@@ -2,15 +2,18 @@ use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
 use futures::StreamExt;
 use gpui::{App, AsyncApp};
-use http_client::github::{AssetKind, GitHubLspBinaryVersion, latest_github_release};
-use http_client::github_download::{GithubBinaryMetadata, download_server_binary};
 pub use language::*;
 use lsp::{InitializeParams, LanguageServerBinary, LanguageServerName};
 use project::lsp_store::clangd_ext;
 use serde_json::json;
 use smol::fs;
 use std::{env::consts, future::Future, path::PathBuf, sync::Arc};
-use util::{ResultExt, fs::remove_matching, maybe, merge_json_value_into};
+use util::{ResultExt, maybe, merge_json_value_into};
+
+use crate::lsp_download::{
+    AssetKind, GitHubLspBinaryVersion, GithubBinaryMetadata, download_server_binary,
+    latest_github_release, remove_matching,
+};
 
 pub struct CLspAdapter;
 

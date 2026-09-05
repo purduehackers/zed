@@ -1,11 +1,17 @@
 use crate::available_languages::{AvailableLanguage, LanguageOrigin};
 use crate::{
-    CachedLspAdapter, File, Language, LanguageConfig, LanguageId, LanguageMatcher,
+    CachedLspAdapter, File, GrammarHandle, Language, LanguageConfig, LanguageId, LanguageMatcher,
     LanguageServerName, LspAdapter, ManifestName, PLAIN_TEXT, ToolchainLister,
     available_languages::AvailableLanguages, language_settings::all_language_settings,
-    task_context::ContextProvider, with_parser,
+    task_context::ContextProvider,
 };
-use anyhow::{Context as _, Result, anyhow};
+// Grammar loading from `.wasm` files is native-only (the browser links grammars itself), so the
+// imports only it uses are gated too, or the wasm check fails under CI's `-D warnings`.
+#[cfg(not(target_family = "wasm"))]
+use crate::with_parser;
+#[cfg(not(target_family = "wasm"))]
+use anyhow::Context as _;
+use anyhow::{Result, anyhow};
 use collections::{FxHashMap, HashMap, HashSet, hash_map};
 pub use language_core::{
     BinaryStatus, LanguageName, LanguageQueries, LanguageServerStatusUpdate, QueryFile,
@@ -24,15 +30,18 @@ use lsp::LanguageServerId;
 use parking_lot::{Mutex, RwLock};
 use postage::watch;
 
+#[cfg(not(target_family = "wasm"))]
+use std::ffi::OsStr;
 use std::{
-    ffi::OsStr,
     path::{Path, PathBuf},
     sync::Arc,
 };
 use text::Rope;
 use theme::Theme;
 
-use util::{maybe, post_inc};
+#[cfg(not(target_family = "wasm"))]
+use util::maybe;
+use util::post_inc;
 
 pub struct LanguageRegistry {
     state: RwLock<LanguageRegistryState>,
@@ -70,11 +79,15 @@ pub struct FakeLanguageServerEntry {
 }
 
 enum AvailableGrammar {
-    Native(tree_sitter::Language),
-    Loaded(#[allow(unused)] PathBuf, tree_sitter::Language),
+    Native(GrammarHandle),
+    // Only the native `.wasm` loader constructs `Loaded` and `Loading`; the browser arm fails
+    // straight into `LoadFailed`.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    Loaded(#[allow(unused)] PathBuf, GrammarHandle),
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     Loading(
         #[allow(unused)] PathBuf,
-        Vec<oneshot::Sender<Result<tree_sitter::Language, Arc<anyhow::Error>>>>,
+        Vec<oneshot::Sender<Result<GrammarHandle, Arc<anyhow::Error>>>>,
     ),
     Unloaded(PathBuf),
     LoadFailed(Arc<anyhow::Error>),
@@ -455,7 +468,7 @@ impl LanguageRegistry {
     /// grammar controls how the source code is parsed.
     pub fn register_native_grammars(
         &self,
-        grammars: impl IntoIterator<Item = (impl Into<Arc<str>>, impl Into<tree_sitter::Language>)>,
+        grammars: impl IntoIterator<Item = (impl Into<Arc<str>>, impl Into<GrammarHandle>)>,
     ) {
         self.state.write().grammars.extend(
             grammars
@@ -818,7 +831,7 @@ impl LanguageRegistry {
     fn get_or_load_grammar(
         self: &Arc<Self>,
         name: Arc<str>,
-    ) -> impl Future<Output = Result<tree_sitter::Language>> {
+    ) -> impl Future<Output = Result<GrammarHandle>> {
         let span = ztracing::debug_span!("get_or_load_grammar", name = &*name.clone());
         let _enter = span.enter();
         let (tx, rx) = oneshot::channel();
@@ -836,41 +849,55 @@ impl LanguageRegistry {
                     txs.push(tx);
                 }
                 AvailableGrammar::Unloaded(wasm_path) => {
-                    log::trace!("start loading grammar {name:?}");
-                    let this = self.clone();
-                    let wasm_path = wasm_path.clone();
-                    *grammar = AvailableGrammar::Loading(wasm_path.clone(), vec![tx]);
-                    self.executor
-                        .spawn(async move {
-                            let grammar_result = maybe!({
-                                let wasm_bytes = std::fs::read(&wasm_path)?;
-                                let grammar_name = wasm_path
-                                    .file_stem()
-                                    .and_then(OsStr::to_str)
-                                    .context("invalid grammar filename")?;
-                                anyhow::Ok(with_parser(|parser| {
-                                    let mut store = parser.take_wasm_store().unwrap();
-                                    let grammar = store.load_language(grammar_name, &wasm_bytes);
-                                    parser.set_wasm_store(store).unwrap();
-                                    grammar
-                                })?)
-                            })
-                            .map_err(Arc::new);
+                    #[cfg(not(target_family = "wasm"))]
+                    {
+                        log::trace!("start loading grammar {name:?}");
+                        let this = self.clone();
+                        let wasm_path = wasm_path.clone();
+                        *grammar = AvailableGrammar::Loading(wasm_path.clone(), vec![tx]);
+                        self.executor
+                            .spawn(async move {
+                                let grammar_result = maybe!({
+                                    let wasm_bytes = std::fs::read(&wasm_path)?;
+                                    let grammar_name = wasm_path
+                                        .file_stem()
+                                        .and_then(OsStr::to_str)
+                                        .context("invalid grammar filename")?;
+                                    anyhow::Ok(with_parser(|parser| {
+                                        let mut store = parser.take_wasm_store().unwrap();
+                                        let grammar =
+                                            store.load_language(grammar_name, &wasm_bytes);
+                                        parser.set_wasm_store(store).unwrap();
+                                        grammar
+                                    })?)
+                                })
+                                .map_err(Arc::new);
 
-                            let value = match &grammar_result {
-                                Ok(grammar) => AvailableGrammar::Loaded(wasm_path, grammar.clone()),
-                                Err(error) => AvailableGrammar::LoadFailed(error.clone()),
-                            };
+                                let value = match &grammar_result {
+                                    Ok(grammar) => {
+                                        AvailableGrammar::Loaded(wasm_path, grammar.clone())
+                                    }
+                                    Err(error) => AvailableGrammar::LoadFailed(error.clone()),
+                                };
 
-                            log::trace!("finish loading grammar {name:?}");
-                            let old_value = this.state.write().grammars.insert(name, value);
-                            if let Some(AvailableGrammar::Loading(_, txs)) = old_value {
-                                for tx in txs {
-                                    tx.send(grammar_result.clone()).ok();
+                                log::trace!("finish loading grammar {name:?}");
+                                let old_value = this.state.write().grammars.insert(name, value);
+                                if let Some(AvailableGrammar::Loading(_, txs)) = old_value {
+                                    for tx in txs {
+                                        tx.send(grammar_result.clone()).ok();
+                                    }
                                 }
-                            }
-                        })
-                        .detach();
+                            })
+                            .detach();
+                    }
+                    #[cfg(target_family = "wasm")]
+                    {
+                        let error = Arc::new(anyhow!(
+                            "grammar {name:?} ({wasm_path:?}) must be linked by the browser grammar linker"
+                        ));
+                        *grammar = AvailableGrammar::LoadFailed(error.clone());
+                        tx.send(Err(error)).ok();
+                    }
                 }
             }
         } else {

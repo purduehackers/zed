@@ -1,4 +1,6 @@
 pub mod client;
+// Serves tools to locally spawned agents over a Unix socket; the browser has neither.
+#[cfg(not(target_family = "wasm"))]
 pub mod listener;
 pub mod oauth;
 pub mod protocol;

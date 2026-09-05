@@ -927,6 +927,15 @@ async fn open_workspaces(
                             .fill_connection_options_from_settings(options)
                     });
                 }
+                if let RemoteConnectionOptions::WebSocket(options) = &connection
+                    && !cx.update(|cx| options.can_dial(cx))
+                {
+                    log::info!(
+                        "skipping restore of cloud workspace {}: no session provider registered",
+                        options.workspace_id
+                    );
+                    continue;
+                }
                 cx.spawn(async move |cx| {
                     open_remote_project(
                         connection,

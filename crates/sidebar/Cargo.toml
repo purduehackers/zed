@@ -21,7 +21,7 @@ async-channel.workspace = true
 agent.workspace = true
 agent-client-protocol.workspace = true
 agent_settings.workspace = true
-agent_ui = { workspace = true, features = ["audio"] }
+agent_ui.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 editor.workspace = true
@@ -51,6 +51,11 @@ util.workspace = true
 workspace.workspace = true
 git_ui_core.workspace = true
 zed_actions.workspace = true
+
+# Audio (cpal/rodio) is desktop-only (BUILD-SPEC 3.2); `agent_ui`'s own `audio` gates
+# already compile without the feature.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+agent_ui = { workspace = true, features = ["audio"] }
 
 [dev-dependencies]
 acp_thread = { workspace = true, features = ["test-support"] }

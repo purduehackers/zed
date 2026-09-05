@@ -25,7 +25,6 @@ futures-lite.workspace = true
 gpui.workspace = true
 http_client = { workspace = true, features = ["test-support"] }
 log.workspace = true
-net.workspace = true
 oauth_callback_server.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
@@ -36,9 +35,16 @@ serde.workspace = true
 settings.workspace = true
 sha2.workspace = true
 slotmap.workspace = true
-tempfile.workspace = true
 url = { workspace = true, features = ["serde"] }
 util.workspace = true
+# `std::time::{Instant, SystemTime}::now()` panic on wasm; `web-time` re-exports `std` on native.
+web-time = { workspace = true, features = ["serde"] }
+
+# The Unix-socket listener (`listener.rs`) is host-only: the browser has no sockets or
+# processes to serve.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+net.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

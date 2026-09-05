@@ -1,0 +1,160 @@
+# cargo-make tasks for yawc.
+#
+# Install the runner once with `cargo install cargo-make`, then run any task
+# below with `cargo make <task>`. `cargo make ci` runs the full pre-PR gate,
+# mirroring the GitHub Actions workflow in .github/workflows/tests.yaml plus
+# clippy and doc.
+
+[config]
+default_to_workspace = false
+skip_core_tasks = true
+
+# ------------------------------------------------------------------------------
+# Formatting
+# ------------------------------------------------------------------------------
+
+[tasks.format]
+description = "Format all code in place"
+command = "cargo"
+args = ["fmt", "--all"]
+
+[tasks.format-check]
+description = "Check formatting without writing changes"
+command = "cargo"
+args = ["fmt", "--all", "--", "--check", "--verbose"]
+
+# ------------------------------------------------------------------------------
+# Lint
+# ------------------------------------------------------------------------------
+
+[tasks.clippy]
+description = "Run clippy with warnings denied"
+command = "cargo"
+# Benches are excluded (--lib --tests --examples instead of --all-targets):
+# they reference non-public helper APIs and do not compile against the crate.
+# Run them separately with `cargo bench` once that is sorted out.
+args = [
+    "clippy",
+    "--all-features",
+    "--lib",
+    "--tests",
+    "--examples",
+    "--",
+    "-D",
+    "warnings",
+]
+
+# ------------------------------------------------------------------------------
+# Build
+# ------------------------------------------------------------------------------
+
+[tasks.build]
+description = "Build all features (lib, tests, examples; benches excluded)"
+command = "cargo"
+# Benches are excluded because they reference non-public helper APIs and do not
+# compile against the crate. Everything else is built.
+args = [
+    "build",
+    "--verbose",
+    "--all-features",
+    "--lib",
+    "--tests",
+    "--examples",
+]
+
+# ------------------------------------------------------------------------------
+# Test
+# ------------------------------------------------------------------------------
+
+[tasks.test]
+description = "Run the test suite with default features (nextest if available)"
+env = { "YAWC_TEST_FEATURES" = "", "YAWC_TEST_DOC" = "1" }
+run_task = "test-runner"
+
+[tasks.test-zlib]
+description = "Run the test suite with the zlib feature (nextest if available)"
+# Doc tests are not feature-sensitive here, so they run only in `test` (above),
+# not again with zlib. The unit/integration suite does run in both because the
+# zlib feature swaps the deflate backend, which is real added coverage.
+env = { "YAWC_TEST_FEATURES" = "--features zlib", "YAWC_TEST_DOC" = "0" }
+run_task = "test-runner"
+
+# Shared runner: prefer `cargo nextest run` when installed, otherwise fall back
+# to `cargo test`. nextest does not run doc tests, so when doc tests are wanted
+# (YAWC_TEST_DOC=1) they run separately via `cargo test --doc`. The fallback
+# `cargo test` already includes doc tests, so it does not run them again.
+[tasks.test-runner]
+private = true
+script_runner = "@shell"
+script = '''
+if command -v cargo-nextest >/dev/null 2>&1; then
+    cargo nextest run $YAWC_TEST_FEATURES
+    if [ "$YAWC_TEST_DOC" = "1" ]; then
+        cargo test --doc $YAWC_TEST_FEATURES
+    fi
+else
+    cargo test --verbose $YAWC_TEST_FEATURES
+fi
+'''
+
+[tasks.wasm]
+description = "Run the wasm tests in headless chrome and node"
+script_runner = "@shell"
+script = '''
+env WASM_BINDGEN_USE_BROWSER=1 wasm-pack test --headless --chrome --lib
+wasm-pack test --node --lib
+'''
+
+# ------------------------------------------------------------------------------
+# Docs
+# ------------------------------------------------------------------------------
+
+[tasks.doc]
+description = "Build the docs and deny doc warnings (broken links, etc.)"
+command = "cargo"
+args = ["doc", "--all-features", "--no-deps"]
+[tasks.doc.env]
+# Note: the `docsrs` cfg is intentionally not set here. It enables
+# `feature(doc_cfg)` in lib.rs, which only builds on nightly (docs.rs uses
+# nightly). This task runs on the stable toolchain to catch broken intra-doc
+# links and other doc warnings before a PR.
+RUSTDOCFLAGS = "-D warnings"
+
+# ------------------------------------------------------------------------------
+# Autobahn compliance suite
+# ------------------------------------------------------------------------------
+
+[tasks.autobahn-client]
+description = "Run the autobahn client testsuite (with zlib)"
+command = "deno"
+args = ["run", "-A", "--unstable", "autobahn/client-test.js", "zlib"]
+
+[tasks.autobahn-server]
+description = "Run the autobahn server testsuite (with zlib)"
+command = "deno"
+args = ["run", "-A", "--unstable", "autobahn/server-test.js", "zlib"]
+
+[tasks.autobahn]
+description = "Run both autobahn testsuites"
+dependencies = ["autobahn-client", "autobahn-server"]
+
+# ------------------------------------------------------------------------------
+# CI gate
+# ------------------------------------------------------------------------------
+
+[tasks.ci]
+description = "Full pre-PR gate: format, clippy, build, test, doc, wasm, autobahn"
+dependencies = [
+    "format-check",
+    "clippy",
+    "build",
+    "test",
+    "test-zlib",
+    "doc",
+    "wasm",
+    "autobahn-client",
+    "autobahn-server",
+]
+
+[tasks.default]
+alias = "ci"

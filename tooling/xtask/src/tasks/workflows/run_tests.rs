@@ -497,16 +497,38 @@ fn check_wasm() -> NamedJob {
         )
     }
 
+    // Zed Codespaces: the layer list lives in `script/check-wasm` (`default_packages`), and
+    // `.cargo/config.toml` is the single source of truth for the wasm rustflags, so no
+    // `CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS` here (it would replace that table) and no
+    // `RUSTC_BOOTSTRAP` (the script sets it).
     fn cargo_check_wasm() -> Step<Run> {
-        named::bash(concat!(
-            "cargo -Zbuild-std=std,panic_abort ",
-            "check --target wasm32-unknown-unknown -p gpui_platform -p cloud_api_client",
+        named::bash("./script/check-wasm")
+    }
+
+    // Zed Codespaces: the browser end-to-end suite's `window.__zs_test` hooks
+    // (`crates/zed_web/src/test_hooks.rs`, 40 KB against the editor, terminal, workspace and db
+    // APIs) are behind the `zed_web/test-hooks` cargo feature, which nothing above compiles.
+    // Without this step a break in them surfaces only when someone builds the test bundle
+    // (`script/build-web --test-hooks`, nightly at best). Incremental on top of the check above.
+    fn cargo_check_wasm_test_hooks() -> Step<Run> {
+        named::bash("./script/check-wasm -p zed_web --features zed_web/test-hooks")
+    }
+
+    // wasi-sdk 25 (script/ensure-wasi-sdk, ~100 MB, verified against script/wasi-sdk.sha256)
+    // backs `CC_wasm32_unknown_unknown`; cache it so the wasm job does not fetch it on every
+    // run. The pin file's hash is part of the key, so a bumped or corrected digest never
+    // restores an SDK verified against the old one.
+    fn cache_wasi_sdk() -> Step<Use> {
+        named::uses(
+            "actions",
+            "cache",
+            "0057852bfaa89a56745cba8c7296529d2fc39830", // v4.3.0
+        )
+        .with(("path", "target/wasi-sdk"))
+        .add_with((
+            "key",
+            "wasi-sdk-25-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('script/wasi-sdk.sha256') }}",
         ))
-        .add_env((
-            "CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS",
-            "-C target-feature=+atomics,+bulk-memory,+mutable-globals",
-        ))
-        .add_env(("RUSTC_BOOTSTRAP", "1"))
     }
 
     named::job(
@@ -517,8 +539,10 @@ fn check_wasm() -> NamedJob {
             .add_step(steps::setup_cargo_config(Platform::Linux))
             .add_step(steps::cache_rust_dependencies_namespace())
             .add_step(install_nightly_wasm_toolchain())
+            .add_step(cache_wasi_sdk())
             .add_step(steps::setup_sccache(Platform::Linux))
             .add_step(cargo_check_wasm())
+            .add_step(cargo_check_wasm_test_hooks())
             .add_step(steps::show_sccache_stats(Platform::Linux))
             .add_step(steps::cleanup_cargo_config(Platform::Linux)),
     )

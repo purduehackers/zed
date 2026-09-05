@@ -23,15 +23,25 @@ use project::{AgentId, Project};
 use remote::remote_client::Interactive;
 use serde::Deserialize;
 use settings::{AgentConfigOptionValue, SettingsStore};
-use std::path::PathBuf;
-use std::process::{ExitStatus, Stdio};
+use std::path::{Path, PathBuf};
+#[cfg(not(target_family = "wasm"))]
+use std::process::Stdio;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::{any::Any, cell::RefCell, collections::VecDeque};
-use task::{Shell, ShellBuilder, SpawnInTerminal};
+#[cfg(not(target_family = "wasm"))]
+use task::{Shell, ShellBuilder};
+use task::{ExitStatus, SpawnInTerminal};
 use thiserror::Error;
 use util::ResultExt as _;
 use util::path_list::PathList;
+// The browser never spawns the agent (see `spawn_agent_process`), so the process-group /
+// job-object `Child` of `util::process` is not compiled there; `util::command::Child` on wasm
+// is the smol shim's never-constructed child, which keeps `AcpConnection::child` and the
+// wait path their native shape.
+#[cfg(target_family = "wasm")]
+use util::command::Child;
+#[cfg(not(target_family = "wasm"))]
 use util::process::Child;
 
 use anyhow::{Context as _, Result};
@@ -244,6 +254,21 @@ fn exited_load_error_with_stderr(status: ExitStatus, debug_log: &AcpDebugLog) ->
         status,
         stderr: debug_log.trailing_stderr().map(SharedString::from),
     }
+}
+
+/// The status the agent process reported, as the `ExitStatus` that `LoadError::Exited`
+/// carries. Natively the two are the same type.
+#[cfg(not(target_family = "wasm"))]
+fn agent_exit_status(status: std::process::ExitStatus) -> ExitStatus {
+    status
+}
+
+/// In the browser the child is never spawned (`spawn_agent_process` fails first), so this
+/// only keeps the wait path well typed against the shim's `std` stub, whose code is always
+/// `Some(0)`.
+#[cfg(target_family = "wasm")]
+fn agent_exit_status(status: std::process::ExitStatus) -> ExitStatus {
+    ExitStatus::from_parts(status.code(), None)
 }
 
 #[derive(Debug, Error)]
@@ -846,19 +871,14 @@ impl AcpConnection {
                 )
             });
 
-        let builder = ShellBuilder::new(&Shell::System, cfg!(windows)).non_interactive();
-        let mut child = builder.build_std_command(Some(path.clone()), &args);
-        child.envs(env.clone());
-        if let Some(cwd) = project.read_with(cx, |project, _cx| {
+        let cwd = project.read_with(cx, |project, _cx| {
             if project.is_local() {
-                root_dir.as_ref()
+                root_dir.as_deref()
             } else {
                 None
             }
-        }) {
-            child.current_dir(cwd);
-        }
-        let mut child = Child::spawn(child, Stdio::piped(), Stdio::piped(), Stdio::piped())?;
+        });
+        let mut child = spawn_agent_process(&path, &args, env, cwd)?;
 
         let stdout = child.stdout.take().context("Failed to take stdout")?;
         let stdin = child.stdin.take().context("Failed to take stdin")?;
@@ -959,7 +979,10 @@ impl AcpConnection {
             .map({
                 let debug_log = debug_log.clone();
                 move |status| match status {
-                    Ok(status) => Ok(exited_load_error_with_stderr(status, &debug_log)),
+                    Ok(status) => Ok(exited_load_error_with_stderr(
+                        agent_exit_status(status),
+                        &debug_log,
+                    )),
                     Err(err) => Err(anyhow!("failed to wait for agent server exit: {err}")),
                 }
             })
@@ -1531,6 +1554,44 @@ impl Drop for AcpConnection {
             child.kill().log_err();
         }
     }
+}
+
+/// Spawns the agent server as a local process with piped stdio, through the system shell so
+/// the same `cmd` quirks as tasks are handled.
+#[cfg(not(target_family = "wasm"))]
+fn spawn_agent_process(
+    path: &str,
+    args: &[String],
+    env: HashMap<String, String>,
+    cwd: Option<&Path>,
+) -> Result<Child> {
+    let builder = ShellBuilder::new(&Shell::System, cfg!(windows)).non_interactive();
+    let mut command = builder.build_std_command(Some(path.to_owned()), args);
+    command.envs(env);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    Child::spawn(command, Stdio::piped(), Stdio::piped(), Stdio::piped())
+}
+
+/// The browser has no local processes: the agent command is resolved on the server
+/// (`GetAgentServerCommand`), but nothing in the tab can run it yet, so starting an agent
+/// surfaces as a load error in the panel.
+#[cfg(target_family = "wasm")]
+fn spawn_agent_process(
+    path: &str,
+    _args: &[String],
+    _env: HashMap<String, String>,
+    _cwd: Option<&Path>,
+) -> Result<Child> {
+    // ZS-TODO(wasm): b11 §3.20 / §7 item 2 — a stdio process relay over the session
+    // (`SpawnProcess`/`ProcessStdin`/`ProcessOutput`/`ProcessExited`/`KillProcess`) whose
+    // pipes feed the transport in `AcpConnection::stdio` in place of this local spawn.
+    // Until it lands, external agents cannot be started from the browser.
+    Err(anyhow!(
+        "cannot start agent server `{path}` in the browser: agents run in the sandbox and \
+         no stdio relay over the session exists yet"
+    ))
 }
 
 fn terminal_auth_task_id(agent_id: &AgentId, method_id: &acp::AuthMethodId) -> String {
@@ -2106,7 +2167,7 @@ pub mod test_support {
             Arc<Mutex<Option<async_channel::Sender<acp::CreateElicitationResponse>>>>,
         auth_elicitation_completion: Arc<Mutex<Option<acp::CompleteElicitationNotification>>>,
         exit_status_sender:
-            Arc<std::sync::Mutex<Option<async_channel::Sender<std::process::ExitStatus>>>>,
+            Arc<std::sync::Mutex<Option<async_channel::Sender<task::ExitStatus>>>>,
     }
 
     impl FakeAcpAgentServer {
@@ -2130,7 +2191,7 @@ pub mod test_support {
                 .clone()
                 .expect("fake ACP server must be connected before simulating exit");
             sender
-                .try_send(std::process::ExitStatus::default())
+                .try_send(task::ExitStatus::default())
                 .expect("fake ACP server exit receiver should still be alive");
         }
 

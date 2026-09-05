@@ -1,0 +1,114 @@
+syntax = "proto3";
+package zed.messages;
+
+import "task.proto";
+
+// Remote terminal protocol (b3-terminals). Every message carries
+// `project_id = REMOTE_SERVER_PROJECT_ID`; offsets are per-terminal byte
+// positions in the PTY's output stream, monotonic and starting at 0.
+
+message SpawnTerminal {
+  uint64 project_id = 1;
+  optional string working_directory = 2;
+  Shell shell = 3;                       // task.proto; System => server login shell (`$SHELL -l`)
+  map<string, string> env = 4;
+  uint32 cols = 5;
+  uint32 rows = 6;
+  optional string task_id = 7;           // task::TaskId is a String
+  optional string title = 8;             // task label for tasks, "<host> — Terminal" for shells (ListTerminals)
+}
+// The terminal starts detached; send AttachTerminal { from_offset: 0 } to stream.
+message SpawnTerminalResponse {
+  uint64 terminal_id = 1;                // random 64-bit, unique across server restarts
+}
+
+// <= 64 KiB per message.
+message TerminalInput {
+  uint64 project_id = 1;
+  uint64 terminal_id = 2;
+  bytes data = 3;
+}
+
+// Server-initiated. `offset` is the absolute byte offset of data[0] in the
+// terminal's output stream; `reset` asks the client to clear its grid first
+// (replay started after scrollback eviction).
+message TerminalOutput {
+  uint64 project_id = 1;
+  uint64 terminal_id = 2;
+  uint64 offset = 3;
+  bytes data = 4;
+  bool reset = 5;
+}
+
+// Client has parsed everything below `offset`; opens the server's send window.
+message AckTerminalOutput {
+  uint64 project_id = 1;
+  uint64 terminal_id = 2;
+  uint64 offset = 3;
+}
+
+message ResizeTerminal {
+  uint64 project_id = 1;
+  uint64 terminal_id = 2;
+  uint32 cols = 3;
+  uint32 rows = 4;
+}
+
+// Kill the process group. Output keeps streaming until the child exits; the
+// server drops the terminal after TerminalExited (immediately if already exited).
+message CloseTerminal {
+  uint64 project_id = 1;
+  uint64 terminal_id = 2;
+}
+
+// Exactly one of `code` / `signal` is set.
+message TerminalExit {
+  optional int32 code = 1;
+  optional int32 signal = 2;
+}
+
+// Server-initiated, sent after the remaining output has been flushed; re-sent
+// after every AttachTerminal replay of an exited terminal.
+message TerminalExited {
+  uint64 project_id = 1;
+  uint64 terminal_id = 2;
+  TerminalExit exit = 3;
+  uint64 end_offset = 4;
+}
+
+message ListTerminals {
+  uint64 project_id = 1;
+}
+
+message TerminalInfo {
+  uint64 terminal_id = 1;
+  string title = 2;
+  optional string cwd = 3;               // best-effort (Linux /proc/<pgrp>/cwd, else the spawn cwd)
+  optional string task_id = 4;
+  uint64 end_offset = 5;
+  uint64 scrollback_start = 6;           // oldest offset still replayable
+  optional TerminalExit exit = 7;
+  uint32 cols = 8;
+  uint32 rows = 9;
+}
+
+message ListTerminalsResponse {
+  repeated TerminalInfo terminals = 1;
+}
+
+// Replays [max(from_offset, scrollback_start), end) as TerminalOutput messages
+// (first one carries reset=true if from_offset was evicted), then resumes streaming.
+// Unknown terminal_id => error response (the client marks the terminal lost).
+message AttachTerminal {
+  uint64 project_id = 1;
+  uint64 terminal_id = 2;
+  uint64 from_offset = 3;
+  uint32 cols = 4;
+  uint32 rows = 5;
+}
+
+message AttachTerminalResponse {
+  uint64 replayed_from = 1;
+  uint64 end_offset = 2;
+  optional TerminalExit exit = 3;        // informational; the ordered TerminalExited is authoritative
+}

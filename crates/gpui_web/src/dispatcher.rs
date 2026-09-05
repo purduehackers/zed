@@ -11,6 +11,110 @@ use web_time::Instant;
 #[cfg(feature = "multithreaded")]
 const MIN_BACKGROUND_THREADS: usize = 2;
 
+/// The global the loader sets to the wasm-bindgen glue's URL before `start()` (CONTRACTS.md
+/// §8.4: `/editor/<build>/zed_web.js`), which the vendored `wasm_thread` reads when it builds
+/// a worker's bootstrap script.
+#[cfg(feature = "multithreaded")]
+const SHIM_URL_GLOBAL: &str = "__zsBindgenShimUrl";
+
+/// How long after spawning the background workers the main thread checks that at least one
+/// of them reached Rust.
+#[cfg(feature = "multithreaded")]
+const WORKER_START_CHECK: Duration = Duration::from_secs(10);
+
+/// The `wasm_thread` builder for every worker of this session, also installed as the
+/// crate-wide default so `scheduler::spawn_dedicated_thread` spawns the same way.
+///
+/// `wasm_thread` spawns `blob:` module workers whose bootstrap script `import`s the
+/// wasm-bindgen glue. A blob URL has no path hierarchy, so a root-relative glue URL such as
+/// the one the loader publishes cannot be resolved from inside the worker: the import fails
+/// before any Rust runs, the worker dies, and the background queue is never drained. That is
+/// silent for everything downstream — no background task and no `BackgroundExecutor::timer`
+/// (a background task itself) ever completes — so the URL is made absolute against the
+/// document here, before `wasm_thread` sees it.
+#[cfg(feature = "multithreaded")]
+fn worker_builder(window: &web_sys::Window) -> wasm_thread::Builder {
+    let mut builder = wasm_thread::Builder::empty();
+    if let Some(url) = absolute_shim_url(window) {
+        builder = builder.wasm_bindgen_shim_url(url);
+    }
+    builder.clone().set_default();
+    builder
+}
+
+/// `globalThis.__zsBindgenShimUrl` resolved against the document's base URL, or `None` when
+/// the loader set nothing (then `wasm_thread` falls back to its own stack-trace lookup, which
+/// already yields an absolute URL).
+#[cfg(feature = "multithreaded")]
+fn absolute_shim_url(window: &web_sys::Window) -> Option<String> {
+    let configured = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str(SHIM_URL_GLOBAL))
+        .ok()
+        .and_then(|value| value.as_string())
+        .filter(|url| !url.is_empty())?;
+    let base = window
+        .document()
+        .and_then(|document| document.base_uri().ok().flatten())
+        .or_else(|| window.location().href().ok());
+    let Some(base) = base else {
+        return Some(configured);
+    };
+    // `new URL(configured, base).href`, through js-sys so no extra web-sys feature is needed.
+    let resolved = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("URL"))
+        .ok()
+        .and_then(|constructor| constructor.dyn_into::<js_sys::Function>().ok())
+        .and_then(|constructor| {
+            let args =
+                js_sys::Array::of2(&JsValue::from_str(&configured), &JsValue::from_str(&base));
+            js_sys::Reflect::construct(&constructor, &args).ok()
+        })
+        .and_then(|url| js_sys::Reflect::get(&url, &JsValue::from_str("href")).ok())
+        .and_then(|href| href.as_string());
+    match resolved {
+        Some(url) => {
+            if url != configured {
+                log::debug!(
+                    "worker bootstrap: resolved {SHIM_URL_GLOBAL} {configured:?} to {url:?}"
+                );
+            }
+            Some(url)
+        }
+        None => {
+            log::error!(
+                "worker bootstrap: {SHIM_URL_GLOBAL} {configured:?} could not be resolved against {base:?}; workers may fail to start"
+            );
+            Some(configured)
+        }
+    }
+}
+
+/// Reports, once, when none of the spawned workers has started after [`WORKER_START_CHECK`]:
+/// a worker that dies in its bootstrap (a failed glue import, a rejected shared memory) never
+/// reaches Rust, so nothing else would say why every background task and timer is stuck.
+#[cfg(feature = "multithreaded")]
+fn watch_worker_startup(
+    window: &web_sys::Window,
+    started: Arc<std::sync::atomic::AtomicUsize>,
+    thread_count: usize,
+) {
+    let callback = Closure::once_into_js(move || {
+        let count = started.load(std::sync::atomic::Ordering::SeqCst);
+        if count == 0 {
+            log::error!(
+                "none of the {thread_count} background workers started within {}s: the worker bootstrap failed (check {SHIM_URL_GLOBAL} and the worker console); background tasks and timers will never run",
+                WORKER_START_CHECK.as_secs()
+            );
+        } else {
+            log::debug!("{count}/{thread_count} background workers started");
+        }
+    });
+    window
+        .set_timeout_with_callback_and_timeout_and_arguments_0(
+            callback.unchecked_ref(),
+            WORKER_START_CHECK.as_millis().min(i32::MAX as u128) as i32,
+        )
+        .ok();
+}
+
 fn shared_memory_supported() -> bool {
     let global = js_sys::global();
     let has_shared_array_buffer =
@@ -154,6 +258,14 @@ pub struct WebDispatcher {
 
 impl WebDispatcher {
     pub fn new(browser_window: web_sys::Window, allow_threads: bool) -> Self {
+        // Browsers forbid `memory.atomic.wait32` on the main thread: the instruction throws a
+        // JS exception through the wasm frames without running destructors, which is how a
+        // contended `parking_lot` lock used to leak gpui's `App` borrow for the rest of the
+        // session. The vendored parking_lot_core spins on a marked thread instead, and `new`
+        // runs on the main thread before any worker exists.
+        #[cfg(target_feature = "atomics")]
+        parking_lot_core::mark_current_thread_cannot_wait();
+
         #[cfg(feature = "multithreaded")]
         let (background_sender, background_receiver) = PriorityQueueReceiver::new();
         #[cfg(not(feature = "multithreaded"))]
@@ -180,14 +292,20 @@ impl WebDispatcher {
                 .navigator()
                 .hardware_concurrency()
                 .max(MIN_BACKGROUND_THREADS as f64) as usize;
+            let builder = worker_builder(&browser_window);
+            let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            watch_worker_startup(&browser_window, started.clone(), thread_count);
 
             // TODO-Wasm: Is it bad to have web workers blocking for a long time like this?
             (0..thread_count)
                 .map(|i| {
                     let mut receiver = background_receiver.clone();
-                    wasm_thread::Builder::new()
+                    let started = started.clone();
+                    builder
+                        .clone()
                         .name(format!("background-worker-{i}"))
                         .spawn(move || {
+                            started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             loop {
                                 let runnable: RunnableVariant = match receiver.pop() {
                                     Ok(runnable) => runnable,

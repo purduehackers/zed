@@ -1,10 +1,6 @@
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use gpui::AsyncApp;
-use http_client::{
-    github::{AssetKind, GitHubLspBinaryVersion, build_asset_url},
-    github_download::download_server_binary,
-};
 use language::{LspAdapter, LspAdapterDelegate, LspInstaller, Toolchain};
 use lsp::{CodeActionKind, LanguageServerBinary, LanguageServerName, Uri};
 use node_runtime::{NodeRuntime, read_package_installed_version};
@@ -22,7 +18,11 @@ use std::{
     sync::Arc,
 };
 use util::merge_json_value_into;
-use util::{fs::remove_matching, rel_path::RelPath};
+use util::rel_path::RelPath;
+
+use crate::lsp_download::{
+    AssetKind, GitHubLspBinaryVersion, build_asset_url, download_server_binary, remove_matching,
+};
 
 fn eslint_server_binary_arguments(server_path: &Path) -> Vec<OsString> {
     vec![

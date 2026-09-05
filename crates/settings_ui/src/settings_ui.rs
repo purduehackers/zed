@@ -848,6 +848,21 @@ fn open_settings_editor_with(
 ) {
     telemetry::event!("Settings Viewed");
 
+    // The browser has one top-level window (`gpui_web` refuses a second `open_window`), so
+    // the settings window is hosted in the workspace's modal layer there (b7 §3.7).
+    #[cfg(target_family = "wasm")]
+    open_settings_editor_in_modal(workspace_handle, cx, callback);
+
+    #[cfg(not(target_family = "wasm"))]
+    open_settings_editor_in_window(workspace_handle, cx, callback);
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn open_settings_editor_in_window(
+    workspace_handle: Option<WindowHandle<MultiWorkspace>>,
+    cx: &mut App,
+    callback: impl FnOnce(&mut SettingsWindow, &mut Window, &mut Context<SettingsWindow>) + 'static,
+) {
     let existing_window = cx
         .windows()
         .into_iter()
@@ -922,6 +937,98 @@ fn open_settings_editor_with(
             },
         )
         .log_err();
+    });
+}
+
+/// Browser build: hosts the [`SettingsWindow`] inside the workspace's modal layer, since
+/// `gpui_web` supports a single top-level window (`WebWindowError::AlreadyOpen`).
+#[cfg(target_family = "wasm")]
+pub struct SettingsModal {
+    settings_window: Entity<SettingsWindow>,
+}
+
+#[cfg(target_family = "wasm")]
+impl SettingsModal {
+    /// The hosted settings view.
+    pub fn settings_window(&self) -> &Entity<SettingsWindow> {
+        &self.settings_window
+    }
+}
+
+#[cfg(target_family = "wasm")]
+impl Focusable for SettingsModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.settings_window.read(cx).focus_handle.clone()
+    }
+}
+
+#[cfg(target_family = "wasm")]
+impl gpui::EventEmitter<gpui::DismissEvent> for SettingsModal {}
+
+#[cfg(target_family = "wasm")]
+impl workspace::ModalView for SettingsModal {
+    fn fade_out_background(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(target_family = "wasm")]
+impl Render for SettingsModal {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let viewport = window.viewport_size();
+        div()
+            .id("settings-modal")
+            .elevation_3(cx)
+            .w(viewport.width * 0.92)
+            .h(viewport.height * 0.92)
+            .overflow_hidden()
+            .child(self.settings_window.clone())
+    }
+}
+
+/// Browser twin of `open_settings_editor_in_window`: reuses the modal when one is open,
+/// otherwise builds the [`SettingsWindow`] and shows it through `Workspace::toggle_modal`
+/// on the workspace window (`workspace_handle`, else the first workspace window).
+#[cfg(target_family = "wasm")]
+fn open_settings_editor_in_modal(
+    workspace_handle: Option<WindowHandle<MultiWorkspace>>,
+    cx: &mut App,
+    callback: impl FnOnce(&mut SettingsWindow, &mut Window, &mut Context<SettingsWindow>) + 'static,
+) {
+    let window_handle = workspace_handle.or_else(|| {
+        cx.windows()
+            .into_iter()
+            .find_map(|window| window.downcast::<MultiWorkspace>())
+    });
+    let Some(window_handle) = window_handle else {
+        log::error!("no workspace window to host the settings modal");
+        return;
+    };
+
+    // Deferred to get the workspace off the stack, as the desktop path does.
+    cx.defer(move |cx| {
+        window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                workspace.update(cx, |workspace, cx| {
+                    if let Some(modal) = workspace.active_modal::<SettingsModal>(cx) {
+                        let settings_window = modal.read(cx).settings_window.clone();
+                        settings_window.update(cx, |settings_window, cx| {
+                            callback(settings_window, window, cx);
+                        });
+                        return;
+                    }
+                    workspace.toggle_modal(window, cx, |window, cx| {
+                        let settings_window =
+                            cx.new(|cx| SettingsWindow::new(Some(window_handle), window, cx));
+                        settings_window.update(cx, |settings_window, cx| {
+                            callback(settings_window, window, cx);
+                        });
+                        SettingsModal { settings_window }
+                    });
+                });
+            })
+            .log_err();
     });
 }
 
@@ -3939,7 +4046,6 @@ impl SettingsWindow {
                 .unwrap_or(false);
 
             if is_restricted {
-                let original_window = self.original_window;
                 restricted_banner = Banner::new()
                     .severity(Severity::Warning)
                     .child(
@@ -3959,23 +4065,12 @@ impl SettingsWindow {
                         div().pr_2().pb_1().child(
                             Button::new("manage-trust", "Manage Trust")
                                 .style(ButtonStyle::Tinted(ui::TintColor::Warning))
-                                .on_click(cx.listener(move |_this, _, window, cx| {
-                                    if let Some(original_window) = original_window {
-                                        original_window
-                                            .update(cx, |multi_workspace, window, cx| {
-                                                multi_workspace
-                                                    .workspace()
-                                                    .update(cx, |workspace, cx| {
-                                                        workspace
-                                                            .show_worktree_trust_security_modal(
-                                                                true, window, cx,
-                                                            );
-                                                    });
-                                            })
-                                            .log_err();
-                                    }
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.with_hosting_workspace(window, cx, |workspace, window, cx| {
+                                        workspace.show_worktree_trust_security_modal(true, window, cx);
+                                    });
                                     // Close the settings window
-                                    window.remove_window();
+                                    this.close_settings_editor(window, cx);
                                 })),
                         ),
                     )
@@ -4106,27 +4201,55 @@ impl SettingsWindow {
     ) {
         match &self.current_file {
             SettingsUiFile::User => {
-                let Some(original_window) = self.original_window else {
-                    return;
-                };
-                original_window
-                    .update(cx, |multi_workspace, window, cx| {
-                        multi_workspace
-                            .workspace()
-                            .clone()
-                            .update(cx, |workspace, cx| {
-                                workspace
-                                    .with_local_or_wsl_workspace(
-                                        window,
-                                        cx,
-                                        open_user_settings_in_workspace,
-                                    )
-                                    .detach();
-                            });
-                    })
-                    .ok();
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    let Some(original_window) = self.original_window else {
+                        return;
+                    };
+                    original_window
+                        .update(cx, |multi_workspace, window, cx| {
+                            multi_workspace
+                                .workspace()
+                                .clone()
+                                .update(cx, |workspace, cx| {
+                                    workspace
+                                        .with_local_or_wsl_workspace(
+                                            window,
+                                            cx,
+                                            open_user_settings_in_workspace,
+                                        )
+                                        .detach();
+                                });
+                        })
+                        .ok();
 
-                window.remove_window();
+                    window.remove_window();
+                }
+                // The browser's settings.json lives in the client-side `WasmFs`, which the
+                // remote project cannot open as an editor buffer (b7 §7 item 12), and
+                // `with_local_or_wsl_workspace` would try to open a second window.
+                #[cfg(target_family = "wasm")]
+                {
+                    use workspace::notifications::{
+                        NotificationId, simple_message_notification::MessageNotification,
+                    };
+                    struct SettingsJsonUnavailable;
+                    self.with_hosting_workspace(window, cx, |workspace, _, cx| {
+                        workspace.show_notification(
+                            NotificationId::unique::<SettingsJsonUnavailable>(),
+                            cx,
+                            |cx| {
+                                cx.new(|cx| {
+                                    MessageNotification::new(
+                                        "Editing settings.json directly is not available in the browser yet; use the settings editor or the keymap editor.",
+                                        cx,
+                                    )
+                                })
+                            },
+                        );
+                    });
+                    self.close_settings_editor(window, cx);
+                }
             }
             SettingsUiFile::Project((worktree_id, path)) => {
                 let settings_path = path.join(paths::local_settings_file_relative_path());
@@ -4176,9 +4299,9 @@ impl SettingsWindow {
                 // TODO: move zed::open_local_file() APIs to this crate, and
                 // re-implement the "initial_contents" behavior
                 let workspace_weak = corresponding_workspace.downgrade();
-                workspace_window
-                    .update(cx, |_, window, cx| {
-                        cx.spawn_in(window, async move |_, cx| {
+                let open_settings_file = move |window: &mut Window, cx: &mut App| {
+                    window
+                        .spawn(cx, async move |cx| {
                             if let Some(create_task) = create_task {
                                 create_task.await.ok()?;
                             };
@@ -4207,10 +4330,23 @@ impl SettingsWindow {
                             Some(())
                         })
                         .detach();
-                    })
-                    .ok();
-
-                window.remove_window();
+                };
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    workspace_window
+                        .update(cx, |_, window, cx| open_settings_file(window, cx))
+                        .ok();
+                    window.remove_window();
+                }
+                // In the browser `workspace_window` is the window this modal is rendered
+                // in: updating it here would be re-entrant, so the open runs on `window`
+                // directly and the modal is dismissed instead of the window removed.
+                #[cfg(target_family = "wasm")]
+                {
+                    let _ = workspace_window;
+                    open_settings_file(window, cx);
+                    self.close_settings_editor(window, cx);
+                }
             }
             SettingsUiFile::Server(_) => {
                 // Server files are not editable
@@ -4463,6 +4599,58 @@ impl SettingsWindow {
         let original_window = self.original_window.as_ref()?;
         let multi_workspace = original_window.read(cx).ok()?;
         Some(multi_workspace.workspace().read(cx).project().clone())
+    }
+
+    /// Runs `f` on the workspace that hosts the settings editor: on desktop the workspace
+    /// of `original_window` (the editor is its own window); in the browser the editor is a
+    /// modal inside the workspace window itself, so it is `window`'s root view (updating
+    /// `original_window` from there would be re-entrant and fail).
+    fn with_hosting_workspace(
+        &self,
+        #[cfg_attr(not(target_family = "wasm"), allow(unused_variables))] window: &mut Window,
+        cx: &mut App,
+        f: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>),
+    ) {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            if let Some(original_window) = self.original_window {
+                original_window
+                    .update(cx, |multi_workspace, window, cx| {
+                        multi_workspace
+                            .workspace()
+                            .clone()
+                            .update(cx, |workspace, cx| f(workspace, window, cx));
+                    })
+                    .log_err();
+            }
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            let Some(Some(multi_workspace)) = window.root::<MultiWorkspace>() else {
+                log::error!("the settings editor is not hosted in a workspace window");
+                return;
+            };
+            let workspace = multi_workspace.read(cx).workspace().clone();
+            workspace.update(cx, |workspace, cx| f(workspace, window, cx));
+        }
+    }
+
+    /// Closes the settings editor: its window on desktop; in the browser the hosting
+    /// modal, unless another modal has already replaced it (removing the only window
+    /// would drop the canvas, and `gpui_web` cannot reopen one).
+    fn close_settings_editor(
+        &self,
+        window: &mut Window,
+        #[cfg_attr(not(target_family = "wasm"), allow(unused_variables))] cx: &mut App,
+    ) {
+        #[cfg(not(target_family = "wasm"))]
+        window.remove_window();
+        #[cfg(target_family = "wasm")]
+        self.with_hosting_workspace(window, cx, |workspace, window, cx| {
+            if workspace.active_modal::<SettingsModal>(cx).is_some() {
+                workspace.hide_modal(window, cx);
+            }
+        });
     }
 
     fn focus_file_at_index(&mut self, index: usize, window: &mut Window, cx: &mut App) {

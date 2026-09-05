@@ -13,13 +13,15 @@ use gpui::{
 };
 use language::{LanguageAwareStyling, Point};
 use multi_buffer::RowInfo;
+#[cfg(not(target_family = "wasm"))]
+use std::time::Duration;
 use std::{
     cmp,
     collections::VecDeque,
+    future::Future,
     mem,
     ops::Range,
     sync::{Arc, LazyLock},
-    time::Duration,
 };
 use sum_tree::{Bias, Cursor, Dimensions, SumTree};
 use text::Patch;
@@ -32,6 +34,25 @@ pub type WrapPatch = text::Patch<WrapRow>;
 pub struct WrapRow(pub u32);
 
 const WRAP_YIELD_ROW_INTERVAL: usize = 100;
+
+#[cfg(not(target_family = "wasm"))]
+fn block_on_wrap_update<F: Future>(future: F) -> F::Output {
+    gpui::block_on(future)
+}
+
+/// `WrapSnapshot::update` only suspends at cooperative `yield_now` points, each of which
+/// resolves on its next poll, so a plain poll loop drives it to completion without ever
+/// parking the thread, which the browser cannot do (`gpui::block_on` does not exist there).
+#[cfg(target_family = "wasm")]
+fn block_on_wrap_update<F: Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut poll_cx = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut poll_cx) {
+            return output;
+        }
+    }
+}
 
 impl_for_row_types! {
     WrapRow => RowDelta
@@ -286,7 +307,7 @@ impl WrapMap {
             }];
 
             if total_rows < WRAP_YIELD_ROW_INTERVAL {
-                let edits = gpui::block_on(new_snapshot.update(
+                let edits = block_on_wrap_update(new_snapshot.update(
                     tab_snapshot,
                     &tab_edits,
                     wrap_width,
@@ -309,6 +330,7 @@ impl WrapMap {
                     (new_snapshot, edits)
                 });
 
+                #[cfg(not(target_family = "wasm"))]
                 match cx
                     .foreground_executor()
                     .block_with_timeout(Duration::from_millis(5), task)
@@ -317,22 +339,13 @@ impl WrapMap {
                         self.snapshot = snapshot;
                         self.edits_since_sync = self.edits_since_sync.compose(&edits);
                     }
-                    Err(wrap_task) => {
-                        self.background_task = Some(cx.spawn(async move |this, cx| {
-                            let (snapshot, edits) = wrap_task.await;
-                            this.update(cx, |this, cx| {
-                                this.snapshot = snapshot;
-                                this.edits_since_sync = this
-                                    .edits_since_sync
-                                    .compose(mem::take(&mut this.interpolated_edits).invert())
-                                    .compose(&edits);
-                                this.background_task = None;
-                                this.flush_edits(cx);
-                                cx.notify();
-                            })
-                            .ok();
-                        }));
-                    }
+                    Err(wrap_task) => self.finish_in_background(wrap_task, cx),
+                }
+                // The browser's foreground thread cannot block, so a large buffer is always
+                // wrapped in the background and shown interpolated until that finishes.
+                #[cfg(target_family = "wasm")]
+                {
+                    self.finish_in_background(task, cx);
                 }
             }
         } else {
@@ -351,6 +364,29 @@ impl WrapMap {
                 new: WrapRow(0)..WrapRow(new_rows),
             }]));
         }
+    }
+
+    /// Installs the wrapped snapshot once `wrap_task` resolves. The edits recorded against the
+    /// interpolated snapshot in the meantime are reverted before the real ones are applied.
+    fn finish_in_background(
+        &mut self,
+        wrap_task: impl Future<Output = (WrapSnapshot, WrapPatch)> + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.background_task = Some(cx.spawn(async move |this, cx| {
+            let (snapshot, edits) = wrap_task.await;
+            this.update(cx, |this, cx| {
+                this.snapshot = snapshot;
+                this.edits_since_sync = this
+                    .edits_since_sync
+                    .compose(mem::take(&mut this.interpolated_edits).invert())
+                    .compose(&edits);
+                this.background_task = None;
+                this.flush_edits(cx);
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     #[ztracing::instrument(skip_all)]
@@ -391,7 +427,7 @@ impl WrapMap {
             if update_passes + total_new_rows < WRAP_YIELD_ROW_INTERVAL {
                 let mut wrap_edits = Patch::default();
                 for (tab_snapshot, tab_edits) in pending_edits {
-                    let edits = gpui::block_on(snapshot.update(
+                    let edits = block_on_wrap_update(snapshot.update(
                         tab_snapshot,
                         &tab_edits,
                         wrap_width,
@@ -420,6 +456,7 @@ impl WrapMap {
                     (snapshot, edits)
                 });
 
+                #[cfg(not(target_family = "wasm"))]
                 match cx
                     .foreground_executor()
                     .block_with_timeout(Duration::from_millis(1), update_task)
@@ -428,22 +465,13 @@ impl WrapMap {
                         self.snapshot = snapshot;
                         self.edits_since_sync = self.edits_since_sync.compose(&output_edits);
                     }
-                    Err(update_task) => {
-                        self.background_task = Some(cx.spawn(async move |this, cx| {
-                            let (snapshot, edits) = update_task.await;
-                            this.update(cx, |this, cx| {
-                                this.snapshot = snapshot;
-                                this.edits_since_sync = this
-                                    .edits_since_sync
-                                    .compose(mem::take(&mut this.interpolated_edits).invert())
-                                    .compose(&edits);
-                                this.background_task = None;
-                                this.flush_edits(cx);
-                                cx.notify();
-                            })
-                            .ok();
-                        }));
-                    }
+                    Err(update_task) => self.finish_in_background(update_task, cx),
+                }
+                // The browser's foreground thread cannot block, so a large batch of edits is
+                // always wrapped in the background and shown interpolated until that finishes.
+                #[cfg(target_family = "wasm")]
+                {
+                    self.finish_in_background(update_task, cx);
                 }
             }
         }

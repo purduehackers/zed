@@ -5496,6 +5496,75 @@ fn drain_git_repo_updates(events: &mut futures::channel::mpsc::UnboundedReceiver
     found
 }
 
+/// The path the settings UI and the keymap editor take in the browser: a local worktree
+/// over the in-memory `WasmFs` at the config directory. The scan exercises `read_dir`
+/// (full child paths), `metadata` (stable inodes), `canonicalize`, `open_handle`,
+/// `is_case_sensitive` and a directory `watch` whose events name the changed file.
+#[gpui::test]
+async fn test_wasm_fs_local_worktree(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = fs::WasmFs::new(cx.background_executor.clone());
+    let config_dir = paths::config_dir().clone();
+    let settings_path = config_dir.join("settings.json");
+    fs.insert_file(&settings_path, b"{}".to_vec());
+
+    let tree = Worktree::local(
+        config_dir.as_path(),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+
+    let entry = tree
+        .read_with(cx, |tree, _| {
+            tree.entry_for_path(rel_path("settings.json")).cloned()
+        })
+        .expect("settings.json is in the snapshot");
+    assert!(!entry.is_dir());
+    let mtime_before = entry.mtime.expect("files carry an mtime");
+    let inode_before = entry.inode;
+
+    fs.write(&settings_path, b"{\"theme\": \"One Dark\"}")
+        .await
+        .unwrap();
+    // Past the watcher's debounce window.
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(1));
+    cx.executor().run_until_parked();
+
+    let entry = tree
+        .read_with(cx, |tree, _| {
+            tree.entry_for_path(rel_path("settings.json")).cloned()
+        })
+        .expect("settings.json is still in the snapshot");
+    assert_ne!(entry.mtime, Some(mtime_before), "the rescan saw the write");
+    assert_eq!(entry.inode, inode_before, "inodes are stable across writes");
+    assert_eq!(
+        fs.load(&settings_path).await.unwrap(),
+        "{\"theme\": \"One Dark\"}"
+    );
+
+    // A file created next to it shows up too (the keymap editor writes keymap.json).
+    let keymap_path = config_dir.join("keymap.json");
+    fs.write(&keymap_path, b"[]").await.unwrap();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(1));
+    cx.executor().run_until_parked();
+    assert!(
+        tree.read_with(cx, |tree, _| {
+            tree.entry_for_path(rel_path("keymap.json")).is_some()
+        }),
+        "keymap.json is in the snapshot"
+    );
+}
+
 fn init_test(cx: &mut gpui::TestAppContext) {
     zlog::init_test();
 

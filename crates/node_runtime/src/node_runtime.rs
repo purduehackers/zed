@@ -1,12 +1,15 @@
 use anyhow::{Context as _, Result, anyhow, bail};
+#[cfg(not(target_family = "wasm"))]
 use async_compression::futures::bufread::GzipDecoder;
+#[cfg(not(target_family = "wasm"))]
 use async_tar::Archive;
 use chrono::{DateTime, Utc};
 use futures::{AsyncReadExt, FutureExt as _, channel::oneshot, future::Shared};
-use http_client::{Host, HttpClient, Url};
+use http_client::{AsyncBody, Host, HttpClient, Url};
 use log::Level;
 use semver::{Version, VersionReq};
 use serde::Deserialize;
+#[cfg(not(target_family = "wasm"))]
 use smol::io::BufReader;
 use smol::{fs, lock::Mutex};
 use std::collections::HashMap;
@@ -21,6 +24,7 @@ use std::{
     sync::Arc,
 };
 use util::ResultExt;
+#[cfg(not(target_family = "wasm"))]
 use util::archive::extract_zip;
 
 const NODE_CA_CERTS_ENV_VAR: &str = "NODE_EXTRA_CA_CERTS";
@@ -417,6 +421,39 @@ enum ArchiveType {
     Zip,
 }
 
+/// Streams a downloaded Node.js archive into `destination`.
+#[cfg(not(target_family = "wasm"))]
+async fn extract_node_archive(
+    archive_type: ArchiveType,
+    body: &mut AsyncBody,
+    destination: &Path,
+) -> Result<()> {
+    match archive_type {
+        ArchiveType::TarGz => {
+            let decompressed_bytes = GzipDecoder::new(BufReader::new(body));
+            let archive = Archive::new(decompressed_bytes);
+            archive.unpack(destination).await?;
+        }
+        ArchiveType::Zip => extract_zip(destination, body).await?,
+    }
+    Ok(())
+}
+
+/// The browser has no filesystem to extract into (and `install_if_needed` bails on
+/// `consts::OS == "unknown"` before downloading anything), so this only reports the gap.
+#[cfg(target_family = "wasm")]
+async fn extract_node_archive(
+    archive_type: ArchiveType,
+    body: &mut AsyncBody,
+    destination: &Path,
+) -> Result<()> {
+    let _ = (archive_type, body);
+    bail!(
+        "extracting Node.js archives into {} is not supported in the browser",
+        destination.display()
+    )
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct NpmInfo {
@@ -706,14 +743,7 @@ impl ManagedNodeRuntime {
             log::info!("Download of Node.js complete, extracting...");
 
             let body = response.body_mut();
-            match archive_type {
-                ArchiveType::TarGz => {
-                    let decompressed_bytes = GzipDecoder::new(BufReader::new(response.body_mut()));
-                    let archive = Archive::new(decompressed_bytes);
-                    archive.unpack(&node_containing_dir).await?;
-                }
-                ArchiveType::Zip => extract_zip(&node_containing_dir, body).await?,
-            }
+            extract_node_archive(archive_type, body, &node_containing_dir).await?;
             log::info!("Extracted Node.js to {}", node_containing_dir.display())
         }
 

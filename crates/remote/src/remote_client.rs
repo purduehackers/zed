@@ -7,6 +7,7 @@ use crate::{
     transport::{
         docker::{DockerConnectionOptions, DockerExecConnection},
         ssh::SshRemoteConnection,
+        websocket::{WebSocketConnectionOptions, WebSocketRemoteConnection},
         wsl::{WslConnectionOptions, WslRemoteConnection},
     },
 };
@@ -45,12 +46,14 @@ use std::{
         Arc, Weak,
         atomic::{AtomicU32, AtomicU64, Ordering::SeqCst},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use util::{
     ResultExt,
     paths::{PathStyle, RemotePathBuf},
 };
+// `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` on native.
+use web_time::Instant;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RemoteOs {
@@ -456,12 +459,17 @@ impl RemoteClient {
                     cx,
                 );
 
+                // Both the signal and the timeout complete on the background executor: a
+                // platform whose background workers never start hangs here without a word.
+                log::debug!("remote client: waiting for the server's RemoteStarted");
                 let ready = client
                     .wait_for_remote_started()
                     .with_timeout(INITIAL_CONNECTION_TIMEOUT, cx.background_executor())
                     .await;
                 match ready {
-                    Ok(Some(_)) => {}
+                    Ok(Some(_)) => {
+                        log::debug!("remote client: RemoteStarted received, pinging");
+                    }
                     Ok(None) => {
                         let mut error = "remote client exited before becoming ready".to_owned();
                         if let Some(status) = io_task.now_or_never() {
@@ -499,6 +507,7 @@ impl RemoteClient {
                     log::error!("failed to establish connection: {}", error);
                     return Err(error);
                 }
+                log::debug!("remote client: initial ping answered, connection established");
 
                 let heartbeat_task = Self::heartbeat(this.downgrade(), connection_activity_rx, cx);
 
@@ -543,6 +552,20 @@ impl RemoteClient {
         has_wsl_interop: bool,
     ) -> AnyProtoClient {
         ChannelClient::new(incoming_rx, outgoing_tx, cx, name, has_wsl_interop).into()
+    }
+
+    /// Like [`Self::proto_client_from_channels`], but keeps the concrete channel client so a
+    /// transport that outlives its client sessions (`zed-remote-server serve`) can reset it.
+    pub fn server_channel_from_channels(
+        incoming_rx: mpsc::UnboundedReceiver<Envelope>,
+        outgoing_tx: mpsc::UnboundedSender<Envelope>,
+        cx: &App,
+        name: &'static str,
+        has_wsl_interop: bool,
+    ) -> ServerChannel {
+        ServerChannel {
+            client: ChannelClient::new(incoming_rx, outgoing_tx, cx, name, has_wsl_interop),
+        }
     }
 
     pub fn shutdown_processes<T: RequestMessage>(
@@ -636,10 +659,11 @@ impl RemoteClient {
         };
 
         let attempts = attempts + 1;
-        if attempts > MAX_RECONNECT_ATTEMPTS {
+        let max_reconnect_attempts = remote_connection.max_reconnect_attempts();
+        if attempts > max_reconnect_attempts {
             log::error!(
                 "Failed to reconnect to after {} attempts, giving up",
-                MAX_RECONNECT_ATTEMPTS
+                max_reconnect_attempts
             );
             self.set_state(State::ReconnectExhausted, cx);
             return Ok(());
@@ -889,11 +913,21 @@ impl RemoteClient {
                         match error {
                             ProxyLaunchError::ServerNotRunning => {
                                 log::error!("failed to reconnect because server is not running");
-                                this.update(cx, |this, cx| {
-                                    this.set_state(State::ServerNotRunning, cx);
-                                })?;
+                            }
+                            ProxyLaunchError::SessionTakenOver => {
+                                log::error!(
+                                    "remote session ended because another client is attached to it"
+                                );
+                            }
+                            ProxyLaunchError::IncompatibleServer => {
+                                log::error!(
+                                    "remote session ended because the server build is incompatible with this client"
+                                );
                             }
                         }
+                        this.update(cx, |this, cx| {
+                            this.set_state(State::ServerNotRunning, cx);
+                        })?;
                     } else {
                         log::error!("proxy process terminated unexpectedly: {exit_code}");
                         this.update(cx, |this, cx| {
@@ -951,6 +985,20 @@ impl RemoteClient {
         Some(self.remote_connection()?.default_system_shell())
     }
 
+    /// Whether terminals for this remote run as server-managed PTYs over the protocol
+    /// instead of a locally spawned `ssh`-style command (D27).
+    pub fn supports_remote_pty(&self) -> bool {
+        self.remote_connection()
+            .is_some_and(|connection| connection.supports_remote_pty())
+    }
+
+    /// Whether the extension store may sync local extensions to this remote with
+    /// `upload_directory` (D27).
+    pub fn supports_extension_upload(&self) -> bool {
+        self.remote_connection()
+            .is_some_and(|connection| connection.supports_extension_upload())
+    }
+
     pub fn shares_network_interface(&self) -> bool {
         self.remote_connection()
             .map_or(false, |connection| connection.shares_network_interface())
@@ -1000,6 +1048,13 @@ impl RemoteClient {
 
     pub fn proto_client(&self) -> AnyProtoClient {
         self.client.clone().into()
+    }
+
+    /// Browser boot (b7): delivers the messages the server sent before the `Project` (and
+    /// its handlers) existed, and stops holding any more. Call once the project is open.
+    #[cfg(target_family = "wasm")]
+    pub fn replay_unhandled_messages(&self, cx: &App) {
+        self.client.replay_unhandled(&cx.to_async());
     }
 
     pub fn connection_options(&self) -> RemoteConnectionOptions {
@@ -1176,6 +1231,44 @@ impl RemoteClient {
         MockConnection::new_with_opts(mock_opts, client_cx, server_cx)
     }
 
+    /// Like [`RemoteClient::fake_server`], but the mock connection reports that
+    /// it hosts PTYs itself, so terminals go over the remote terminal protocol
+    /// (D27) instead of being spawned with `build_command`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fake_server_with_remote_pty(
+        client_cx: &mut gpui::TestAppContext,
+        server_cx: &mut gpui::TestAppContext,
+    ) -> (RemoteConnectionOptions, AnyProtoClient, ConnectGuard) {
+        use crate::transport::mock::{MockConnection, MockConnectionOptions};
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 32);
+        let opts = MockConnectionOptions {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+        };
+        let (server_client, connect_guard) = MockConnection::new_with_opts_and_remote_pty(
+            opts.clone(),
+            true,
+            client_cx,
+            server_cx,
+        );
+        (opts.into(), server_client, connect_guard)
+    }
+
+    /// Registers a new remote-PTY mock server for existing connection options,
+    /// to simulate a reconnect.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fake_server_with_opts_and_remote_pty(
+        opts: &RemoteConnectionOptions,
+        client_cx: &mut gpui::TestAppContext,
+        server_cx: &mut gpui::TestAppContext,
+    ) -> (AnyProtoClient, ConnectGuard) {
+        use crate::transport::mock::MockConnection;
+        let mock_opts = match opts {
+            RemoteConnectionOptions::Mock(mock_opts) => mock_opts.clone(),
+            _ => panic!("fake_server_with_opts_and_remote_pty requires Mock connection options"),
+        };
+        MockConnection::new_with_opts_and_remote_pty(mock_opts, true, client_cx, server_cx)
+    }
+
     /// Creates a `RemoteClient` connected to a mock server.
     ///
     /// Call `fake_server` first to get the connection options, set up the
@@ -1284,6 +1377,11 @@ impl ConnectionPool {
                                 .await
                                 .map(|connection| Arc::new(connection) as Arc<dyn RemoteConnection>)
                         }
+                        RemoteConnectionOptions::WebSocket(opts) => {
+                            WebSocketRemoteConnection::new(opts, delegate, cx)
+                                .await
+                                .map(|connection| Arc::new(connection) as Arc<dyn RemoteConnection>)
+                        }
                         #[cfg(any(test, feature = "test-support"))]
                         RemoteConnectionOptions::Mock(opts) => match cx.update(|cx| {
                             cx.default_global::<crate::transport::mock::MockConnectionRegistry>()
@@ -1331,6 +1429,10 @@ pub enum RemoteConnectionOptions {
     Ssh(SshConnectionOptions),
     Wsl(WslConnectionOptions),
     Docker(DockerConnectionOptions),
+    /// A cloud workspace served by `zed-remote-server serve` over one WebSocket. `Hash`/`Eq`
+    /// delegate to the options' `workspace_id`-only implementations, so the pool key survives
+    /// URL, token and session-id rotation.
+    WebSocket(WebSocketConnectionOptions),
     #[cfg(any(test, feature = "test-support"))]
     Mock(crate::transport::mock::MockConnectionOptions),
 }
@@ -1350,13 +1452,14 @@ impl RemoteConnectionOptions {
                     opts.name.clone()
                 }
             }
+            RemoteConnectionOptions::WebSocket(opts) => opts.display_name(),
             #[cfg(any(test, feature = "test-support"))]
             RemoteConnectionOptions::Mock(opts) => format!("mock-{}", opts.id),
         }
     }
 
     /// A stable identifier for the kind of remote connection, suitable for
-    /// telemetry (e.g. `"ssh"`, `"wsl"`, `"docker"`, `"podman"`).
+    /// telemetry (e.g. `"ssh"`, `"wsl"`, `"docker"`, `"podman"`, `"websocket"`).
     pub fn connection_type(&self) -> &'static str {
         match self {
             RemoteConnectionOptions::Ssh(_) => "ssh",
@@ -1368,6 +1471,7 @@ impl RemoteConnectionOptions {
                     "docker"
                 }
             }
+            RemoteConnectionOptions::WebSocket(_) => "websocket",
             #[cfg(any(test, feature = "test-support"))]
             RemoteConnectionOptions::Mock(_) => "mock",
         }
@@ -1563,6 +1667,114 @@ mod tests {
             "stream channel should be removed once the consumer has dropped the stream"
         );
     }
+
+    struct Responder;
+
+    #[gpui::test]
+    async fn test_server_channel_drops_responses_of_a_replaced_session(cx: &mut TestAppContext) {
+        let (incoming_tx, incoming_rx) = mpsc::unbounded::<Envelope>();
+        let (outgoing_tx, mut old_outgoing_rx) = mpsc::unbounded::<Envelope>();
+        let channel = cx.update(|cx| {
+            RemoteClient::server_channel_from_channels(
+                incoming_rx,
+                outgoing_tx,
+                cx,
+                "server",
+                false,
+            )
+        });
+        let client = channel.proto_client();
+        let responder = cx.new(|_| Responder);
+
+        // The first handler invocation blocks on the gate; later ones answer at once.
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let gate = Arc::new(Mutex::new(Some(release_rx)));
+        client.add_request_handler(responder.downgrade(), {
+            let gate = gate.clone();
+            move |_, _: proto::TypedEnvelope<proto::Ping>, _| {
+                let pending = gate.lock().take();
+                async move {
+                    if let Some(pending) = pending {
+                        pending.await.ok();
+                    }
+                    Ok(proto::Ack {})
+                }
+            }
+        });
+
+        incoming_tx
+            .unbounded_send(proto::Ping {}.into_envelope(40, None, None))
+            .unwrap();
+        cx.run_until_parked();
+
+        let mut ends = cx.update(|cx| channel.begin_fresh_session(&cx.to_async()));
+        ends.incoming_tx
+            .unbounded_send(proto::Ping {}.into_envelope(40, None, None))
+            .unwrap();
+        cx.run_until_parked();
+        release_tx.send(()).unwrap();
+        cx.run_until_parked();
+
+        let mut new_responses = Vec::new();
+        while let Ok(envelope) = ends.outgoing_rx.try_recv() {
+            if envelope.responding_to == Some(40) {
+                new_responses.push(envelope);
+            }
+        }
+        assert_eq!(
+            new_responses.len(),
+            1,
+            "the replaced session's late response must not reach the new client"
+        );
+        while let Ok(envelope) = old_outgoing_rx.try_recv() {
+            assert_ne!(
+                envelope.responding_to,
+                Some(40),
+                "the old channel never sees the late response either"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_server_channel_replace_buffered(cx: &mut TestAppContext) {
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded::<Envelope>();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded::<Envelope>();
+        let channel = cx.update(|cx| {
+            RemoteClient::server_channel_from_channels(
+                incoming_rx,
+                outgoing_tx,
+                cx,
+                "server",
+                false,
+            )
+        });
+        let client = channel.proto_client();
+        client.send(proto::Ping {}).unwrap();
+        cx.run_until_parked();
+
+        let mut sent_id = None;
+        while let Ok(envelope) = outgoing_rx.try_recv() {
+            if matches!(envelope.payload, Some(proto::envelope::Payload::Ping(_))) {
+                sent_id = Some(envelope.id);
+            }
+        }
+        let sent_id = sent_id.expect("the ping was sent");
+
+        let replacement = proto::Ack {}.into_envelope(sent_id, None, None);
+        assert!(channel.replace_buffered(sent_id, Some(replacement)));
+        assert!(matches!(
+            channel
+                .client
+                .buffer
+                .lock()
+                .front()
+                .map(|envelope| &envelope.payload),
+            Some(Some(proto::envelope::Payload::Ack(_)))
+        ));
+        assert!(channel.replace_buffered(sent_id, None));
+        assert!(channel.client.buffer.lock().is_empty());
+        assert!(!channel.replace_buffered(sent_id, None));
+    }
 }
 
 impl From<SshConnectionOptions> for RemoteConnectionOptions {
@@ -1574,6 +1786,12 @@ impl From<SshConnectionOptions> for RemoteConnectionOptions {
 impl From<WslConnectionOptions> for RemoteConnectionOptions {
     fn from(opts: WslConnectionOptions) -> Self {
         RemoteConnectionOptions::Wsl(opts)
+    }
+}
+
+impl From<WebSocketConnectionOptions> for RemoteConnectionOptions {
+    fn from(opts: WebSocketConnectionOptions) -> Self {
+        RemoteConnectionOptions::WebSocket(opts)
     }
 }
 
@@ -1639,9 +1857,39 @@ pub trait RemoteConnection: Send + Sync {
     fn shell(&self) -> String;
     fn default_system_shell(&self) -> String;
     fn has_wsl_interop(&self) -> bool;
+    /// How many consecutive reconnect attempts `RemoteClient` makes before giving up with
+    /// `ReconnectExhausted`. Transports whose redial is cheap and expected (a sandbox
+    /// resuming behind a WebSocket) raise it; `0` stops retrying at once.
+    fn max_reconnect_attempts(&self) -> usize {
+        MAX_RECONNECT_ATTEMPTS
+    }
+    /// Whether terminals are server-managed PTYs driven over the protocol (D27).
+    fn supports_remote_pty(&self) -> bool {
+        false
+    }
+    /// Whether `upload_directory` works, i.e. whether the extension store may sync local
+    /// extensions to this remote (D27).
+    fn supports_extension_upload(&self) -> bool {
+        true
+    }
 
     #[cfg(any(test, feature = "test-support"))]
     fn simulate_disconnect(&self, _: &AsyncApp) {}
+}
+
+/// Resolves with whichever future completes first, dropping the other. Replaces
+/// `smol::future::or`, which the browser build's `smol` shim does not provide.
+async fn first_to_finish<T>(
+    left: impl Future<Output = T>,
+    right: impl Future<Output = T>,
+) -> T {
+    let left = std::pin::pin!(left);
+    let right = std::pin::pin!(right);
+    match futures::future::select(left, right).await {
+        futures::future::Either::Left((value, _)) | futures::future::Either::Right((value, _)) => {
+            value
+        }
+    }
 }
 
 type ResponseChannels = Mutex<HashMap<MessageId, oneshot::Sender<(Envelope, oneshot::Sender<()>)>>>;
@@ -1679,6 +1927,71 @@ impl<T: Send + Clone + 'static> Signal<T> {
     }
 }
 
+/// The broker's ends of a channel pair.
+pub struct ChannelEnds {
+    /// Envelopes from the client go in here.
+    pub incoming_tx: mpsc::UnboundedSender<Envelope>,
+    /// Envelopes for the client come out of here.
+    pub outgoing_rx: mpsc::UnboundedReceiver<Envelope>,
+}
+
+/// Server-side handle on the channel client, for transports that keep the server process
+/// alive across client sessions (`zed-remote-server serve`).
+#[derive(Clone)]
+pub struct ServerChannel {
+    client: Arc<ChannelClient>,
+}
+
+impl ServerChannel {
+    /// The client as the `AnyProtoClient` the headless project is built on.
+    pub fn proto_client(&self) -> AnyProtoClient {
+        self.client.clone().into()
+    }
+
+    /// Replaces (or, with `None`, removes) the envelope with `id` in the unacked replay
+    /// buffer, so a message the transport refused to send is not replayed on every reconnect.
+    /// Returns whether an envelope with that id was buffered.
+    pub fn replace_buffered(&self, id: u32, replacement: Option<Envelope>) -> bool {
+        let mut buffer = self.client.buffer.lock();
+        let Some(index) = buffer.iter().position(|envelope| envelope.id == id) else {
+            return false;
+        };
+        match replacement {
+            Some(replacement) => buffer[index] = replacement,
+            None => {
+                buffer.remove(index);
+            }
+        }
+        true
+    }
+
+    /// Forgets everything that belonged to the previous client and re-runs the initial
+    /// handshake on a new channel pair: clears the unacked replay buffer, resets the
+    /// received-id watermark, drops pending response channels (their futures fail), then
+    /// restarts message handling, which sends `RemoteStarted` into the new `outgoing_tx`.
+    /// Everything queued on the old `outgoing_rx` dies with it when the caller drops it.
+    /// `next_message_id` is deliberately not reset: the client only uses server ids as an
+    /// ack watermark, and monotonic ids keep buffer trimming correct.
+    pub fn begin_fresh_session(&self, cx: &AsyncApp) -> ChannelEnds {
+        let (incoming_tx, incoming_rx) = mpsc::unbounded();
+        let (outgoing_tx, outgoing_rx) = mpsc::unbounded();
+        let client = &self.client;
+        // Handlers dispatched for the previous client keep running; bumping the generation
+        // makes their late responses drop instead of reaching the new client's requests,
+        // whose ids restart at 0 and would otherwise collide.
+        client.generation.fetch_add(1, SeqCst);
+        client.buffer.lock().clear();
+        client.max_received.store(0, SeqCst);
+        client.response_channels.lock().clear();
+        client.stream_response_channels.lock().clear();
+        client.reconnect(incoming_rx, outgoing_tx, cx);
+        ChannelEnds {
+            incoming_tx,
+            outgoing_rx,
+        }
+    }
+}
+
 pub(crate) struct ChannelClient {
     next_message_id: AtomicU32,
     outgoing_tx: Mutex<mpsc::UnboundedSender<Envelope>>,
@@ -1687,11 +2000,92 @@ pub(crate) struct ChannelClient {
     stream_response_channels: StreamResponseChannels,
     message_handlers: Mutex<ProtoMessageHandlerSet>,
     max_received: AtomicU32,
+    /// Bumped by `ServerChannel::begin_fresh_session`; a handler dispatched under an older
+    /// generation answers a client that is gone, so its response is dropped.
+    generation: AtomicU64,
     name: &'static str,
     task: Mutex<Task<Result<()>>>,
     remote_started: Signal<()>,
     has_wsl_interop: bool,
     executor: BackgroundExecutor,
+    /// Browser boot (b7): the `Project` that registers the handlers for what the server
+    /// replays right after `HelloAck` (`PortsChanged`, a pending `LifecycleNotice`) is only
+    /// created after the client-state round trip, so messages without a handler are held
+    /// here until [`ChannelClient::replay_unhandled`] delivers them; `None` once delivered
+    /// (or from the start, natively), after which such messages are answered with an error
+    /// as before.
+    #[cfg(target_family = "wasm")]
+    unhandled_before_handlers: Mutex<Option<Vec<Box<dyn proto::AnyTypedEnvelope>>>>,
+}
+
+/// Most a boot holds back before falling through to the error path; the replay after attach
+/// is a handful of messages.
+#[cfg(target_family = "wasm")]
+const MAX_UNHANDLED_BEFORE_HANDLERS: usize = 64;
+
+/// The client a dispatched message handler answers through: `send_response` is dropped once
+/// the session that carried the request has been replaced by a fresh one.
+struct SessionScopedClient {
+    client: Arc<ChannelClient>,
+    generation: u64,
+}
+
+impl SessionScopedClient {
+    fn is_replaced(&self) -> bool {
+        self.client.generation.load(SeqCst) != self.generation
+    }
+}
+
+impl ProtoClient for SessionScopedClient {
+    fn request(
+        &self,
+        envelope: proto::Envelope,
+        request_type: &'static str,
+    ) -> BoxFuture<'static, Result<proto::Envelope>> {
+        self.client
+            .request_dynamic(envelope, request_type, true)
+            .boxed()
+    }
+
+    fn request_stream(
+        &self,
+        envelope: proto::Envelope,
+        request_type: &'static str,
+    ) -> BoxFuture<'static, Result<BoxStream<'static, Result<proto::Envelope>>>> {
+        self.client
+            .request_stream_dynamic(envelope, request_type)
+            .boxed()
+    }
+
+    // `AnyProtoClient::send_response` arrives here as `send` with `responding_to` set, so
+    // both entry points apply the generation check to responses.
+    fn send(&self, envelope: proto::Envelope, message_type: &'static str) -> Result<()> {
+        if envelope.responding_to.is_some() && self.is_replaced() {
+            log::debug!(
+                "{}:dropping {message_type} response to request {:?} of a replaced session",
+                self.client.name,
+                envelope.responding_to
+            );
+            return Ok(());
+        }
+        self.client.send_dynamic(envelope)
+    }
+
+    fn send_response(&self, envelope: Envelope, message_type: &'static str) -> Result<()> {
+        self.send(envelope, message_type)
+    }
+
+    fn message_handler_set(&self) -> &Mutex<ProtoMessageHandlerSet> {
+        &self.client.message_handlers
+    }
+
+    fn is_via_collab(&self) -> bool {
+        false
+    }
+
+    fn has_wsl_interop(&self) -> bool {
+        self.client.has_wsl_interop
+    }
 }
 
 impl ChannelClient {
@@ -1706,6 +2100,7 @@ impl ChannelClient {
             outgoing_tx: Mutex::new(outgoing_tx),
             next_message_id: AtomicU32::new(0),
             max_received: AtomicU32::new(0),
+            generation: AtomicU64::new(0),
             response_channels: ResponseChannels::default(),
             stream_response_channels: StreamResponseChannels::default(),
             message_handlers: Default::default(),
@@ -1719,11 +2114,87 @@ impl ChannelClient {
             )),
             remote_started: Signal::new(cx),
             has_wsl_interop,
+            #[cfg(target_family = "wasm")]
+            unhandled_before_handlers: Mutex::new(Some(Vec::new())),
         })
     }
 
     fn wait_for_remote_started(&self) -> Shared<Task<Option<()>>> {
         self.remote_started.wait()
+    }
+
+    /// Holds `envelope` back while the boot buffer is active and no handler exists for its
+    /// type; returns it when it must be dispatched (or refused) right away.
+    #[cfg(target_family = "wasm")]
+    fn hold_until_handlers_exist(
+        &self,
+        envelope: Box<dyn proto::AnyTypedEnvelope>,
+    ) -> std::result::Result<(), Box<dyn proto::AnyTypedEnvelope>> {
+        let mut held = self.unhandled_before_handlers.lock();
+        let Some(held) = held.as_mut() else {
+            return Err(envelope);
+        };
+        let has_handler = self
+            .message_handlers
+            .lock()
+            .message_handlers
+            .contains_key(&envelope.payload_type_id());
+        if has_handler || held.len() >= MAX_UNHANDLED_BEFORE_HANDLERS {
+            return Err(envelope);
+        }
+        log::debug!(
+            "{}:holding {} until its handler is registered",
+            self.name,
+            envelope.payload_type_name()
+        );
+        held.push(envelope);
+        Ok(())
+    }
+
+    /// Dispatches the messages held by [`Self::hold_until_handlers_exist`] and stops
+    /// holding any more; a message still without a handler is answered with an error, as
+    /// the receive loop does.
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn replay_unhandled(self: &Arc<Self>, cx: &AsyncApp) {
+        let held = self.unhandled_before_handlers.lock().take();
+        for envelope in held.into_iter().flatten() {
+            let type_name = envelope.payload_type_name();
+            let message_id = envelope.message_id();
+            let scoped_client: AnyProtoClient = Arc::new(SessionScopedClient {
+                client: self.clone(),
+                generation: self.generation.load(SeqCst),
+            })
+            .into();
+            if let Some(future) = ProtoMessageHandlerSet::handle_message(
+                &self.message_handlers,
+                envelope,
+                scoped_client,
+                cx.clone(),
+            ) {
+                log::debug!("{}:replaying held message. name:{type_name}", self.name);
+                let name = self.name;
+                cx.foreground_executor()
+                    .spawn(async move {
+                        if let Err(error) = future.await {
+                            log::error!(
+                                "{name}:error handling held message. type:{type_name}, error:{error:#}"
+                            );
+                        }
+                    })
+                    .detach();
+            } else {
+                log::error!("{}:unhandled held message name:{type_name}", self.name);
+                if let Err(error) = AnyProtoClient::from(self.clone()).send_response(
+                    message_id,
+                    anyhow::anyhow!("no handler registered for {type_name}").to_proto(),
+                ) {
+                    log::error!(
+                        "{}:error sending error response for {type_name}:{error:#}",
+                        self.name
+                    );
+                }
+            }
+        }
     }
 
     fn start_handling_messages(
@@ -1770,6 +2241,7 @@ impl ChannelClient {
                 }
 
                 if let Some(proto::envelope::Payload::RemoteStarted(_)) = &incoming.payload {
+                    log::debug!("{}:remote message received. name:RemoteStarted", this.name);
                     this.remote_started.set(());
                     let mut envelope = proto::Ack {}.into_envelope(0, Some(incoming.id), None);
                     envelope.id = this.next_message_id.fetch_add(1, SeqCst);
@@ -1777,7 +2249,10 @@ impl ChannelClient {
                     continue;
                 }
 
-                this.max_received.store(incoming.id, SeqCst);
+                // Server ids only ever grow, so the watermark is monotonic; this also keeps a
+                // locally synthesized response (id 0, e.g. the WebSocket transport's
+                // oversize-envelope error) from rolling the ack we send the server back to 0.
+                this.max_received.fetch_max(incoming.id, SeqCst);
 
                 if let Some(request_id) = incoming.responding_to {
                     let request_id = MessageId(request_id);
@@ -1819,12 +2294,22 @@ impl ChannelClient {
                 } else if let Some(envelope) =
                     build_typed_envelope(peer_id, Instant::now(), incoming)
                 {
+                    #[cfg(target_family = "wasm")]
+                    let envelope = match this.hold_until_handlers_exist(envelope) {
+                        Ok(()) => continue,
+                        Err(envelope) => envelope,
+                    };
                     let type_name = envelope.payload_type_name();
                     let message_id = envelope.message_id();
+                    let scoped_client: AnyProtoClient = Arc::new(SessionScopedClient {
+                        client: this.clone(),
+                        generation: this.generation.load(SeqCst),
+                    })
+                    .into();
                     if let Some(future) = ProtoMessageHandlerSet::handle_message(
                         &this.message_handlers,
                         envelope,
-                        this.clone().into(),
+                        scoped_client,
                         cx.clone(),
                     ) {
                         log::debug!("{}:remote message received. name:{type_name}", this.name);
@@ -1908,39 +2393,35 @@ impl ChannelClient {
     }
 
     async fn resync(&self, timeout: Duration) -> Result<()> {
-        smol::future::or(
-            async {
-                self.request_internal(proto::FlushBufferedMessages {}, false)
-                    .await?;
+        let resync = async {
+            self.request_internal(proto::FlushBufferedMessages {}, false)
+                .await?;
 
-                for envelope in self.buffer.lock().iter() {
-                    self.outgoing_tx
-                        .lock()
-                        .unbounded_send(envelope.clone())
-                        .ok();
-                }
-                Ok(())
-            },
-            async {
-                self.executor.timer(timeout).await;
-                anyhow::bail!("Timed out resyncing remote client")
-            },
-        )
-        .await
+            for envelope in self.buffer.lock().iter() {
+                self.outgoing_tx
+                    .lock()
+                    .unbounded_send(envelope.clone())
+                    .ok();
+            }
+            Ok(())
+        };
+        let timeout = async {
+            self.executor.timer(timeout).await;
+            anyhow::bail!("Timed out resyncing remote client")
+        };
+        first_to_finish(resync, timeout).await
     }
 
     async fn ping(&self, timeout: Duration) -> Result<()> {
-        smol::future::or(
-            async {
-                self.request(proto::Ping {}).await?;
-                Ok(())
-            },
-            async {
-                self.executor.timer(timeout).await;
-                anyhow::bail!("Timed out pinging remote client")
-            },
-        )
-        .await
+        let ping = async {
+            self.request(proto::Ping {}).await?;
+            Ok(())
+        };
+        let timeout = async {
+            self.executor.timer(timeout).await;
+            anyhow::bail!("Timed out pinging remote client")
+        };
+        first_to_finish(ping, timeout).await
     }
 
     fn send<T: EnvelopedMessage>(&self, payload: T) -> Result<()> {

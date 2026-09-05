@@ -18,7 +18,9 @@ use lsp::{
 };
 use serde::Serialize;
 use serde_json::Value;
-use util::{ResultExt, fs::make_file_executable, maybe, rel_path::RelPath};
+#[cfg(not(target_family = "wasm"))]
+use util::fs::make_file_executable;
+use util::{ResultExt, maybe, rel_path::RelPath};
 
 use crate::{LanguageServerRegistryProxy, LspAccess};
 
@@ -211,6 +213,11 @@ impl DynLspInstaller for ExtensionLspAdapter {
                 // We can remove once the following extension versions no longer see any use:
                 // - toml@0.0.2
                 // - zig@0.0.1
+                //
+                // On wasm `util::fs` is gated out: extensions cannot spawn local binaries there
+                // (the smol shim's `process` module fails every spawn), so there is nothing to
+                // mark executable, matching `make_file_executable`'s no-op on non-unix targets.
+                #[cfg(not(target_family = "wasm"))]
                 if ["toml", "zig"].contains(&self.extension.manifest().id.as_ref())
                     && path.starts_with(&self.extension.work_dir())
                 {

@@ -17,9 +17,10 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::Write;
 use std::sync::LazyLock;
-use std::time::Instant;
 use std::{env, mem, path::PathBuf, sync::Arc, time::Duration};
+// `std::time::Instant` natively; on wasm `Instant::now()` panics.
 use telemetry_events::{AssistantEventData, AssistantPhase, Event, EventRequestBody, EventWrapper};
+use web_time::Instant;
 
 pub struct TelemetrySubscription {
     pub historical_events: Result<HistoricalEvents>,
@@ -124,6 +125,10 @@ pub fn os_name() -> String {
     {
         "Windows".to_string()
     }
+    #[cfg(target_family = "wasm")]
+    {
+        "Web".to_string()
+    }
 }
 
 /// Note: This might do blocking IO! Only call from background threads
@@ -132,6 +137,9 @@ pub fn os_version() -> String {
        feature = "test-support" => {
            // MacOS branch in particular is quite slow, hence we ought to "avoid" it in tests.
            "test binary".to_owned()
+       }
+       target_family = "wasm" => {
+           "unknown".to_string()
        }
        target_os = "macos" => {
            static MACOS_VERSION_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -182,6 +190,26 @@ pub fn os_version() -> String {
     }
 }
 
+/// Whether this build collects and sends telemetry at all. The browser bundle never does:
+/// it has no installation to attribute events to, its CSP does not allow the POST to
+/// zed.dev, and the decision must not hinge on another crate's default settings.
+const TELEMETRY_SUPPORTED: bool = cfg!(not(target_family = "wasm"));
+
+/// The settings telemetry runs with: as configured where telemetry is supported, and with
+/// metrics and diagnostics forced off otherwise, whatever the user's settings say.
+/// `anthropic_retention` is a consent flag other code reads and is left alone.
+fn settings_for_target(settings: TelemetrySettings, supported: bool) -> TelemetrySettings {
+    if supported {
+        settings
+    } else {
+        TelemetrySettings {
+            diagnostics: false,
+            metrics: false,
+            anthropic_retention: settings.anthropic_retention,
+        }
+    }
+}
+
 impl Telemetry {
     pub fn new(
         clock: Arc<dyn SystemClock>,
@@ -189,7 +217,7 @@ impl Telemetry {
         cx: &mut App,
     ) -> Arc<Self> {
         let state = Arc::new(Mutex::new(TelemetryState {
-            settings: *TelemetrySettings::get_global(cx),
+            settings: settings_for_target(*TelemetrySettings::get_global(cx), TELEMETRY_SUPPORTED),
             architecture: env::consts::ARCH,
             release_channel: ReleaseChannel::try_global(cx),
             system_id: None,
@@ -211,24 +239,27 @@ impl Telemetry {
             subscribers: Vec::new(),
         }));
 
-        cx.background_spawn({
-            let state = state.clone();
-            let os_version = os_version();
-            state.lock().os_version = Some(os_version);
-            async move {
-                if let Some(tempfile) = File::create(Self::log_file_path()).ok() {
-                    state.lock().log_file = Some(tempfile);
+        state.lock().os_version = Some(os_version());
+        // No log directory exists in the browser, and nothing would be written to it.
+        if TELEMETRY_SUPPORTED {
+            cx.background_spawn({
+                let state = state.clone();
+                async move {
+                    if let Some(tempfile) = File::create(Self::log_file_path()).ok() {
+                        state.lock().log_file = Some(tempfile);
+                    }
                 }
-            }
-        })
-        .detach();
+            })
+            .detach();
+        }
 
         cx.observe_global::<SettingsStore>({
             let state = state.clone();
 
             move |cx| {
                 let mut state = state.lock();
-                state.settings = *TelemetrySettings::get_global(cx);
+                state.settings =
+                    settings_for_target(*TelemetrySettings::get_global(cx), TELEMETRY_SUPPORTED);
             }
         })
         .detach();
@@ -423,7 +454,7 @@ impl Telemetry {
         drop(state);
 
         if let Some(mut last_event) = LAST_EVENT_TIME.try_lock() {
-            let current_time = std::time::Instant::now();
+            let current_time = Instant::now();
             let last_time = last_event.get_or_insert(current_time);
 
             if current_time.duration_since(*last_time) > Duration::from_secs(60 * 10) {
@@ -743,6 +774,35 @@ mod tests {
     use telemetry_events::FlexibleEvent;
     use util::rel_path::RelPath;
     use worktree::{PathChange, ProjectEntryId, WorktreeId};
+
+    #[test]
+    fn os_name_and_version_are_never_empty() {
+        assert!(!os_name().is_empty());
+        assert!(!os_version().is_empty());
+    }
+
+    /// The browser build (`TELEMETRY_SUPPORTED == false`) collects nothing even when the
+    /// user's settings turn telemetry on; `report_event` and `set_authenticated_user_info`
+    /// both return early on `settings.metrics`.
+    #[test]
+    fn settings_for_target_forces_collection_off_where_unsupported() {
+        let configured = TelemetrySettings {
+            diagnostics: true,
+            metrics: true,
+            anthropic_retention: true,
+        };
+        let unsupported = settings_for_target(configured, false);
+        assert!(!unsupported.metrics);
+        assert!(!unsupported.diagnostics);
+        assert!(
+            unsupported.anthropic_retention,
+            "consent flags are not touched"
+        );
+
+        let supported = settings_for_target(configured, true);
+        assert!(supported.metrics);
+        assert!(supported.diagnostics);
+    }
 
     #[gpui::test]
     async fn test_telemetry_flush_on_max_queue_size(

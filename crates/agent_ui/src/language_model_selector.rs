@@ -333,15 +333,18 @@ impl ModelMatcher {
     }
 
     pub fn fuzzy_search(&self, query: &str) -> Vec<ModelInfo> {
-        let mut matches = self.fg_executor.block_on(match_strings(
-            &self.candidates,
-            query,
-            false,
-            true,
-            100,
-            &Default::default(),
-            self.bg_executor.clone(),
-        ));
+        let mut matches = crate::block_on_match_strings(
+            &self.fg_executor,
+            match_strings(
+                &self.candidates,
+                query,
+                false,
+                true,
+                100,
+                &Default::default(),
+                self.bg_executor.clone(),
+            ),
+        );
 
         let sorting_key = |mat: &StringMatch| {
             let candidate = &self.candidates[mat.candidate_id];

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Archiver for `--target wasm32-unknown-unknown`, referenced from .cargo/config.toml [env].
+# Resolves the SDK exactly like script/wasm-cc (`WASI_SDK_PATH` or target/wasi-sdk, pinned
+# version only), so an override cannot pair one SDK's clang with another SDK's llvm-ar.
+set -euo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/wasi-sdk-env"
+wasi_sdk_check script/wasm-ar || exit 1
+exec "$WASI_SDK_DIR/bin/llvm-ar" "$@"

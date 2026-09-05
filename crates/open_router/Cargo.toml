@@ -26,6 +26,8 @@ serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
 thiserror.workspace = true
+# `std::time::SystemTime::now()` panics on wasm; `web-time` re-exports `std` on native.
+web-time.workspace = true
 
 [dev-dependencies]
 http_client = { workspace = true, features = ["test-support"] }

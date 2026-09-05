@@ -1,8 +1,8 @@
 use editor::{Bias, Editor, SelectionEffects, scroll::Autoscroll, styled_runs_for_code_label};
 use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{
-    App, Context, DismissEvent, Entity, HighlightStyle, ParentElement, StyledText, Task, TaskExt,
-    TextStyle, WeakEntity, Window, relative,
+    App, BackgroundExecutor, Context, DismissEvent, Entity, HighlightStyle, ParentElement,
+    StyledText, Task, TaskExt, TextStyle, WeakEntity, Window, relative,
 };
 use ordered_float::OrderedFloat;
 use picker::{Picker, PickerDelegate, PreviewUpdate};
@@ -64,26 +64,57 @@ impl ProjectSymbolsDelegate {
     }
 
     // Note if you make changes to this, also change `agent_ui::completion_provider::search_symbols`
-    fn filter(&mut self, query: &str, window: &mut Window, cx: &mut Context<Picker<Self>>) {
-        const MAX_MATCHES: usize = 100;
-        let mut visible_matches = cx.foreground_executor().block_on(fuzzy::match_strings(
-            &self.visible_match_candidates,
-            query,
-            false,
-            true,
-            MAX_MATCHES,
-            &Default::default(),
-            cx.background_executor().clone(),
-        ));
-        let mut external_matches = cx.foreground_executor().block_on(fuzzy::match_strings(
-            &self.external_match_candidates,
-            query,
-            false,
-            true,
-            MAX_MATCHES - visible_matches.len().min(MAX_MATCHES),
-            &Default::default(),
-            cx.background_executor().clone(),
-        ));
+    fn filter(
+        &mut self,
+        query: &str,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Task<()> {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let (visible_matches, external_matches) =
+                cx.foreground_executor().block_on(match_candidates(
+                    &self.visible_match_candidates,
+                    &self.external_match_candidates,
+                    query,
+                    cx.background_executor().clone(),
+                ));
+            self.set_matches(visible_matches, external_matches, window, cx);
+            Task::ready(())
+        }
+
+        // The browser's main thread cannot block, so the matcher runs in a foreground task
+        // that writes the matches back when it lands. The task cannot borrow the delegate,
+        // hence the cloned candidates. The picker only re-renders on notify, so notify here
+        // to show the matches against the current symbols while the LSP request is in
+        // flight, as the synchronous native path does.
+        #[cfg(target_family = "wasm")]
+        {
+            let visible_candidates = self.visible_match_candidates.clone();
+            let external_candidates = self.external_match_candidates.clone();
+            let query = query.to_owned();
+            let executor = cx.background_executor().clone();
+            cx.spawn_in(window, async move |this, cx| {
+                let (visible_matches, external_matches) =
+                    match_candidates(&visible_candidates, &external_candidates, &query, executor)
+                        .await;
+                this.update_in(cx, |this, window, cx| {
+                    this.delegate
+                        .set_matches(visible_matches, external_matches, window, cx);
+                    cx.notify();
+                })
+                .log_err();
+            })
+        }
+    }
+
+    fn set_matches(
+        &mut self,
+        mut visible_matches: Vec<StringMatch>,
+        mut external_matches: Vec<StringMatch>,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) {
         let sort_key_for_match = |mat: &StringMatch| {
             let symbol = &self.symbols[mat.candidate_id];
             (Reverse(OrderedFloat(mat.score)), symbol.label.filter_text())
@@ -105,6 +136,36 @@ impl ProjectSymbolsDelegate {
         self.matches = matches;
         self.set_selected_index(0, window, cx);
     }
+}
+
+async fn match_candidates(
+    visible_candidates: &[StringMatchCandidate],
+    external_candidates: &[StringMatchCandidate],
+    query: &str,
+    executor: BackgroundExecutor,
+) -> (Vec<StringMatch>, Vec<StringMatch>) {
+    const MAX_MATCHES: usize = 100;
+    let visible_matches = fuzzy::match_strings(
+        visible_candidates,
+        query,
+        false,
+        true,
+        MAX_MATCHES,
+        &Default::default(),
+        executor.clone(),
+    )
+    .await;
+    let external_matches = fuzzy::match_strings(
+        external_candidates,
+        query,
+        false,
+        true,
+        MAX_MATCHES - visible_matches.len().min(MAX_MATCHES),
+        &Default::default(),
+        executor,
+    )
+    .await;
+    (visible_matches, external_matches)
 }
 
 impl PickerDelegate for ProjectSymbolsDelegate {
@@ -215,39 +276,45 @@ impl PickerDelegate for ProjectSymbolsDelegate {
             .rsplit_once("::")
             .map_or(&*query, |(_, suffix)| suffix)
             .to_owned();
-        self.filter(&query_filter, window, cx);
+        let initial_filter = self.filter(&query_filter, window, cx);
         self.show_worktree_root_name = self.project.read(cx).visible_worktrees(cx).count() > 1;
         let symbols = self
             .project
             .update(cx, |project, cx| project.symbols(&query, cx));
         cx.spawn_in(window, async move |this, cx| {
+            initial_filter.await;
             let symbols = symbols.await.log_err();
             if let Some(symbols) = symbols {
-                this.update_in(cx, |this, window, cx| {
-                    let delegate = &mut this.delegate;
-                    let project = delegate.project.read(cx);
-                    let (visible_match_candidates, external_match_candidates) = symbols
-                        .iter()
-                        .enumerate()
-                        .map(|(id, symbol)| {
-                            StringMatchCandidate::new(id, symbol.label.filter_text())
-                        })
-                        .partition(|candidate| {
-                            if let SymbolLocation::InProject(path) = &symbols[candidate.id].path {
-                                project
-                                    .entry_for_path(path, cx)
-                                    .is_some_and(|e| !e.is_ignored)
-                            } else {
-                                false
-                            }
-                        });
+                let filter = this
+                    .update_in(cx, |this, window, cx| {
+                        let delegate = &mut this.delegate;
+                        let project = delegate.project.read(cx);
+                        let (visible_match_candidates, external_match_candidates) = symbols
+                            .iter()
+                            .enumerate()
+                            .map(|(id, symbol)| {
+                                StringMatchCandidate::new(id, symbol.label.filter_text())
+                            })
+                            .partition(|candidate| {
+                                if let SymbolLocation::InProject(path) = &symbols[candidate.id].path
+                                {
+                                    project
+                                        .entry_for_path(path, cx)
+                                        .is_some_and(|e| !e.is_ignored)
+                                } else {
+                                    false
+                                }
+                            });
 
-                    delegate.visible_match_candidates = visible_match_candidates;
-                    delegate.external_match_candidates = external_match_candidates;
-                    delegate.symbols = symbols;
-                    delegate.filter(&query_filter, window, cx);
-                })
-                .log_err();
+                        delegate.visible_match_candidates = visible_match_candidates;
+                        delegate.external_match_candidates = external_match_candidates;
+                        delegate.symbols = symbols;
+                        delegate.filter(&query_filter, window, cx)
+                    })
+                    .log_err();
+                if let Some(filter) = filter {
+                    filter.await;
+                }
             }
         })
     }

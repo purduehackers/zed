@@ -295,6 +295,47 @@ pub async fn match_path_sets<'a, Set: PathMatchCandidateSet<'a>>(
     let mut config = nucleo::Config::DEFAULT;
     config.set_match_paths();
     let mut matchers = matcher::get_matchers(num_cpus, config);
+
+    let match_segment =
+        |segment_idx: usize, results: &mut Vec<PathMatch>, matcher: &mut nucleo::Matcher| {
+            let segment_start = segment_idx * segment_size;
+            let segment_end = segment_start + segment_size;
+
+            let mut tree_start = 0;
+            for candidate_set in candidate_sets {
+                let tree_end = tree_start + candidate_set.len();
+
+                if tree_start < segment_end && segment_start < tree_end {
+                    let start = tree_start.max(segment_start) - tree_start;
+                    let end = tree_end.min(segment_end) - tree_start;
+                    let candidates = candidate_set.candidates(start).take(end - start);
+
+                    if path_match_helper(
+                        matcher,
+                        &query,
+                        candidates,
+                        results,
+                        candidate_set.id(),
+                        &candidate_set.prefix(),
+                        candidate_set.root_is_file(),
+                        relative_to,
+                        path_style,
+                        cancel_flag,
+                    )
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+
+                if tree_end >= segment_end {
+                    break;
+                }
+                tree_start = tree_end;
+            }
+        };
+
+    #[cfg(not(target_family = "wasm"))]
     executor
         .scoped(|scope| {
             for (segment_idx, (results, matcher)) in segment_results
@@ -302,48 +343,24 @@ pub async fn match_path_sets<'a, Set: PathMatchCandidateSet<'a>>(
                 .zip(matchers.iter_mut())
                 .enumerate()
             {
-                let query = &query;
-                let relative_to = relative_to.clone();
-                scope.spawn(async move {
-                    let segment_start = segment_idx * segment_size;
-                    let segment_end = segment_start + segment_size;
-
-                    let mut tree_start = 0;
-                    for candidate_set in candidate_sets {
-                        let tree_end = tree_start + candidate_set.len();
-
-                        if tree_start < segment_end && segment_start < tree_end {
-                            let start = tree_start.max(segment_start) - tree_start;
-                            let end = tree_end.min(segment_end) - tree_start;
-                            let candidates = candidate_set.candidates(start).take(end - start);
-
-                            if path_match_helper(
-                                matcher,
-                                query,
-                                candidates,
-                                results,
-                                candidate_set.id(),
-                                &candidate_set.prefix(),
-                                candidate_set.root_is_file(),
-                                &relative_to,
-                                path_style,
-                                cancel_flag,
-                            )
-                            .is_err()
-                            {
-                                break;
-                            }
-                        }
-
-                        if tree_end >= segment_end {
-                            break;
-                        }
-                        tree_start = tree_end;
-                    }
-                });
+                let match_segment = &match_segment;
+                scope.spawn(async move { match_segment(segment_idx, results, matcher) });
             }
         })
         .await;
+    // `BackgroundExecutor::scoped` blocks on drop, which the browser cannot do; match the
+    // segments one after another on the calling task instead.
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = &executor;
+        for (segment_idx, (results, matcher)) in segment_results
+            .iter_mut()
+            .zip(matchers.iter_mut())
+            .enumerate()
+        {
+            match_segment(segment_idx, results, matcher);
+        }
+    }
 
     matcher::return_matchers(matchers);
     if cancel_flag.load(atomic::Ordering::Acquire) {

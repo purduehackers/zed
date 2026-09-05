@@ -1,5 +1,5 @@
 use std::ops::Range;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use collections::HashMap;
 use feature_flags::{DiffReviewFeatureFlag, FeatureFlagAppExt as _};
@@ -15,6 +15,7 @@ use settings::Settings;
 use sum_tree::Bias;
 use text::SelectionGoal;
 use util::{RangeExt, debug_panic, post_inc};
+use web_time::Instant;
 
 use super::{EditorElement, EditorLayout, LineNumberLayout, PositionMap, SplitSide};
 use crate::{

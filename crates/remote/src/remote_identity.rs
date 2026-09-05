@@ -22,6 +22,10 @@ pub enum RemoteConnectionIdentity {
         name: String,
         remote_user: String,
     },
+    /// A cloud workspace reached over the WebSocket transport. `workspace_id` is the stable
+    /// control-plane identity; the endpoint URL, token and per-connect session id rotate and
+    /// are never part of the identity.
+    WebSocket { workspace_id: String },
     #[cfg(any(test, feature = "test-support"))]
     Mock { id: u64 },
 }
@@ -51,6 +55,7 @@ impl RemoteConnectionIdentity {
                 name,
                 remote_user,
             } => format!("docker:{remote_user}@{name}:{container_id}"),
+            Self::WebSocket { workspace_id } => format!("ws:{workspace_id}"),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock { id } => format!("mock:{id}"),
         }
@@ -73,6 +78,9 @@ impl From<&RemoteConnectionOptions> for RemoteConnectionIdentity {
                 container_id: options.container_id.clone(),
                 name: options.name.clone(),
                 remote_user: options.remote_user.clone(),
+            },
+            RemoteConnectionOptions::WebSocket(options) => Self::WebSocket {
+                workspace_id: options.workspace_id.clone(),
             },
             #[cfg(any(test, feature = "test-support"))]
             RemoteConnectionOptions::Mock(options) => Self::Mock { id: options.id },
@@ -102,7 +110,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::{DockerConnectionOptions, SshConnectionOptions, WslConnectionOptions};
+    use crate::{
+        DockerConnectionOptions, SshConnectionOptions, WebSocketConnectionOptions,
+        WslConnectionOptions,
+    };
 
     #[test]
     fn ssh_identity_ignores_non_persisted_runtime_fields() {
@@ -184,6 +195,50 @@ mod tests {
         });
 
         assert!(same_remote_connection_identity(Some(&left), Some(&right),));
+    }
+
+    #[test]
+    fn websocket_identity_is_the_workspace_id_only() {
+        use crate::{RefreshError, RefreshReason, WebSocketSession, WebSocketSessionRefresh};
+        use gpui::{AsyncApp, Task};
+        use std::sync::Arc;
+
+        struct NoRefresh;
+        impl WebSocketSessionRefresh for NoRefresh {
+            fn refresh(
+                &self,
+                _workspace_id: &str,
+                _reason: RefreshReason,
+                _cx: &mut AsyncApp,
+            ) -> Task<Result<WebSocketSession, RefreshError>> {
+                Task::ready(Err(RefreshError::Unauthorized))
+            }
+        }
+
+        let left = RemoteConnectionOptions::WebSocket(
+            WebSocketConnectionOptions::new("wss://a.example/rpc", "ws_1", "sess_1", "token-a")
+                .with_takeover(true)
+                .with_refresh(Arc::new(NoRefresh)),
+        );
+        let right = RemoteConnectionOptions::WebSocket(WebSocketConnectionOptions::new(
+            "wss://b.example/rpc",
+            "ws_1",
+            "sess_2",
+            "token-b",
+        ));
+        let other = RemoteConnectionOptions::WebSocket(WebSocketConnectionOptions::new(
+            "wss://a.example/rpc",
+            "ws_2",
+            "sess_1",
+            "token-a",
+        ));
+
+        assert!(same_remote_connection_identity(Some(&left), Some(&right)));
+        assert!(!same_remote_connection_identity(Some(&left), Some(&other)));
+        assert_eq!(
+            remote_connection_identity(&left).persistence_key(),
+            "ws:ws_1"
+        );
     }
 
     #[test]

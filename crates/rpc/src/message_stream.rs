@@ -5,8 +5,9 @@ pub use ::proto::*;
 use async_tungstenite::tungstenite::Message as WebSocketMessage;
 use futures::{SinkExt as _, StreamExt as _};
 use proto::Message as _;
-use std::time::Instant;
 use std::{fmt::Debug, io};
+// `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` natively.
+use web_time::Instant;
 
 const KIB: usize = 1024;
 const MIB: usize = KIB * 1024;

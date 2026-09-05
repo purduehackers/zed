@@ -38,7 +38,6 @@ markdown.workspace = true
 mime.workspace = true
 parking_lot = { workspace = true, optional = true }
 image.workspace = true
-portable-pty.workspace = true
 project.workspace = true
 sandbox.workspace = true
 serde.workspace = true
@@ -53,7 +52,11 @@ url.workspace = true
 util.workspace = true
 uuid.workspace = true
 watch.workspace = true
+web-time.workspace = true
 urlencoding.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+portable-pty.workspace = true
 
 [dev-dependencies]
 env_logger.workspace = true

@@ -129,6 +129,12 @@ static SUPPRESSED_EXTENSIONS: LazyLock<FxHashSet<&str>> = LazyLock::new(|| {
     ])
 });
 
+/// Whether `id` names an extension whose functionality moved into the core editor and
+/// must no longer be installed or loaded (see [`SUPPRESSED_EXTENSIONS`]).
+pub fn is_suppressed_extension(id: &str) -> bool {
+    SUPPRESSED_EXTENSIONS.contains(id)
+}
+
 /// Returns the [`SchemaVersion`] range that is compatible with this version of Zed.
 pub fn schema_version_range() -> RangeInclusive<SchemaVersion> {
     SchemaVersion::ZERO..=CURRENT_SCHEMA_VERSION
@@ -2285,6 +2291,13 @@ impl ExtensionStore {
     pub fn register_remote_client(&mut self, client: Entity<RemoteClient>, cx: &mut Context<Self>) {
         let entity_id = client.entity_id();
         if self.remote_clients.contains_key(&entity_id) {
+            return;
+        }
+        if !client.read(cx).supports_extension_upload() {
+            log::info!(
+                "extension sync skipped: {} does not accept uploads",
+                client.read(cx).connection_options().connection_type()
+            );
             return;
         }
 

@@ -14,12 +14,10 @@ use language::{
 use language_model::{ApiKeyState, AuthenticateError, EnvVar, env_var};
 use serde::{Deserialize, Serialize};
 
-use std::{
-    ops::Range,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{ops::Range, sync::Arc, time::Duration};
 use text::ToOffset;
+// `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` natively.
+use web_time::Instant;
 
 pub const CODESTRAL_API_URL: &str = "https://codestral.mistral.ai";
 

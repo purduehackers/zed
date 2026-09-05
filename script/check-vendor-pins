@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# Rebase check for the vendored crates under vendor/ (DECISIONS.md D10/D31; the script contract of
+# docs/briefs/b5-wasm-build-env.md item 18). A path `[patch]` keeps applying after an upstream
+# bump as long as the version still matches, so a rebase can move a git rev or a crates-io pin
+# in Cargo.toml while the vendored copy silently keeps shadowing it. For every `## <crate>`
+# section of vendor/README.md this checks that:
+#   - a git dependency line for <crate> in Cargo.toml (or, failing that, in crates/*/Cargo.toml)
+#     carries the rev on the section's `- Revision:` line, or a crates-io `version = "=X"` pin
+#     equals vendor/<crate>/Cargo.toml's version, or a plain crates-io requirement `"X"` is
+#     satisfied by that version; the vendored version appears on the section's `- Upstream:` line;
+#     `## <crate> (not vendored; …)` sections are provenance records and are skipped;
+#   - vendor/<crate> is listed in `[workspace] exclude`;
+#   - cargo resolves <crate> to the vendored path (`cargo pkgid`), i.e. the patch is in use.
+#   script/check-vendor-pins
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+status=0
+fail() {
+    echo "check-vendor-pins: $*" >&2
+    status=1
+}
+
+readme_field() {
+    # `readme_field <crate> <field>`: the value of `- <field>: …` in the `## <crate>` section.
+    awk -v crate="$1" -v field="- $2:" '
+        /^## / { in_section = ($2 == crate) }
+        in_section && index($0, field) == 1 { sub("^" field "[ ]*", ""); print; exit }
+    ' vendor/README.md
+}
+
+# A `## <crate> (not vendored; …)` section is a provenance record for a crate that is reached
+# through the registry unmodified (sqlite-wasm-rs): no vendor/ copy, no [patch] entry, nothing
+# to pin here.
+crates="$(awk '/^## / && !/not vendored/ { print $2 }' vendor/README.md)"
+if [[ -z "$crates" ]]; then
+    fail "vendor/README.md has no '## <crate>' sections"
+fi
+
+for crate in $crates; do
+    if [[ ! -f "vendor/$crate/Cargo.toml" ]]; then
+        fail "$crate: vendor/$crate/Cargo.toml is missing"
+        continue
+    fi
+
+    if ! grep -Eq "^exclude = \[.*\"vendor/$crate\"" Cargo.toml; then
+        fail "$crate: vendor/$crate is not in the [workspace] exclude array of Cargo.toml"
+    fi
+
+    readme_revision="$(readme_field "$crate" Revision | awk '{ print $1 }')"
+    # The dependency line is normally a workspace dependency in the root Cargo.toml; a crate
+    # only leaf manifests depend on (wasm_thread: gpui_web, scheduler) is pinned in those. The
+    # `path = "vendor/…"` [patch] entry is never the dependency line.
+    dependency_line="$(grep -E "^$crate = " Cargo.toml | grep -v "path = \"vendor/" | head -1 || true)"
+    if [[ -z "$dependency_line" ]]; then
+        dependency_line="$(grep -Eh "^$crate = " crates/*/Cargo.toml | grep -v "path = \"vendor/" | head -1 || true)"
+    fi
+    if [[ "$dependency_line" =~ git\ =\ \"[^\"]+\",\ rev\ =\ \"([0-9a-f]{40})\" ]]; then
+        cargo_revision="${BASH_REMATCH[1]}"
+        if [[ ! "$readme_revision" =~ ^[0-9a-f]{40}$ ]]; then
+            fail "$crate: no 40-hex rev on the '- Revision:' line of its vendor/README.md section"
+        elif [[ "$cargo_revision" != "$readme_revision" ]]; then
+            fail "$crate: Cargo.toml rev $cargo_revision != vendor/README.md revision $readme_revision (re-sync vendor/$crate from upstream and re-apply its local changes)"
+        fi
+    elif [[ "$dependency_line" =~ version\ =\ \"=([^\"]+)\" ]]; then
+        cargo_version="${BASH_REMATCH[1]}"
+        vendored_version="$(awk -F'"' '/^version = "/ { print $2; exit }' "vendor/$crate/Cargo.toml")"
+        if [[ "$cargo_version" != "$vendored_version" ]]; then
+            fail "$crate: Cargo.toml pins =$cargo_version but vendor/$crate/Cargo.toml is $vendored_version (cargo would report the patch as unused)"
+        fi
+        if ! readme_field "$crate" Upstream | grep -Fq "$cargo_version"; then
+            fail "$crate: version $cargo_version is not on the '- Upstream:' line of its vendor/README.md section"
+        fi
+    elif [[ "$dependency_line" =~ ^$crate\ =\ \"([^\"]+)\"$ || "$dependency_line" =~ version\ =\ \"([^=\"][^\"]*)\" ]]; then
+        # A plain crates-io requirement left byte-identical to upstream (tree-sitter-python =
+        # "0.25"): the vendored copy must still satisfy it or cargo reports the patch as unused.
+        cargo_requirement="${BASH_REMATCH[1]}"
+        vendored_version="$(awk -F'"' '/^version = "/ { print $2; exit }' "vendor/$crate/Cargo.toml")"
+        if [[ "$vendored_version" != "$cargo_requirement" && "$vendored_version" != "$cargo_requirement".* ]]; then
+            fail "$crate: Cargo.toml requires $cargo_requirement but vendor/$crate/Cargo.toml is $vendored_version (cargo would report the patch as unused)"
+        fi
+        if ! readme_field "$crate" Upstream | grep -Fq "$vendored_version"; then
+            fail "$crate: version $vendored_version is not on the '- Upstream:' line of its vendor/README.md section"
+        fi
+    else
+        fail "$crate: no '$crate = { git = …, rev = \"<40 hex>\" }', '$crate = { version = \"=X\" }' or '$crate = \"X\"' dependency line in Cargo.toml or crates/*/Cargo.toml"
+    fi
+
+    pkgid="$(cargo pkgid --offline "$crate" 2>/dev/null || cargo pkgid "$crate" 2>/dev/null || true)"
+    case "$pkgid" in
+        path+file://*/vendor/"$crate"#*) ;;
+        "") fail "$crate: cargo pkgid could not resolve it (is the [patch] entry present?)" ;;
+        *) fail "$crate: cargo resolves it to '$pkgid', not to vendor/$crate (the [patch] entry is not in use)" ;;
+    esac
+done
+
+if [[ $status -eq 0 ]]; then
+    echo "check-vendor-pins: OK ($(echo "$crates" | tr '\n' ' '))"
+fi
+exit "$status"

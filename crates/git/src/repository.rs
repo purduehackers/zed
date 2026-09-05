@@ -873,6 +873,11 @@ pub trait GitRepository: Send + Sync {
     /// all, and an error when the directory exists but the time cannot be
     /// determined (e.g. on filesystems without birthtime support); callers
     /// should fail safe in the error case.
+    ///
+    /// The time is a `std::time::SystemTime` even in the browser build: it
+    /// is a directory's birthtime from file metadata (or `proto::Timestamp`
+    /// for a remote repository), never `SystemTime::now()`, and the
+    /// recorded value it is compared against (`git_ui_core`) is `std` too.
     fn worktree_created_at(
         &self,
         worktree_path: PathBuf,

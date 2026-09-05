@@ -24,8 +24,9 @@ use std::{
         atomic::{self, AtomicU32},
     },
     time::Duration,
-    time::Instant,
 };
+// `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` natively.
+use web_time::Instant;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize)]
 pub struct ConnectionId {
@@ -75,7 +76,7 @@ pub struct ConnectionState {
             Option<
                 HashMap<
                     u32,
-                    oneshot::Sender<(proto::Envelope, std::time::Instant, oneshot::Sender<()>)>,
+                    oneshot::Sender<(proto::Envelope, Instant, oneshot::Sender<()>)>,
                 >,
             >,
         >,

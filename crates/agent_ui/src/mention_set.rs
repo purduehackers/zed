@@ -505,7 +505,16 @@ impl MentionSet {
                 tracked_buffers: Vec::new(),
             }));
         }
+        // `std::fs` is unsupported on wasm32-unknown-unknown; in the browser
+        // skill files live in the client `Fs` (`WasmFs`), which is where
+        // `agent_skills` discovered them, so read them through it there.
+        #[cfg(target_family = "wasm")]
+        let fs = self
+            .project
+            .upgrade()
+            .map(|project| project.read(cx).fs().clone());
         cx.background_spawn(async move {
+            #[cfg(not(target_family = "wasm"))]
             let content = std::fs::read_to_string(&skill_file_path).map_err(|e| {
                 anyhow!(
                     "Failed to read skill file {}: {}",
@@ -513,6 +522,18 @@ impl MentionSet {
                     e
                 )
             })?;
+            #[cfg(target_family = "wasm")]
+            let content = fs
+                .context("Project not found")?
+                .load(&skill_file_path)
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "Failed to read skill file {}: {}",
+                        skill_file_path.display(),
+                        e
+                    )
+                })?;
             Ok(Mention::Text {
                 content,
                 tracked_buffers: Vec::new(),

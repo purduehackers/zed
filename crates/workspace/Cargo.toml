@@ -29,6 +29,7 @@ test-support = [
 any_vec.workspace = true
 agent_settings.workspace = true
 anyhow.workspace = true
+async-compression.workspace = true
 async-recursion.workspace = true
 client.workspace = true
 chrono.workspace = true
@@ -70,6 +71,7 @@ ui_input.workspace = true
 url.workspace = true
 util.workspace = true
 uuid.workspace = true
+web-time.workspace = true
 zed_actions.workspace = true
 
 [dev-dependencies]
@@ -78,6 +80,7 @@ db = { workspace = true, features = ["test-support"] }
 fs = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }
+release_channel.workspace = true
 remote = { workspace = true, features = ["test-support"] }
 session = { workspace = true, features = ["test-support"] }
 settings = { workspace = true, features = ["test-support"] }

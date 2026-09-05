@@ -1,4 +1,5 @@
-use std::time::Instant;
+// `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` natively.
+use web_time::Instant;
 
 use ui::{SpinnerLabel, div, prelude::*};
 
@@ -63,10 +64,9 @@ impl Render for TabularDataPreviewPane {
             });
 
         let render_prep_duration = render_prep_start.elapsed();
-        self.performance_metrics.timings.insert(
-            "render_prep",
-            (render_prep_duration, std::time::Instant::now()),
-        );
+        self.performance_metrics
+            .timings
+            .insert("render_prep", (render_prep_duration, Instant::now()));
 
         let div = div()
             .relative()

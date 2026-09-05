@@ -16,12 +16,7 @@ ai_onboarding.workspace = true
 async-lock.workspace = true
 anthropic = { workspace = true, features = ["schemars"] }
 anyhow.workspace = true
-aws-config = { workspace = true, features = ["behavior-version-latest"] }
-aws-credential-types = { workspace = true, features = ["hardcoded-credentials"] }
-aws-sigv4.workspace = true
-aws_http_client.workspace = true
 base64.workspace = true
-bedrock = { workspace = true, features = ["schemars"] }
 client.workspace = true
 cloud_api_client.workspace = true
 cloud_api_types.workspace = true
@@ -33,12 +28,10 @@ copilot_ui.workspace = true
 credentials_provider.workspace = true
 deepseek = { workspace = true, features = ["schemars"] }
 extension.workspace = true
-extension_host.workspace = true
 fs.workspace = true
 futures.workspace = true
 google_ai = { workspace = true, features = ["schemars"] }
 gpui.workspace = true
-gpui_tokio.workspace = true
 http_client.workspace = true
 language.workspace = true
 language_model.workspace = true
@@ -50,7 +43,6 @@ menu.workspace = true
 mistral = { workspace = true, features = ["schemars"] }
 ollama = { workspace = true, features = ["schemars"] }
 open_ai = { workspace = true, features = ["schemars"] }
-openai_subscribed.workspace = true
 opencode = { workspace = true, features = ["schemars"] }
 open_router = { workspace = true, features = ["schemars"] }
 rand.workspace = true
@@ -61,11 +53,24 @@ serde_json.workspace = true
 settings.workspace = true
 sha2.workspace = true
 strum.workspace = true
-tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 ui.workspace = true
 ui_input.workspace = true
 util.workspace = true
 x_ai = { workspace = true, features = ["schemars"] }
+
+# Amazon Bedrock (the AWS SDK on a tokio runtime), extension-provided providers (wasmtime)
+# and the ChatGPT-subscription provider (a loopback OAuth callback server) are desktop-only;
+# the browser build (BUILD-SPEC 3.2) skips them.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+aws-config = { workspace = true, features = ["behavior-version-latest"] }
+aws-credential-types = { workspace = true, features = ["hardcoded-credentials"] }
+aws-sigv4.workspace = true
+aws_http_client.workspace = true
+bedrock = { workspace = true, features = ["schemars"] }
+extension_host.workspace = true
+gpui_tokio.workspace = true
+openai_subscribed.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 
 [dev-dependencies]
 client = { workspace = true, features = ["test-support"] }
@@ -78,6 +83,11 @@ http_client = { workspace = true, features = ["test-support"] }
 language_model = { workspace = true, features = ["test-support"] }
 parking_lot.workspace = true
 settings = { workspace = true, features = ["test-support"] }
+# Test position only, so the b11 proxy tests assert against the browser half's own
+# constants instead of a hand-copy of them. `zed_web_core`'s own dependencies are
+# `anyhow`/`collections`/`serde*`/`web-time`, so this adds no cycle and no build edge for
+# the library itself.
+zed_web_core.workspace = true
 
 [package.metadata.cargo-shear]
 ignored = ["component"]

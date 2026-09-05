@@ -52,7 +52,6 @@ use settings::{NotifyWhenAgentWaiting, Settings as _, SettingsStore};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
 use std::{rc::Rc, time::Duration};
 use terminal_view::terminal_panel::TerminalPanel;
 use text::Anchor;
@@ -70,6 +69,9 @@ use util::{
     size::format_file_size,
     time::duration_alt_display,
 };
+// `web_time::Instant` is `std::time::Instant` natively; on wasm `Instant::now()` panics, and
+// `acp_thread::RetryStatus::started_at` is already the `web_time` type there.
+use web_time::Instant;
 use workspace::{
     CollaboratorId, MultiWorkspace, NewTerminal, PathList, Workspace, path_link::sanitize_path_text,
 };

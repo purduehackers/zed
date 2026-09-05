@@ -246,7 +246,7 @@ impl Editor {
                         .edited_ranges_for_transaction::<usize>(&transaction)
                         .collect::<Vec<_>>();
                     if push_to_client_history {
-                        buffer.push_transaction(transaction, Instant::now());
+                        buffer.push_transaction(transaction, web_time::Instant::now());
                         buffer.finalize_last_transaction();
                     }
                     (buffer.remote_id(), formatted_ranges)

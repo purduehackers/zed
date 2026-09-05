@@ -2,11 +2,17 @@ mod mappings;
 
 mod alacritty;
 mod pty_info;
+mod remote_pty;
+mod sync_handler;
 pub mod terminal_settings;
 
-#[cfg(not(windows))]
+pub use remote_pty::{RemotePtyHandle, RemotePtyTransport, RemoteTerminalOptions};
+
+#[cfg(all(not(windows), not(target_family = "wasm")))]
 use anyhow::Context as _;
-use anyhow::{Result, bail};
+#[cfg(not(target_family = "wasm"))]
+use anyhow::bail;
+use anyhow::{Result, anyhow};
 use futures_lite::future::yield_now;
 use log::trace;
 
@@ -32,7 +38,9 @@ use task::{HideStrategy, Shell, ShellKind, SpawnInTerminal};
 use terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape, TerminalSettings};
 use theme::{ActiveTheme, Theme};
 use urlencoding;
-use util::{ResultExt as _, paths::PathStyle, truncate_and_trailoff};
+#[cfg(not(target_family = "wasm"))]
+use util::ResultExt as _;
+use util::{paths::PathStyle, truncate_and_trailoff};
 
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -42,16 +50,19 @@ use std::{
     fmt::{self, Display, Formatter},
     ops::{BitOr, BitOrAssign, Deref, Range as StdRange},
     path::{Path, PathBuf},
-    process::ExitStatus,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
+pub(crate) use sync_handler::SyncHandler;
+pub use task::ExitStatus;
 use thiserror::Error;
-use vte::ansi::{Attr, Handler, Processor, StdSyncHandler};
+use vte::ansi::{Attr, Handler, Processor};
+// `std::time::Instant` natively; on wasm `Instant::now()` panics.
 pub use vte::ansi::{Color, NamedColor, Rgb};
+use web_time::Instant;
 
 use gpui::{
     App, AppContext as _, BackgroundExecutor, Bounds, ClipboardItem, Context, EventEmitter, Hsla,
@@ -59,22 +70,24 @@ use gpui::{
     Point as GpuiPoint, Rgba, ScrollWheelEvent, Size, Task, TouchPhase, Window, actions, black, px,
 };
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_family = "wasm")))]
 use crate::alacritty::current_child_signal_mask;
 use crate::alacritty::{
     AlacrittyCell, AlacrittyGridIterator, AlacrittyHyperlink, AlacrittySearch, AlacrittyTerm,
     AlacrittyTermConfig, AlacrittyTermLock, HyperlinkMatch, PtySender, RegexSearches,
     append_text_to_term, apply_config, clear_saved_screen, content_text, display_offset,
     display_only_term_config, find_from_terminal_point, full_content_range, last_non_empty_lines,
-    make_content, new_term, open_pty, pty_options, pty_term_config, resize, screen_lines,
-    scroll_display, scroll_to_point, search_matches, selection_text, set_default_cursor_style,
-    set_selection as set_term_selection, shrink_to_used, spawn_event_loop,
+    make_content, new_term, resize, screen_lines, scroll_display, scroll_to_point, search_matches,
+    selection_text, set_default_cursor_style, set_selection as set_term_selection, shrink_to_used,
     toggle_vi_mode as toggle_term_vi_mode, total_lines, update_selection as update_term_selection,
     update_selection_to_vi_cursor, update_vi_cursor_for_scroll, used_lines, vi_goto_point,
     vi_motion,
 };
+#[cfg(not(target_family = "wasm"))]
+use crate::alacritty::{open_pty, pty_options, pty_term_config, spawn_event_loop};
 use crate::mappings::colors::to_vte_rgb;
 use crate::mappings::keys::to_esc_str;
+use crate::remote_pty::{REMOTE_PARSE_BUDGET, RemotePtyState};
 
 /// Process-wide flag set by headless hosts (e.g. the eval CLI) that have no
 /// controlling TTY. In such sandboxes PTY allocation and acquiring a
@@ -196,14 +209,14 @@ pub struct ParsedAnsiText {
 
 pub fn parse_ansi_text(input: &[u8]) -> ParsedAnsiText {
     let mut handler = StyledAnsiTextHandler::default();
-    let mut processor = Processor::<StdSyncHandler>::default();
+    let mut processor = Processor::<SyncHandler>::default();
     processor.advance(&mut handler, input);
     handler.finish()
 }
 
 pub fn strip_ansi_text(input: &[u8]) -> String {
     let mut handler = PlainAnsiTextHandler::default();
-    let mut processor = Processor::<StdSyncHandler>::default();
+    let mut processor = Processor::<SyncHandler>::default();
     processor.advance(&mut handler, input);
     handler.text
 }
@@ -759,6 +772,17 @@ impl fmt::Debug for TerminalBackendEvent {
 
 enum PtyEvent {
     Event(TerminalBackendEvent),
+    /// Raw bytes from a PTY hosted by the remote server. `offset` is the absolute
+    /// position of `data[0]` in the terminal's output stream; `reset` means "clear
+    /// the grid first" (the replay started after a scrollback eviction).
+    Output {
+        offset: u64,
+        data: Vec<u8>,
+        reset: bool,
+    },
+    /// The remote server no longer has this terminal (an attach failed after a
+    /// server restart). Detaches, prints a notice and completes any task.
+    RemoteLost,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1019,7 +1043,7 @@ impl TerminalBuilder {
             completion_tx: None,
             term,
             term_config: config,
-            output_processor: Processor::<StdSyncHandler>::new(),
+            output_processor: Processor::<SyncHandler>::new(),
             title_override: None,
             events: VecDeque::with_capacity(10),
             last_content: Content {
@@ -1059,6 +1083,7 @@ impl TerminalBuilder {
             init_command_startup_marker: None,
             init_command_startup_tx: None,
             event_loop_task: Task::ready(Ok(())),
+            sync_update_expiry: None,
             background_executor: background_executor.clone(),
             path_style,
             cwd_history: Vec::new(),
@@ -1077,6 +1102,7 @@ impl TerminalBuilder {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub fn new(
         working_directory: Option<PathBuf>,
         mode: TerminalMode,
@@ -1306,7 +1332,7 @@ impl TerminalBuilder {
                 completion_tx,
                 term,
                 term_config: config,
-                output_processor: Processor::<StdSyncHandler>::new(),
+                output_processor: Processor::<SyncHandler>::new(),
                 title_override: terminal_title_override,
                 events: VecDeque::with_capacity(10), //Should never get this high.
                 last_content: Default::default(),
@@ -1346,6 +1372,7 @@ impl TerminalBuilder {
                 init_command_startup_marker: None,
                 init_command_startup_tx: None,
                 event_loop_task: Task::ready(Ok(())),
+                sync_update_expiry: None,
                 background_executor,
                 path_style,
                 cwd_history: if is_remote_terminal {
@@ -1399,6 +1426,33 @@ impl TerminalBuilder {
         cx.background_spawn(fut)
     }
 
+    /// The browser cannot spawn a local process; local terminals are unavailable
+    /// there and every terminal is spawned through the remote project
+    /// (`TerminalBuilder::new_remote`). Same signature as the native constructor so
+    /// callers compile unchanged.
+    #[cfg(target_family = "wasm")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        _working_directory: Option<PathBuf>,
+        _mode: TerminalMode,
+        _shell: Shell,
+        _env: HashMap<String, String>,
+        _cursor_shape: SettingsCursorShape,
+        _alternate_scroll: AlternateScroll,
+        _max_scroll_history_lines: Option<usize>,
+        _path_hyperlink_regexes: Vec<String>,
+        _path_hyperlink_timeout: Duration,
+        _is_remote_terminal: bool,
+        _window_id: u64,
+        _cx: &App,
+        _activation_script: Vec<String>,
+        _path_style: PathStyle,
+    ) -> Task<Result<TerminalBuilder>> {
+        Task::ready(Err(anyhow!(
+            "local terminals are unavailable in the browser; spawn through the remote project"
+        )))
+    }
+
     pub fn subscribe(mut self, cx: &Context<Terminal>) -> Terminal {
         //Event loop
         self.terminal.event_loop_task = cx.spawn(async move |terminal, cx| {
@@ -1406,10 +1460,14 @@ impl TerminalBuilder {
                 terminal.update(cx, |terminal, cx| {
                     //Process the first event immediately for lowered latency
                     terminal.process_pty_event(event, cx);
+                    terminal.flush_remote_ack();
                 })?;
 
                 'outer: loop {
                     let mut events = Vec::new();
+                    // Remote output is parsed on this thread, so a batch is capped
+                    // in bytes as well as in events.
+                    let mut queued_bytes = 0;
 
                     #[cfg(any(test, feature = "test-support"))]
                     let mut timer = cx.background_executor().simulate_random_delay().fuse();
@@ -1429,10 +1487,13 @@ impl TerminalBuilder {
                                     {
                                         wakeup = true;
                                     } else {
+                                        if let PtyEvent::Output { data, .. } = &event {
+                                            queued_bytes += data.len();
+                                        }
                                         events.push(event);
                                     }
 
-                                    if events.len() > 100 {
+                                    if events.len() > 100 || queued_bytes >= REMOTE_PARSE_BUDGET {
                                         break;
                                     }
                                 } else {
@@ -1455,6 +1516,8 @@ impl TerminalBuilder {
                         for event in events {
                             this.process_pty_event(event, cx);
                         }
+
+                        this.flush_remote_ack();
                     })?;
                     yield_now().await;
                 }
@@ -1485,16 +1548,22 @@ impl TerminalBuilder {
 
 /// Separates retained PTY process metadata from resources needed only while
 /// the terminal is live.
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 enum PtyResources {
     Active(PtySender),
     Released,
 }
 
 enum TerminalType {
+    /// Never constructed in the browser (`TerminalBuilder::new` fails there).
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     Pty {
         resources: PtyResources,
         info: Arc<PtyProcessInfo>,
     },
+    /// A PTY hosted by the remote server, driven over the terminal protocol
+    /// (see [`crate::remote_pty`]).
+    Remote(RemotePtyState),
     DisplayOnly,
 }
 
@@ -1506,7 +1575,7 @@ pub struct Terminal {
     completion_tx: Option<Sender<Option<ExitStatus>>>,
     term: Arc<AlacrittyTermLock>,
     term_config: AlacrittyTermConfig,
-    output_processor: Processor<StdSyncHandler>,
+    output_processor: Processor<SyncHandler>,
     events: VecDeque<InternalEvent>,
     /// This is only used for mouse mode cell change detection
     last_mouse: Option<(Point, SelectionSide)>,
@@ -1538,6 +1607,9 @@ pub struct Terminal {
     init_command_startup_marker: Option<String>,
     init_command_startup_tx: Option<Sender<()>>,
     event_loop_task: Task<Result<(), anyhow::Error>>,
+    /// Ends a synchronized update that was begun by remote output and never
+    /// ended; see [`Terminal::expire_sync_update`].
+    sync_update_expiry: Option<Task<()>>,
     background_executor: BackgroundExecutor,
     path_style: PathStyle,
     cwd_history: Vec<CwdHistoryEntry>,
@@ -1617,6 +1689,12 @@ impl Terminal {
     fn process_pty_event(&mut self, event: PtyEvent, cx: &mut Context<Self>) {
         match event {
             PtyEvent::Event(event) => self.process_event(event, cx),
+            PtyEvent::Output {
+                offset,
+                data,
+                reset,
+            } => self.process_remote_output(offset, data, reset, cx),
+            PtyEvent::RemoteLost => self.process_remote_lost(cx),
         }
     }
 
@@ -1694,6 +1772,16 @@ impl Terminal {
                 self.write_to_pty(format(color).into_bytes());
             }
             TerminalBackendEvent::ChildExit(exit_status) => {
+                if let TerminalType::Remote(state) = &mut self.terminal_type {
+                    // An `AttachTerminal` replay re-sends the exit of a terminal
+                    // that already finished; `register_task_finished` emits
+                    // `CloseTerminal` on every call for interactive shells, so the
+                    // duplicate has to be dropped here.
+                    if self.child_exited.is_some() {
+                        return;
+                    }
+                    state.attached = false;
+                }
                 self.register_task_finished(Some(exit_status), cx);
             }
         }
@@ -1719,12 +1807,16 @@ impl Terminal {
                     self.last_content.terminal_bounds.num_columns() != new_bounds.num_columns();
                 self.last_content.terminal_bounds = new_bounds;
 
-                if let TerminalType::Pty {
-                    resources: PtyResources::Active(pty_tx),
-                    ..
-                } = &self.terminal_type
-                {
-                    pty_tx.resize(new_bounds);
+                match &self.terminal_type {
+                    TerminalType::Pty {
+                        resources: PtyResources::Active(pty_tx),
+                        ..
+                    } => pty_tx.resize(new_bounds),
+                    TerminalType::Remote(state) if state.attached => state.transport.resize(
+                        new_bounds.num_columns() as u16,
+                        new_bounds.num_lines() as u16,
+                    ),
+                    _ => {}
                 }
 
                 resize(term, new_bounds);
@@ -1969,6 +2061,7 @@ impl Terminal {
         drop(term);
         self.detect_init_command_startup_marker();
         cx.emit(Event::Wakeup);
+        self.expire_sync_update(cx);
     }
 
     pub fn total_lines(&self) -> usize {
@@ -2111,19 +2204,31 @@ impl Terminal {
         let input = input.into();
         #[cfg(any(test, feature = "test-support"))]
         self.pty_write_log.borrow_mut().push(input.to_vec());
-        if let TerminalType::Pty {
-            resources: PtyResources::Active(pty_tx),
-            ..
-        } = &self.terminal_type
-        {
-            if log::log_enabled!(log::Level::Debug) {
-                if let Ok(str) = str::from_utf8(&input) {
-                    log::debug!("Writing to PTY: {:?}", str);
-                } else {
-                    log::debug!("Writing to PTY: {:?}", input);
+        match &self.terminal_type {
+            TerminalType::Pty {
+                resources: PtyResources::Active(pty_tx),
+                ..
+            } => {
+                if log::log_enabled!(log::Level::Debug) {
+                    if let Ok(str) = str::from_utf8(&input) {
+                        log::debug!("Writing to PTY: {:?}", str);
+                    } else {
+                        log::debug!("Writing to PTY: {:?}", input);
+                    }
                 }
+                pty_tx.notify(input)
             }
-            pty_tx.notify(input);
+            TerminalType::Remote(state) if state.attached => {
+                // Only the size: remote input lands in the browser console's
+                // log buffer, and it may be a password typed into `sudo`.
+                log::debug!(
+                    "Writing {} bytes to remote terminal {}",
+                    input.len(),
+                    state.transport.terminal_id()
+                );
+                state.transport.input(input)
+            }
+            _ => {}
         }
     }
 
@@ -2203,7 +2308,10 @@ impl Terminal {
     }
 
     pub fn is_pty(&self) -> bool {
-        matches!(self.terminal_type, TerminalType::Pty { .. })
+        matches!(
+            self.terminal_type,
+            TerminalType::Pty { .. } | TerminalType::Remote(_)
+        )
     }
 
     pub fn write_init_command_after_startup(
@@ -2894,7 +3002,9 @@ impl Terminal {
                 .read()
                 .as_ref()
                 .and_then(|process| foreground_process_command_from_argv(&process.argv)),
-            TerminalType::DisplayOnly => None,
+            // The foreground process of a remote PTY lives on the server, exactly
+            // as it does over ssh.
+            TerminalType::Remote(_) | TerminalType::DisplayOnly => None,
         }
     }
 
@@ -2911,7 +3021,7 @@ impl Terminal {
                 .read()
                 .as_ref()
                 .map(|process| process.cwd.clone()),
-            TerminalType::DisplayOnly => None,
+            TerminalType::Remote(_) | TerminalType::DisplayOnly => None,
         }
     }
 
@@ -3013,22 +3123,32 @@ impl Terminal {
                             format!("{process_file} — {process_name}")
                         })
                         .unwrap_or_else(|| "Terminal".to_string()),
-                    TerminalType::DisplayOnly => "Terminal".to_string(),
+                    TerminalType::Remote(_) | TerminalType::DisplayOnly => "Terminal".to_string(),
                 }),
         }
     }
 
     pub fn kill_active_task(&mut self) {
-        if let Some(task) = self.task()
-            && task.status == TaskStatus::Running
-        {
-            match &self.terminal_type {
+        let running = self
+            .task()
+            .is_some_and(|task| task.status == TaskStatus::Running);
+        if running {
+            match &mut self.terminal_type {
                 TerminalType::Pty { info, .. } => {
                     // First kill the foreground process group (the command running in the shell)
                     info.kill_current_process();
                     // Then kill the shell itself so that the terminal exits properly
                     // and wait_for_completed_task can complete
                     info.kill_child_process();
+                }
+                TerminalType::Remote(state) => {
+                    // The server kills the process group but keeps streaming (and
+                    // keeps the terminal) until the child actually exits, so this
+                    // terminal stays attached until `TerminalExited` arrives. The
+                    // server removes the entry on that exit, so `Drop` has
+                    // nothing left to close.
+                    state.owns_server_entry = false;
+                    state.transport.close();
                 }
                 TerminalType::DisplayOnly => {
                     // Non-PTY task terminals own their subprocess directly.
@@ -3040,21 +3160,36 @@ impl Terminal {
         }
     }
 
-    /// Returns whether this terminal still owns its live PTY sender.
+    /// Returns whether this terminal still owns its live PTY sender, or is still
+    /// attached to a remote PTY.
     pub fn has_active_pty_resources(&self) -> bool {
-        matches!(
-            self.terminal_type,
+        match &self.terminal_type {
             TerminalType::Pty {
                 resources: PtyResources::Active(_),
                 ..
-            }
-        )
+            } => true,
+            TerminalType::Remote(state) => state.attached,
+            _ => false,
+        }
     }
 
     /// Releases live PTY resources while retaining process metadata and buffered output.
     ///
     /// Calling this method after the resources have already been released is a no-op.
     pub fn release_pty_resources(&mut self) {
+        if let TerminalType::Remote(state) = &mut self.terminal_type {
+            // The server keeps an exited terminal (and its scrollback) until it
+            // is told to close it, so the close has to go out even after the
+            // exit; only a terminal the server already lost, or one this client
+            // deliberately forgot, is left alone.
+            let close = state.owns_server_entry;
+            state.attached = false;
+            state.owns_server_entry = false;
+            if close {
+                state.transport.close();
+            }
+            return;
+        }
         let TerminalType::Pty { resources, info } = &mut self.terminal_type else {
             return;
         };
@@ -3079,14 +3214,15 @@ impl Terminal {
     pub fn pid(&self) -> Option<sysinfo::Pid> {
         match &self.terminal_type {
             TerminalType::Pty { info, .. } => info.pid(),
-            TerminalType::DisplayOnly => None,
+            // A remote PTY's pid is a server pid, meaningless to `sysinfo` here.
+            TerminalType::Remote(_) | TerminalType::DisplayOnly => None,
         }
     }
 
     pub fn pid_getter(&self) -> Option<&ProcessIdGetter> {
         match &self.terminal_type {
             TerminalType::Pty { info, .. } => Some(info.pid_getter()),
-            TerminalType::DisplayOnly => None,
+            TerminalType::Remote(_) | TerminalType::DisplayOnly => None,
         }
     }
 
@@ -3185,6 +3321,11 @@ impl Terminal {
     }
 
     pub fn clone_builder(&self, cx: &App, cwd: Option<PathBuf>) -> Task<Result<TerminalBuilder>> {
+        if self.is_remote_pty() {
+            return Task::ready(Err(anyhow!(
+                "remote terminals are cloned by Project::clone_terminal"
+            )));
+        }
         let working_directory = self.working_directory().or_else(|| cwd);
         TerminalBuilder::new(
             working_directory,
@@ -3216,9 +3357,9 @@ fn task_summary(task: &TaskState, exit_status: Option<ExitStatus>) -> (bool, Str
     let (success, task_line) = match exit_status {
         Some(status) => {
             let code = status.code();
-            #[cfg(unix)]
+            #[cfg(any(unix, target_family = "wasm"))]
             let signal = status.signal();
-            #[cfg(not(unix))]
+            #[cfg(not(any(unix, target_family = "wasm")))]
             let signal: Option<i32> = None;
 
             match (code, signal) {
@@ -3266,11 +3407,13 @@ fn convert_lf_to_crlf(bytes: &[u8], previous_byte_was_cr: &mut bool) -> Vec<u8> 
 /// Owns a non-PTY task subprocess and the background task pumping its output
 /// into the terminal emulator. Used by headless hosts (e.g. the eval CLI) where
 /// PTY allocation fails with `ENOTTY`. Dropping this kills the child.
+#[cfg(not(target_family = "wasm"))]
 struct SubprocessHandle {
     child: Arc<parking_lot::Mutex<Option<util::process::Child>>>,
     _reader: Task<()>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl SubprocessHandle {
     fn kill(&self) {
         if let Some(child) = self.child.lock().as_mut() {
@@ -3279,9 +3422,20 @@ impl SubprocessHandle {
     }
 }
 
+/// No subprocesses exist in the browser; keeps `Terminal::subprocess`, `Drop` and
+/// `kill_active_task` unchanged there.
+#[cfg(target_family = "wasm")]
+struct SubprocessHandle;
+
+#[cfg(target_family = "wasm")]
+impl SubprocessHandle {
+    fn kill(&self) {}
+}
+
 /// Spawns `program`/`args` as a plain subprocess with piped stdout/stderr and
 /// drives its output into `term`, mirroring what the Alacritty event loop does
 /// for a PTY but without one. Used when [`HeadlessTerminal`] is enabled.
+#[cfg(not(target_family = "wasm"))]
 fn spawn_task_subprocess(
     program: String,
     args: Vec<String>,
@@ -3319,7 +3473,7 @@ fn spawn_task_subprocess(
                 let events_tx = events_tx.clone();
                 async move {
                     let Some(mut reader) = reader else { return };
-                    let mut processor = Processor::<StdSyncHandler>::new();
+                    let mut processor = Processor::<SyncHandler>::new();
                     let mut buffer = [0u8; 8192];
                     let mut previous_byte_was_cr = false;
                     loop {
@@ -3602,6 +3756,104 @@ mod tests {
                 "startup marker command for {shell_kind:?} should not contain the full marker, got {command:?}"
             );
         }
+    }
+
+    fn display_only_terminal(cx: &mut TestAppContext) -> Entity<Terminal> {
+        cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        })
+    }
+
+    /// A synchronized update (`CSI ? 2026 h`) whose end never arrives is ended by
+    /// the parser's own timeout: alacritty's event loop would do this for a PTY,
+    /// `expire_sync_update` does it for `output_processor`.
+    #[gpui::test]
+    async fn write_output_ends_stale_synchronized_update(cx: &mut TestAppContext) {
+        let terminal = display_only_terminal(cx);
+        let wakeups = Arc::new(Mutex::new(0usize));
+        cx.update({
+            let wakeups = wakeups.clone();
+            |cx| {
+                cx.subscribe(&terminal, move |_, event, _| {
+                    if matches!(event, Event::Wakeup) {
+                        *wakeups.lock() += 1;
+                    }
+                })
+                .detach();
+            }
+        });
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(b"\x1b[?2026hhello", cx);
+        });
+        let (content, pending, wakeups_after_write) = terminal.read_with(cx, |terminal, _| {
+            (
+                terminal.get_content(),
+                terminal
+                    .output_processor
+                    .sync_timeout()
+                    .sync_timeout()
+                    .is_some(),
+                *wakeups.lock(),
+            )
+        });
+        assert!(
+            !content.contains("hello"),
+            "text inside a synchronized update is held back until it ends: {content:?}"
+        );
+        assert!(pending, "a synchronized update is pending");
+        assert!(terminal.read_with(cx, |terminal, _| terminal.sync_update_expiry.is_some()));
+
+        cx.executor().advance_clock(Duration::from_millis(150));
+        cx.run_until_parked();
+
+        let content = terminal.read_with(cx, |terminal, _| terminal.get_content());
+        assert!(
+            content.contains("hello"),
+            "the timeout ended the synchronized update: {content:?}"
+        );
+        assert!(terminal.read_with(cx, |terminal, _| {
+            terminal
+                .output_processor
+                .sync_timeout()
+                .sync_timeout()
+                .is_none()
+        }));
+        assert_eq!(
+            *wakeups.lock(),
+            wakeups_after_write + 1,
+            "ending the update repaints once"
+        );
+    }
+
+    #[gpui::test]
+    async fn write_output_esu_cancels_timer(cx: &mut TestAppContext) {
+        let terminal = display_only_terminal(cx);
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(b"\x1b[?2026hhello\x1b[?2026l", cx);
+        });
+        let (content, pending, timer) = terminal.read_with(cx, |terminal, _| {
+            (
+                terminal.get_content(),
+                terminal
+                    .output_processor
+                    .sync_timeout()
+                    .sync_timeout()
+                    .is_some(),
+                terminal.sync_update_expiry.is_some(),
+            )
+        });
+        assert!(content.contains("hello"), "{content:?}");
+        assert!(!pending);
+        assert!(!timer, "a completed update leaves no timer behind");
     }
 
     #[gpui::test]
@@ -5606,6 +5858,7 @@ mod tests {
                 info.pid_getter().fallback_pid(),
                 info.current.read().is_some()
             ),
+            TerminalType::Remote(_) => "remote".to_string(),
             TerminalType::DisplayOnly => "display-only".to_string(),
         });
         panic!(

@@ -1,14 +1,23 @@
+#[cfg(not(target_family = "wasm"))]
+use std::io;
 #[cfg(target_os = "windows")]
 use std::num::NonZeroU32;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
-use std::{borrow::Cow, io, ops::RangeInclusive, path::PathBuf, sync::Arc};
+#[cfg(not(target_family = "wasm"))]
+use std::path::PathBuf;
+use std::{borrow::Cow, ops::RangeInclusive, sync::Arc};
 
 mod hyperlinks;
 
+#[cfg(not(target_family = "wasm"))]
 use alacritty_terminal::{
-    event::{Event as AlacTermEvent, EventListener, Notify, WindowSize},
+    event::Notify,
     event_loop::{EventLoop, Msg, Notifier},
+    tty,
+};
+use alacritty_terminal::{
+    event::{Event as AlacTermEvent, EventListener, WindowSize},
     grid::{Dimensions, Grid, GridIterator, Row, Scroll as AlacScroll},
     index::{Boundary, Column, Direction as AlacDirection, Line, Point as AlacPoint},
     selection::{
@@ -21,13 +30,13 @@ use alacritty_terminal::{
         cell::{Cell as AlacCell, Flags, Hyperlink as AlacHyperlink},
         search::{Match, RegexIter, RegexSearch},
     },
-    tty,
     vi_mode::{ViModeCursor, ViMotion as AlacViMotion},
     vte::ansi::{
         ClearMode, CursorShape as AlacCursorShape, CursorStyle as AlacCursorStyle,
         NamedPrivateMode, PrivateMode,
     },
 };
+#[cfg(not(target_family = "wasm"))]
 use anyhow::{Context as _, Result};
 use futures::channel::mpsc::UnboundedSender;
 use util::paths::PathStyle;
@@ -35,17 +44,19 @@ use vte::ansi::Handler;
 #[cfg(target_os = "windows")]
 use windows::Win32::{Foundation::HANDLE, System::Threading::GetProcessId};
 
+#[cfg(not(target_family = "wasm"))]
+use crate::pty_info::ProcessIdGetter;
 use crate::{
     Cell, Color, Content, Cursor, CursorShape, GridLinesChange, HoveredWord, Hyperlink,
     HyperlinkData, IndexedCell, Modes, Point, PtyEvent, Range, RenderableCells, Scroll, Search,
     Selection, SelectionRange, SelectionSide, SelectionType, TerminalBackendEvent, TerminalBounds,
     ViMotion,
-    pty_info::ProcessIdGetter,
     terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape},
 };
 
 pub(super) use hyperlinks::{HyperlinkMatch, RegexSearches};
 
+#[cfg(not(target_family = "wasm"))]
 pub(super) type AlacrittyPty = tty::Pty;
 pub(super) type AlacrittyTerm = Term<ZedListener>;
 pub(super) type AlacrittyTermConfig = Config;
@@ -82,10 +93,36 @@ impl From<&AlacrittyPty> for ProcessIdGetter {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub(super) struct PtySender {
     notifier: Notifier,
 }
 
+/// Local PTYs cannot exist in the browser; this keeps `TerminalType::Pty` and the
+/// pid/kill API compiling without a code path that constructs it.
+#[cfg(target_family = "wasm")]
+#[allow(dead_code)]
+pub(super) struct PtySender {
+    never: std::convert::Infallible,
+}
+
+#[cfg(target_family = "wasm")]
+#[allow(dead_code)]
+impl PtySender {
+    pub(super) fn notify(&self, _input: impl Into<Cow<'static, [u8]>>) {
+        match self.never {}
+    }
+
+    pub(super) fn resize(&self, _bounds: TerminalBounds) {
+        match self.never {}
+    }
+
+    pub(super) fn shutdown(&self) {
+        match self.never {}
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
 impl PtySender {
     pub(super) fn notify(&self, input: impl Into<Cow<'static, [u8]>>) {
         self.notifier.notify(input);
@@ -153,11 +190,12 @@ pub(super) fn apply_config(term: &AlacrittyTermLock, config: &AlacrittyTermConfi
     term.lock().set_options(config.clone());
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_family = "wasm")))]
 pub(super) fn current_child_signal_mask() -> io::Result<tty::SignalMask> {
     tty::SignalMask::current()
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub(super) fn pty_options(
     shell: Option<(String, Vec<String>)>,
     working_directory: Option<PathBuf>,
@@ -177,6 +215,7 @@ pub(super) fn pty_options(
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub(super) fn open_pty(
     options: &tty::Options,
     bounds: TerminalBounds,
@@ -200,6 +239,7 @@ pub(super) fn new_term(
     Arc::new(FairMutex::new(term))
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub(super) fn spawn_event_loop(
     term: Arc<AlacrittyTermLock>,
     events_tx: UnboundedSender<PtyEvent>,
@@ -318,7 +358,15 @@ impl From<AlacTermEvent> for TerminalBackendEvent {
             AlacTermEvent::Wakeup => Self::Wakeup,
             AlacTermEvent::Bell => Self::Bell,
             AlacTermEvent::Exit => Self::Exit,
+            #[cfg(not(target_family = "wasm"))]
             AlacTermEvent::ChildExit(status) => Self::ChildExit(status),
+            // No event loop (hence no child) exists in the browser, but the conversion has
+            // to be total: alacritty's status is the std stub there, `task::ExitStatus` is
+            // the wire type.
+            #[cfg(target_family = "wasm")]
+            AlacTermEvent::ChildExit(status) => {
+                Self::ChildExit(crate::ExitStatus::from_parts(status.code(), None))
+            }
         }
     }
 }
@@ -776,6 +824,13 @@ fn terminal_selection_range_from_alacritty(range: AlacSelectionRange) -> Selecti
         end: terminal_point_from_alacritty(range.end),
         is_block: range.is_block,
     }
+}
+
+/// Fully resets the emulator - grid, scrollback and modes - the way `ESC c`
+/// (RIS) does. Used when a remote server restarts a terminal's output stream at
+/// a new base offset, where the previous contents no longer belong to it.
+pub(super) fn reset_term(term: &mut Term<ZedListener>) {
+    term.reset_state();
 }
 
 pub(super) fn clear_saved_screen(term: &mut Term<ZedListener>) {

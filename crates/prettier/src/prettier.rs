@@ -6,6 +6,9 @@ use language::language_settings::{LanguageSettings, PrettierSettings};
 use language::{Buffer, Diff, Language, OffsetUtf16};
 use lsp::{LanguageServer, LanguageServerId};
 use node_runtime::NodeRuntime;
+// Only the process-spawning and test-support `start` bodies compare against the default
+// prettier directory; the browser build has neither.
+#[cfg(any(test, feature = "test-support", not(target_family = "wasm")))]
 use paths::default_prettier_dir;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -285,7 +288,7 @@ impl Prettier {
         }))
     }
 
-    #[cfg(not(any(test, feature = "test-support")))]
+    #[cfg(all(not(any(test, feature = "test-support")), not(target_family = "wasm")))]
     pub async fn start(
         server_id: LanguageServerId,
         prettier_dir: PathBuf,
@@ -343,6 +346,24 @@ impl Prettier {
             default: prettier_dir == default_prettier_dir().as_path(),
             prettier_dir,
         }))
+    }
+
+    /// The browser never spawns a prettier process (a remote buffer is formatted by the server
+    /// over the remote protocol, and `LanguageServer::new` is not compiled for wasm), so a local
+    /// start can only report the gap.
+    #[cfg(all(not(any(test, feature = "test-support")), target_family = "wasm"))]
+    pub async fn start(
+        server_id: LanguageServerId,
+        prettier_dir: PathBuf,
+        node: NodeRuntime,
+        request_timeout: Duration,
+        cx: AsyncApp,
+    ) -> anyhow::Result<Self> {
+        let _ = (server_id, node, request_timeout, cx);
+        anyhow::bail!(
+            "starting prettier from {} is not supported in the browser",
+            prettier_dir.display()
+        )
     }
 
     pub async fn format(

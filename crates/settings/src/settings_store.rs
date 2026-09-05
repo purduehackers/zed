@@ -367,19 +367,26 @@ impl SettingsStore {
             paths::global_settings_file().clone(),
         );
 
-        let global_content = cx
-            .foreground_executor()
-            .block_on(global_settings_file_rx.next())
-            .unwrap();
-        let user_content = cx
-            .foreground_executor()
-            .block_on(user_settings_file_rx.next())
-            .unwrap();
+        // Natively the initial contents are applied synchronously so callers see them before
+        // this returns. `block_on` does not exist on wasm; there the watcher loop below
+        // applies the first message each watcher sends (the initial contents) on its first
+        // iteration, and the browser entry crate sets the user settings itself beforehand.
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let global_content = cx
+                .foreground_executor()
+                .block_on(global_settings_file_rx.next())
+                .unwrap();
+            let user_content = cx
+                .foreground_executor()
+                .block_on(user_settings_file_rx.next())
+                .unwrap();
 
-        let result = self.set_user_settings(&user_content, cx);
-        settings_changed(SettingsFile::User, result, cx);
-        let result = self.set_global_settings(&global_content, cx);
-        settings_changed(SettingsFile::Global, result, cx);
+            let result = self.set_user_settings(&user_content, cx);
+            settings_changed(SettingsFile::User, result, cx);
+            let result = self.set_global_settings(&global_content, cx);
+            settings_changed(SettingsFile::Global, result, cx);
+        }
 
         self._settings_files_watcher = Some(cx.spawn(async move |cx| {
             let _user_settings_watcher = user_settings_watcher;
@@ -1754,6 +1761,50 @@ mod tests {
                 buffer_font_fallbacks: content.buffer_font_fallbacks.unwrap(),
             }
         }
+    }
+
+    /// Natively `watch_settings_files` applies both documents before it returns (the
+    /// `block_on` half of the split that lets the browser apply them on the watcher's first
+    /// tick instead); nothing here pumps the executor.
+    #[gpui::test]
+    async fn watch_settings_files_applies_initial_contents(cx: &mut gpui::TestAppContext) {
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.create_dir(paths::settings_file().parent().unwrap())
+            .await
+            .unwrap();
+        fs.insert_file(
+            paths::settings_file(),
+            r#"{ "tabs": { "close_position": "right" } }"#.as_bytes().to_vec(),
+        )
+        .await;
+        fs.insert_file(
+            paths::global_settings_file(),
+            r#"{ "tabs": { "git_status": true } }"#.as_bytes().to_vec(),
+        )
+        .await;
+        fs.pause_events();
+        cx.run_until_parked();
+
+        let applied = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|cx| {
+            let mut store = SettingsStore::new(cx, &default_settings());
+            store.register_setting::<ItemSettings>();
+            store.watch_settings_files(fs.clone(), cx, {
+                let applied = applied.clone();
+                move |file, _, _| applied.borrow_mut().push(file)
+            });
+            assert_eq!(
+                applied.borrow().as_slice(),
+                &[SettingsFile::User, SettingsFile::Global]
+            );
+            assert_eq!(
+                store.get::<ItemSettings>(None),
+                &ItemSettings {
+                    close_position: ClosePosition::Right,
+                    git_status: true,
+                }
+            );
+        });
     }
 
     #[gpui::test]

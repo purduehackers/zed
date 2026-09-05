@@ -23,9 +23,7 @@ test-support = [
 
 [dependencies]
 anyhow.workspace = true
-async-compression.workspace = true
 async-pipe = { workspace = true, optional = true }
-async-tar.workspace = true
 async-trait.workspace = true
 client.workspace = true
 collections.workspace = true
@@ -49,6 +47,12 @@ smol.workspace = true
 task.workspace = true
 telemetry.workspace = true
 util.workspace = true
+
+# Only `download_adapter_from_github` unpacks archives, and the browser has no filesystem to
+# extract into.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+async-compression.workspace = true
+async-tar.workspace = true
 
 [dev-dependencies]
 async-pipe.workspace = true

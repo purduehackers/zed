@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# C compiler for `--target wasm32-unknown-unknown`, referenced from .cargo/config.toml [env].
+# bash only: wasm builds are supported on macOS and Linux (see check-wasm).
+set -euo pipefail
+# `WASI_SDK_PATH` or <repo>/target/wasi-sdk (script/ensure-wasi-sdk); refuses any SDK but the
+# pinned version so an override cannot silently swap the compiler behind the shipped bundle.
+. "$(dirname "${BASH_SOURCE[0]}")/wasi-sdk-env"
+wasi_sdk_check script/wasm-cc || exit 1
+# -isystem ranks below cc-rs's -I dirs, so tree-sitter's own wasm/include (published by the
+# tree-sitter-language crate's build.rs in the tree-sitter checkout) and zstd-sys's wasm-shim
+# keep precedence; grammar scanners and SQLite get wasi-libc's headers. The -m flags mirror
+# `-C target-feature=+atomics,+bulk-memory,+mutable-globals` in .cargo/config.toml.
+exec "$WASI_SDK_DIR/bin/clang" --target=wasm32-unknown-unknown \
+    -matomics -mbulk-memory -mmutable-globals \
+    -isystem "$WASI_SDK_DIR/share/wasi-sysroot/include/wasm32-wasi" "$@"

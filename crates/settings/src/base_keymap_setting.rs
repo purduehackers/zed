@@ -95,31 +95,36 @@ impl BaseKeymap {
         ("Cursor", Self::Cursor),
     ];
 
+    /// The base-keymap asset for the compile target's OS.
     pub fn asset_path(&self) -> Option<&'static str> {
-        #[cfg(target_os = "macos")]
-        match self {
-            BaseKeymap::JetBrains => Some("keymaps/macos/jetbrains.json"),
-            BaseKeymap::SublimeText => Some("keymaps/macos/sublime_text.json"),
-            BaseKeymap::Atom => Some("keymaps/macos/atom.json"),
-            BaseKeymap::TextMate => Some("keymaps/macos/textmate.json"),
-            BaseKeymap::Emacs => Some("keymaps/macos/emacs.json"),
-            BaseKeymap::Cursor => Some("keymaps/macos/cursor.json"),
-            BaseKeymap::VSCode => Some("keymaps/macos/vscode.json"),
-            BaseKeymap::Zed => None,
-            BaseKeymap::None => None,
-        }
+        self.asset_path_for(crate::KeymapOs::current())
+    }
 
-        #[cfg(not(target_os = "macos"))]
-        match self {
-            BaseKeymap::JetBrains => Some("keymaps/linux/jetbrains.json"),
-            BaseKeymap::SublimeText => Some("keymaps/linux/sublime_text.json"),
-            BaseKeymap::Atom => Some("keymaps/linux/atom.json"),
-            BaseKeymap::Emacs => Some("keymaps/linux/emacs.json"),
-            BaseKeymap::Cursor => Some("keymaps/linux/cursor.json"),
-            BaseKeymap::TextMate => None,
-            BaseKeymap::VSCode => Some("keymaps/linux/vscode.json"),
-            BaseKeymap::Zed => None,
-            BaseKeymap::None => None,
+    /// The base-keymap asset for `os`. `TextMate` only exists for macOS.
+    pub fn asset_path_for(&self, os: crate::KeymapOs) -> Option<&'static str> {
+        match os {
+            crate::KeymapOs::Mac => match self {
+                BaseKeymap::JetBrains => Some("keymaps/macos/jetbrains.json"),
+                BaseKeymap::SublimeText => Some("keymaps/macos/sublime_text.json"),
+                BaseKeymap::Atom => Some("keymaps/macos/atom.json"),
+                BaseKeymap::TextMate => Some("keymaps/macos/textmate.json"),
+                BaseKeymap::Emacs => Some("keymaps/macos/emacs.json"),
+                BaseKeymap::Cursor => Some("keymaps/macos/cursor.json"),
+                BaseKeymap::VSCode => Some("keymaps/macos/vscode.json"),
+                BaseKeymap::Zed => None,
+                BaseKeymap::None => None,
+            },
+            crate::KeymapOs::Windows | crate::KeymapOs::Linux => match self {
+                BaseKeymap::JetBrains => Some("keymaps/linux/jetbrains.json"),
+                BaseKeymap::SublimeText => Some("keymaps/linux/sublime_text.json"),
+                BaseKeymap::Atom => Some("keymaps/linux/atom.json"),
+                BaseKeymap::Emacs => Some("keymaps/linux/emacs.json"),
+                BaseKeymap::Cursor => Some("keymaps/linux/cursor.json"),
+                BaseKeymap::TextMate => None,
+                BaseKeymap::VSCode => Some("keymaps/linux/vscode.json"),
+                BaseKeymap::Zed => None,
+                BaseKeymap::None => None,
+            },
         }
     }
 

@@ -1,0 +1,61 @@
+diff --git alacritty_terminal/Cargo.toml alacritty_terminal/Cargo.toml
+index c5868de..e078980 100644
+--- alacritty_terminal/Cargo.toml
++++ alacritty_terminal/Cargo.toml
+@@ -4,11 +4,10 @@ version = "0.26.1-dev"
+ authors = ["Christian Duerr <contact@christianduerr.com>", "Joe Wilm <joe@jwilm.com>"]
+ license = "Apache-2.0"
+ description = "Library for writing terminal emulators"
+-readme = "../README.md"
+ homepage = "https://alacritty.org"
+ repository = "https://github.com/alacritty/alacritty"
+-edition.workspace = true
+-rust-version.workspace = true
++edition = "2024"
++rust-version = "1.85.0"
+ 
+ [features]
+ default = ["serde"]
+@@ -17,16 +16,18 @@ serde = ["dep:serde", "bitflags/serde", "vte/serde"]
+ [dependencies]
+ base64 = "0.22.0"
+ bitflags = "2.4.1"
+-home = "0.5.5"
+-libc = { version = "0.2", features = ["extra_traits"] }
+ log = "0.4"
+ parking_lot = "0.12.0"
+-polling = "3.8.0"
+ regex-automata = "0.4.3"
+ unicode-width = "0.2.0"
+ vte = { version = "0.15.0", default-features = false, features = ["std", "ansi"] }
+ serde = { version = "1", features = ["derive", "rc"], optional = true }
+ 
++[target.'cfg(not(target_family = "wasm"))'.dependencies]
++home = "0.5.5"
++libc = { version = "0.2", features = ["extra_traits"] }
++polling = "3.8.0"
++
+ [target.'cfg(unix)'.dependencies]
+ rustix-openpty = "0.2.0"
+ rustix = { version = "1.0.0", default-features = false, features = ["std"] }
+diff --git alacritty_terminal/src/lib.rs alacritty_terminal/src/lib.rs
+index 7324473..c1b4ff4 100644
+--- alacritty_terminal/src/lib.rs
++++ alacritty_terminal/src/lib.rs
+@@ -5,13 +5,16 @@
+ #![cfg_attr(clippy, deny(warnings))]
+ 
+ pub mod event;
++#[cfg(not(target_family = "wasm"))]
+ pub mod event_loop;
+ pub mod grid;
+ pub mod index;
+ pub mod selection;
+ pub mod sync;
+ pub mod term;
++#[cfg(not(target_family = "wasm"))]
+ pub mod thread;
++#[cfg(not(target_family = "wasm"))]
+ pub mod tty;
+ pub mod vi_mode;
+ 

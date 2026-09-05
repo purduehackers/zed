@@ -25,9 +25,16 @@ project.workspace = true
 smallvec.workspace = true
 telemetry.workspace = true
 text.workspace = true
-tree-sitter = { workspace = true, features = ["wasm"] }
 util.workspace = true
+web-time.workspace = true
 zeta_prompt.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+# `wasm` = wasmtime-backed `WasmStore` for extension grammars; the browser links grammars itself.
+tree-sitter = { workspace = true, features = ["wasm"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+tree-sitter.workspace = true
 
 [dev-dependencies]
 env_logger.workspace = true

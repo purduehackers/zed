@@ -135,7 +135,7 @@ use std::{
         Arc,
         atomic::{self, AtomicUsize},
     },
-    time::{Duration, Instant},
+    time::Duration,
     vec,
 };
 use sum_tree::Dimensions;
@@ -149,6 +149,8 @@ use util::{
     rel_path::RelPath,
     union_json_value_into,
 };
+// `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` natively.
+use web_time::Instant;
 
 pub use document_colors::DocumentColors;
 pub use document_links::{
@@ -517,7 +519,7 @@ impl LocalLspStore {
                 }
 
                 let code_action_kinds = adapter.code_action_kinds();
-                lsp::LanguageServer::new(
+                spawn_language_server_process(
                     stderr_capture,
                     server_id,
                     server_name,
@@ -1547,7 +1549,8 @@ impl LocalLspStore {
                     .start_transaction()
                     .context("transaction already open")?;
                 buffer.end_transaction(cx);
-                let transaction_id = buffer.push_empty_transaction(cx.background_executor().now());
+                let transaction_id =
+                    buffer.push_empty_transaction(buffer_transaction_now(cx.background_executor()));
                 buffer.finalize_last_transaction();
                 anyhow::Ok(transaction_id)
             })?;
@@ -2337,6 +2340,8 @@ impl LocalLspStore {
                             // and pop the combined transaction off the history stack
                             // later if push_to_history is false
                             if buffer.get_transaction(transaction.id).is_none() {
+                                // Wall clock, as in `Buffer::start_transaction`; see
+                                // `buffer_transaction_now`.
                                 buffer.push_transaction(transaction, Instant::now());
                             }
                             buffer.merge_transactions(
@@ -7778,6 +7783,8 @@ impl LspStore {
                     .await?;
                 if push_to_history {
                     buffer_handle.update(cx, |buffer, _| {
+                        // Wall clock, as in `Buffer::start_transaction`; see
+                        // `buffer_transaction_now`.
                         buffer.push_transaction(transaction.clone(), Instant::now());
                         buffer.finalize_last_transaction();
                     });
@@ -15504,6 +15511,55 @@ fn extend_formatting_transaction(
         }
         Ok(())
     })
+}
+
+/// The timestamp `language::Buffer` groups a transaction by: the executor's clock (fake-timer
+/// aware in tests), which is the `web_time::Instant` that `text` stamps transactions with.
+fn buffer_transaction_now(executor: &gpui::BackgroundExecutor) -> Instant {
+    executor.now()
+}
+
+/// Starts the language server process; see [`lsp::LanguageServer::new`].
+#[cfg(not(target_family = "wasm"))]
+fn spawn_language_server_process(
+    stderr_capture: Arc<Mutex<Option<String>>>,
+    server_id: LanguageServerId,
+    server_name: LanguageServerName,
+    binary: LanguageServerBinary,
+    root_path: &Path,
+    code_action_kinds: Option<Vec<CodeActionKind>>,
+    workspace_folders: Option<Arc<Mutex<BTreeSet<Uri>>>>,
+    cx: &mut AsyncApp,
+) -> Result<LanguageServer> {
+    LanguageServer::new(
+        stderr_capture,
+        server_id,
+        server_name,
+        binary,
+        root_path,
+        code_action_kinds,
+        workspace_folders,
+        cx,
+    )
+}
+
+/// Language servers run inside the sandbox and are reached over the remote protocol; the
+/// browser never spawns one (`lsp::LanguageServer::new` is not compiled there).
+#[cfg(target_family = "wasm")]
+fn spawn_language_server_process(
+    _stderr_capture: Arc<Mutex<Option<String>>>,
+    _server_id: LanguageServerId,
+    server_name: LanguageServerName,
+    binary: LanguageServerBinary,
+    _root_path: &Path,
+    _code_action_kinds: Option<Vec<CodeActionKind>>,
+    _workspace_folders: Option<Arc<Mutex<BTreeSet<Uri>>>>,
+    _cx: &mut AsyncApp,
+) -> Result<LanguageServer> {
+    Err(anyhow!(
+        "cannot spawn language server {server_name} ({:?}) in the browser",
+        binary.path
+    ))
 }
 
 #[cfg(test)]

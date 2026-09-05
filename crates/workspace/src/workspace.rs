@@ -1,4 +1,5 @@
 pub mod active_file_name;
+pub mod client_state;
 pub mod dock;
 pub mod history_manager;
 pub mod invalid_item_view;
@@ -105,7 +106,7 @@ use project::{
     trusted_worktrees::{RemoteHostLocation, TrustedWorktrees, TrustedWorktreesEvent},
 };
 use remote::{
-    RemoteClientDelegate, RemoteConnection, RemoteConnectionOptions,
+    RemoteClient, RemoteClientDelegate, RemoteConnection, RemoteConnectionOptions,
     remote_client::ConnectionIdentifier,
 };
 use schemars::JsonSchema;
@@ -131,7 +132,6 @@ use std::{
     env,
     hash::Hash,
     path::{Path, PathBuf},
-    process::ExitStatus,
     rc::Rc,
     sync::{
         Arc, LazyLock,
@@ -139,7 +139,7 @@ use std::{
     },
     time::Duration,
 };
-use task::{DebugScenario, SharedTaskContext, SpawnInTerminal};
+use task::{DebugScenario, ExitStatus, SharedTaskContext, SpawnInTerminal};
 use theme::{ActiveTheme, ClientDecorationsExt, SystemAppearance};
 use theme_settings::ThemeSettings;
 pub use toolbar::{
@@ -10458,6 +10458,10 @@ pub fn workspace_windows_for_location(
                 (RemoteConnectionOptions::Docker(a), RemoteConnectionOptions::Docker(b)) => {
                     a.container_id == b.container_id
                 }
+                (
+                    RemoteConnectionOptions::WebSocket(a),
+                    RemoteConnectionOptions::WebSocket(b),
+                ) => a.workspace_id == b.workspace_id,
                 #[cfg(any(test, feature = "test-support"))]
                 (RemoteConnectionOptions::Mock(a), RemoteConnectionOptions::Mock(b)) => {
                     a.id == b.id
@@ -11125,17 +11129,200 @@ pub fn open_remote_project_with_existing_connection(
     })
 }
 
-async fn open_remote_project_inner(
+/// A remote project opened in a brand-new window by
+/// [`open_remote_project_in_new_window_with_client`] or [`open_remote_project_in_new_window`].
+pub struct OpenedRemoteProject {
+    /// The new window.
+    pub window: WindowHandle<MultiWorkspace>,
+    /// The window's only workspace.
+    pub workspace: Entity<Workspace>,
+    /// The items opened for `paths`, in order; `None` where opening failed.
+    pub items: Vec<Option<Box<dyn ItemHandle>>>,
+}
+
+/// Opens a brand-new window whose only workspace is the remote project served by an
+/// already-created `RemoteClient` (D16). The caller has run `remote::connect` and
+/// `RemoteClient::new` itself — so it can load the client-state image over
+/// `remote.read(cx).proto_client()` and initialise `WorkspaceDb` *before*
+/// `deserialize_remote_project` runs here. Unlike [`open_remote_project_with_new_connection`]
+/// it needs no pre-existing window and no placeholder local project.
+pub fn open_remote_project_in_new_window_with_client(
+    remote: Entity<RemoteClient>,
+    app_state: Arc<AppState>,
+    paths: Vec<PathBuf>,
+    window_options: WindowOptions,
+    cx: &mut App,
+) -> Task<Result<OpenedRemoteProject>> {
+    let connection_options = remote.read(cx).connection_options();
+    cx.spawn(async move |cx| {
+        let (workspace_id, serialized_workspace) =
+            deserialize_remote_project(connection_options, paths.clone(), cx).await?;
+        let project = cx.update(|cx| {
+            project::Project::remote(
+                remote,
+                app_state.client.clone(),
+                app_state.node_runtime.clone(),
+                app_state.user_store.clone(),
+                app_state.languages.clone(),
+                app_state.fs.clone(),
+                true,
+                cx,
+            )
+        });
+        open_remote_project_in_new_window_inner(
+            project,
+            paths,
+            workspace_id,
+            serialized_workspace,
+            app_state,
+            window_options,
+            cx,
+        )
+        .await
+    })
+}
+
+/// Desktop convenience for [`open_remote_project_in_new_window_with_client`]: builds the
+/// `RemoteClient` from an already-dialed connection with
+/// `ConnectionIdentifier::Workspace(workspace_id)`, then opens the window the same way.
+/// Resolves to `None` when `cancel_rx` fires before the client is ready.
+pub fn open_remote_project_in_new_window(
+    remote_connection: Arc<dyn RemoteConnection>,
+    cancel_rx: oneshot::Receiver<()>,
+    delegate: Arc<dyn RemoteClientDelegate>,
+    app_state: Arc<AppState>,
+    paths: Vec<PathBuf>,
+    window_options: WindowOptions,
+    cx: &mut App,
+) -> Task<Result<Option<OpenedRemoteProject>>> {
+    cx.spawn(async move |cx| {
+        let (workspace_id, serialized_workspace) =
+            deserialize_remote_project(remote_connection.connection_options(), paths.clone(), cx)
+                .await?;
+
+        let remote = match cx
+            .update(|cx| {
+                remote::RemoteClient::new(
+                    ConnectionIdentifier::Workspace(workspace_id.0),
+                    remote_connection,
+                    cancel_rx,
+                    delegate,
+                    cx,
+                )
+            })
+            .await?
+        {
+            Some(remote) => remote,
+            None => return Ok(None),
+        };
+
+        let project = cx.update(|cx| {
+            project::Project::remote(
+                remote,
+                app_state.client.clone(),
+                app_state.node_runtime.clone(),
+                app_state.user_store.clone(),
+                app_state.languages.clone(),
+                app_state.fs.clone(),
+                true,
+                cx,
+            )
+        });
+        open_remote_project_in_new_window_inner(
+            project,
+            paths,
+            workspace_id,
+            serialized_workspace,
+            app_state,
+            window_options,
+            cx,
+        )
+        .await
+        .map(Some)
+    })
+}
+
+async fn open_remote_project_in_new_window_inner(
     project: Entity<Project>,
     paths: Vec<PathBuf>,
     workspace_id: WorkspaceId,
     serialized_workspace: Option<SerializedWorkspace>,
     app_state: Arc<AppState>,
-    window: WindowHandle<MultiWorkspace>,
-    provisional_project_group_key: Option<ProjectGroupKey>,
-    source_workspace: Option<WeakEntity<Workspace>>,
+    window_options: WindowOptions,
     cx: &mut AsyncApp,
-) -> Result<(Entity<Workspace>, Vec<Option<Box<dyn ItemHandle>>>)> {
+) -> Result<OpenedRemoteProject> {
+    let (project_paths_to_open, mut project_path_errors) =
+        resolve_remote_project_paths(&project, paths, cx).await;
+    // An empty `paths` opens the window on the bare remote project (the browser shell may
+    // boot a workspace without a checkout yet); only a request whose every path failed to
+    // resolve is an error.
+    if project_paths_to_open.is_empty()
+        && let Some(error) = project_path_errors.pop()
+    {
+        return Err(error);
+    }
+
+    let window = cx.update(|cx| {
+        cx.open_window(window_options, {
+            let app_state = app_state.clone();
+            let project = project.clone();
+            let centered_layout = serialized_workspace
+                .as_ref()
+                .map(|serialized| serialized.centered_layout);
+            move |window, cx| {
+                let workspace = cx.new(|cx| {
+                    let mut workspace =
+                        Workspace::new(Some(workspace_id), project, app_state, window, cx);
+                    workspace.update_history(cx);
+                    if let Some(centered_layout) = centered_layout {
+                        workspace.centered_layout = centered_layout;
+                    }
+                    workspace
+                });
+                cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
+            }
+        })
+    })?;
+    let workspace = window.update(cx, |multi_workspace: &mut MultiWorkspace, _, _cx| {
+        multi_workspace.workspace().clone()
+    })?;
+
+    let items = match finish_opening_remote_workspace(
+        project,
+        workspace.clone(),
+        workspace_id,
+        serialized_workspace,
+        project_paths_to_open,
+        project_path_errors,
+        window,
+        cx,
+    )
+    .await
+    {
+        Ok(items) => items,
+        Err(error) => {
+            // The caller only learns about the window through `Ok`, so an `Err` must not
+            // leave it behind: a retry would otherwise open a second window for the same
+            // workspace.
+            window
+                .update(cx, |_, window, _| window.remove_window())
+                .ok();
+            return Err(error);
+        }
+    };
+
+    Ok(OpenedRemoteProject {
+        window,
+        workspace,
+        items,
+    })
+}
+
+async fn resolve_remote_project_paths(
+    project: &Entity<Project>,
+    paths: Vec<PathBuf>,
+    cx: &mut AsyncApp,
+) -> (Vec<(PathBuf, Option<ProjectPath>)>, Vec<anyhow::Error>) {
     let mut project_paths_to_open = vec![];
     let mut project_path_errors = vec![];
 
@@ -11154,6 +11341,23 @@ async fn open_remote_project_inner(
             }
         };
     }
+
+    (project_paths_to_open, project_path_errors)
+}
+
+async fn open_remote_project_inner(
+    project: Entity<Project>,
+    paths: Vec<PathBuf>,
+    workspace_id: WorkspaceId,
+    serialized_workspace: Option<SerializedWorkspace>,
+    app_state: Arc<AppState>,
+    window: WindowHandle<MultiWorkspace>,
+    provisional_project_group_key: Option<ProjectGroupKey>,
+    source_workspace: Option<WeakEntity<Workspace>>,
+    cx: &mut AsyncApp,
+) -> Result<(Entity<Workspace>, Vec<Option<Box<dyn ItemHandle>>>)> {
+    let (project_paths_to_open, mut project_path_errors) =
+        resolve_remote_project_paths(&project, paths, cx).await;
 
     if project_paths_to_open.is_empty() {
         return Err(project_path_errors.pop().context("no paths given")?);
@@ -11190,6 +11394,33 @@ async fn open_remote_project_inner(
         new_workspace
     })?;
 
+    let items = finish_opening_remote_workspace(
+        project,
+        workspace.clone(),
+        workspace_id,
+        serialized_workspace,
+        project_paths_to_open,
+        project_path_errors,
+        window,
+        cx,
+    )
+    .await?;
+
+    Ok((workspace, items))
+}
+
+/// Restores toolchains, opens `project_paths_to_open` in `workspace` and surfaces
+/// `project_path_errors` as workspace errors.
+async fn finish_opening_remote_workspace(
+    project: Entity<Project>,
+    workspace: Entity<Workspace>,
+    workspace_id: WorkspaceId,
+    serialized_workspace: Option<SerializedWorkspace>,
+    project_paths_to_open: Vec<(PathBuf, Option<ProjectPath>)>,
+    project_path_errors: Vec<anyhow::Error>,
+    window: WindowHandle<MultiWorkspace>,
+    cx: &mut AsyncApp,
+) -> Result<Vec<Option<Box<dyn ItemHandle>>>> {
     let db = cx.update(|cx| WorkspaceDb::global(cx));
     let toolchains = db.toolchains(workspace_id).await?;
     for (toolchain, worktree_path, path) in toolchains {
@@ -11234,10 +11465,7 @@ async fn open_remote_project_inner(
         }
     });
 
-    Ok((
-        workspace,
-        items.into_iter().map(|item| item?.ok()).collect(),
-    ))
+    Ok(items.into_iter().map(|item| item?.ok()).collect())
 }
 
 fn deserialize_remote_project(
@@ -12097,6 +12325,98 @@ mod tests {
     use settings::SettingsStore;
     use util::path;
     use util::rel_path::rel_path;
+
+    #[gpui::test]
+    async fn test_open_remote_project_in_new_window_with_client(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        // `RemoteClient::new` names the connection after the release channel.
+        cx.update(|cx| release_channel::init("0.0.0".parse().unwrap(), cx));
+        let app_state = cx.update(AppState::test);
+
+        // A mock server that only answers the client's pings and adds worktrees.
+        let (opts, server_client, connect_guard) = RemoteClient::fake_server(cx, server_cx);
+        drop(connect_guard);
+        let server_entity = server_cx.new(|_| ());
+        server_client.add_request_handler(
+            server_entity.downgrade(),
+            |_, _: TypedEnvelope<proto::Ping>, _| async move { Ok(proto::Ack {}) },
+        );
+        server_client.add_request_handler(
+            server_entity.downgrade(),
+            |_, envelope: TypedEnvelope<proto::AddWorktree>, _| async move {
+                Ok(proto::AddWorktreeResponse {
+                    worktree_id: 7,
+                    canonicalized_path: envelope.payload.path,
+                    root_repo_common_dir: None,
+                    root_repo_is_linked_worktree: false,
+                })
+            },
+        );
+        let remote = RemoteClient::connect_mock(opts, cx).await;
+
+        let opened = cx
+            .update(|cx| {
+                open_remote_project_in_new_window_with_client(
+                    remote.clone(),
+                    app_state.clone(),
+                    vec![PathBuf::from("/workspaces/repo")],
+                    WindowOptions::default(),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        // Exactly one window, and it is the one handed back.
+        let window_ids = cx.update(|cx| {
+            cx.windows()
+                .iter()
+                .map(|window| window.window_id())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(window_ids, vec![opened.window.window_id()]);
+        assert_eq!(opened.items.len(), 1);
+        opened.workspace.read_with(cx, |workspace, cx| {
+            let project = workspace.project().read(cx);
+            assert!(project.is_remote());
+            assert_eq!(
+                project.remote_client().map(|client| client.entity_id()),
+                Some(remote.entity_id())
+            );
+            assert_eq!(project.worktrees(cx).count(), 1);
+            assert!(workspace.database_id().is_some());
+        });
+
+        // The connection-taking form resolves to `None` when cancelled before the client is
+        // ready, and opens no window.
+        let (opts, _server_client, connect_guard) = RemoteClient::fake_server(cx, server_cx);
+        drop(connect_guard);
+        let delegate: Arc<dyn remote::RemoteClientDelegate> = Arc::new(remote::MockDelegate);
+        let connection = remote::connect(opts, delegate.clone(), &mut cx.to_async())
+            .await
+            .unwrap();
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        drop(cancel_tx);
+        let cancelled = cx
+            .update(|cx| {
+                open_remote_project_in_new_window(
+                    connection,
+                    cancel_rx,
+                    delegate,
+                    app_state,
+                    vec![PathBuf::from("/workspaces/repo")],
+                    WindowOptions::default(),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        assert!(cancelled.is_none());
+        assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+    }
 
     #[gpui::test]
     async fn test_tab_disambiguation(cx: &mut TestAppContext) {

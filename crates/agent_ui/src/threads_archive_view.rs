@@ -22,6 +22,10 @@ use gpui::{
     Focusable, ListState, Render, SharedString, Subscription, Task, TaskExt, WeakEntity, Window,
     list, prelude::*, px,
 };
+// `gpui::block_on` does not exist on wasm (the browser's main thread cannot park); the wasm
+// matcher never suspends, so a poll loop stands in for it there. See `crate::agent_ui`.
+#[cfg(not(target_family = "wasm"))]
+use gpui::block_on as block_on_match_strings;
 use itertools::Itertools as _;
 use menu::{Confirm, SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use picker::{
@@ -43,6 +47,8 @@ use workspace::{
     WorkspaceDb, WorkspaceId,
 };
 
+#[cfg(target_family = "wasm")]
+use crate::poll_match_strings_to_completion as block_on_match_strings;
 use zed_actions::agents_sidebar::FocusSidebarFilter;
 use zed_actions::editor::{MoveDown, MoveUp};
 
@@ -1353,7 +1359,7 @@ impl PickerDelegate for ProjectPickerDelegate {
             })
             .collect();
 
-        let mut sibling_matches = gpui::block_on(fuzzy::match_strings(
+        let mut sibling_matches = block_on_match_strings(fuzzy::match_strings(
             &sibling_candidates,
             query,
             smart_case,
@@ -1389,7 +1395,7 @@ impl PickerDelegate for ProjectPickerDelegate {
             })
             .collect();
 
-        let mut recent_matches = gpui::block_on(fuzzy::match_strings(
+        let mut recent_matches = block_on_match_strings(fuzzy::match_strings(
             &recent_candidates,
             query,
             smart_case,

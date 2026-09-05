@@ -6,7 +6,6 @@ use futures::future::BoxFuture;
 use futures::lock::OwnedMutexGuard;
 use futures::{AsyncBufReadExt, StreamExt as _};
 use gpui::{App, AsyncApp, Entity, SharedString, Task};
-use http_client::github::{AssetKind, GitHubLspBinaryVersion, latest_github_release};
 use language::language_settings::LanguageSettings;
 use language::{
     Buffer, ContextLocation, DynLspInstaller, LanguageToolchainStore, LspInstaller, Symbol,
@@ -35,11 +34,9 @@ use std::env::consts;
 use util::command::Stdio;
 
 use util::command::new_command;
-use util::fs::{make_file_executable, remove_matching};
-use util::paths::PathStyle;
+use util::paths::{PathStyle, UrlExt};
 use util::rel_path::RelPath;
 
-use http_client::github_download::{GithubBinaryMetadata, download_server_binary};
 use parking_lot::Mutex;
 use std::str::FromStr;
 use std::{
@@ -51,6 +48,11 @@ use std::{
 };
 use task::{ShellKind, TaskTemplate, TaskTemplates, VariableName};
 use util::{ResultExt, maybe};
+
+use crate::lsp_download::{
+    AssetKind, GitHubLspBinaryVersion, GithubBinaryMetadata, download_server_binary,
+    latest_github_release, make_file_executable, remove_matching,
+};
 
 pub(crate) fn semantic_token_rules() -> SemanticTokenRules {
     let content = grammars::get_file("python/semantic_token_rules.json")
@@ -343,6 +345,15 @@ impl TyLspAdapter {
     const ARCH_SERVER_NAME: &str = "pc-windows-msvc";
 }
 
+// wasm32-unknown-unknown: there is no ty build for the browser and it never downloads one
+// (`lsp_download`), but the install path is compiled there too; these name the target it would
+// ask for.
+#[cfg(target_family = "wasm")]
+impl TyLspAdapter {
+    const GITHUB_ASSET_KIND: AssetKind = AssetKind::TarGz;
+    const ARCH_SERVER_NAME: &str = "unknown-unknown";
+}
+
 impl TyLspAdapter {
     const SERVER_NAME: LanguageServerName = LanguageServerName::new_static("ty");
 
@@ -427,8 +438,15 @@ impl LspAdapter for TyLspAdapter {
             serde_json::from_value::<PythonToolchainData>(toolchain.as_json).ok()
         }) {
             _ = maybe!({
-                let uri =
-                    url::Url::from_file_path(toolchain.environment.executable.as_ref()?).ok()?;
+                let executable = toolchain.environment.executable.as_ref()?;
+                let uri = url::Url::from_file_path_ext(executable, PathStyle::local())
+                    .inspect_err(|()| {
+                        log::warn!(
+                            "(Python) toolchain executable {executable:?} has no file URL; \
+                             not sending pythonExtension.activeEnvironment to ty"
+                        )
+                    })
+                    .ok()?;
                 let sys_prefix = toolchain.environment.prefix.clone()?;
                 let environment = json!({
                     "executable": {
@@ -515,7 +533,7 @@ impl LspInstaller for TyLspAdapter {
             } = latest_version;
             let destination_path = container_dir.join(format!("ty-{name}"));
 
-            async_fs::create_dir_all(&destination_path).await?;
+            smol::fs::create_dir_all(&destination_path).await?;
 
             let server_path = match Self::GITHUB_ASSET_KIND {
                 AssetKind::TarGz | AssetKind::TarBz2 | AssetKind::Gz => destination_path
@@ -1224,7 +1242,7 @@ fn env_priority(kind: Option<PythonEnvironmentKind>) -> usize {
 ///
 /// https://virtualfish.readthedocs.io/en/latest/plugins.html#auto-activation-auto-activation
 async fn get_worktree_venv_declaration(worktree_root: &Path) -> Option<String> {
-    let file = async_fs::File::open(worktree_root.join(".venv"))
+    let file = smol::fs::File::open(worktree_root.join(".venv"))
         .await
         .ok()?;
     let mut venv_name = String::new();
@@ -1658,6 +1676,10 @@ async fn resolve_venv_activation_scripts(
 pub struct EnvironmentApi<'a> {
     global_search_locations: Arc<Mutex<Vec<PathBuf>>>,
     project_env: &'a HashMap<String, String>,
+    // The process environment, consulted after `project_env`. The browser has none — its
+    // `std::env` is empty, and `pet_core`'s `EnvironmentApi` implements `Environment` for Unix
+    // and Windows only — so there the project environment (the workspace host's) is all of it.
+    #[cfg(not(target_family = "wasm"))]
     pet_env: pet_core::os_environment::EnvironmentApi,
 }
 
@@ -1665,12 +1687,13 @@ impl<'a> EnvironmentApi<'a> {
     pub fn from_env(project_env: &'a HashMap<String, String>) -> Self {
         let paths = project_env
             .get("PATH")
-            .map(|p| std::env::split_paths(p).collect())
+            .map(|p| split_path_list(p))
             .unwrap_or_default();
 
         EnvironmentApi {
             global_search_locations: Arc::new(Mutex::new(paths)),
             project_env,
+            #[cfg(not(target_family = "wasm"))]
             pet_env: pet_core::os_environment::EnvironmentApi::new(),
         }
     }
@@ -1680,7 +1703,58 @@ impl<'a> EnvironmentApi<'a> {
             .get("HOME")
             .or_else(|| self.project_env.get("USERPROFILE"))
             .map(|home| pet_fs::path::norm_case(PathBuf::from(home)))
-            .or_else(|| self.pet_env.get_user_home())
+            .or_else(|| self.process_user_home())
+    }
+
+    /// The process environment's home directory; none in the browser.
+    fn process_user_home(&self) -> Option<PathBuf> {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.pet_env.get_user_home()
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            None
+        }
+    }
+
+    /// The process environment's value for `key`; none in the browser.
+    fn process_env_var(&self, key: String) -> Option<String> {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.pet_env.get_env_var(key)
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = key;
+            None
+        }
+    }
+
+    /// The process environment's global search locations; none in the browser.
+    fn process_search_locations(&self) -> Vec<PathBuf> {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.pet_env.get_know_global_search_locations()
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            Vec::new()
+        }
+    }
+}
+
+/// Splits a `PATH`-style list. `std::env::split_paths` is the `unsupported` platform stub on
+/// wasm32-unknown-unknown and panics; the environment there is the workspace host's, whose
+/// `PATH` is Unix-style.
+fn split_path_list(paths: &str) -> Vec<PathBuf> {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        std::env::split_paths(paths).collect()
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        paths.split(':').map(PathBuf::from).collect()
     }
 }
 
@@ -1697,21 +1771,20 @@ impl pet_core::os_environment::Environment for EnvironmentApi<'_> {
         self.project_env
             .get(&key)
             .cloned()
-            .or_else(|| self.pet_env.get_env_var(key))
+            .or_else(|| self.process_env_var(key))
     }
 
     fn get_know_global_search_locations(&self) -> Vec<PathBuf> {
         if self.global_search_locations.lock().is_empty() {
-            let mut paths = std::env::split_paths(
+            let mut paths = split_path_list(
                 &self
                     .get_env_var("PATH".to_string())
                     .or_else(|| self.get_env_var("Path".to_string()))
                     .unwrap_or_default(),
-            )
-            .collect::<Vec<PathBuf>>();
+            );
 
             log::trace!("Env PATH: {:?}", paths);
-            for p in self.pet_env.get_know_global_search_locations() {
+            for p in self.process_search_locations() {
                 if !paths.contains(&p) {
                     paths.push(p);
                 }
@@ -2451,6 +2524,15 @@ impl RuffLspAdapter {
 impl RuffLspAdapter {
     const GITHUB_ASSET_KIND: AssetKind = AssetKind::Zip;
     const ARCH_SERVER_NAME: &str = "pc-windows-msvc";
+}
+
+// wasm32-unknown-unknown: there is no ruff build for the browser and it never downloads one
+// (`lsp_download`), but the install path is compiled there too; these name the target it would
+// ask for.
+#[cfg(target_family = "wasm")]
+impl RuffLspAdapter {
+    const GITHUB_ASSET_KIND: AssetKind = AssetKind::TarGz;
+    const ARCH_SERVER_NAME: &str = "unknown-unknown";
 }
 
 impl RuffLspAdapter {

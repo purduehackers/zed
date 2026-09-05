@@ -21,7 +21,6 @@ load-grammars = [
 [dependencies]
 anyhow.workspace = true
 async-compression.workspace = true
-async-fs.workspace = true
 async-tar.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
@@ -59,10 +58,16 @@ snippet.workspace = true
 task.workspace = true
 terminal.workspace = true
 theme.workspace = true
-tree-sitter = { workspace = true, optional = true , features = ["wasm"] }
 tree-sitter-gitcommit = { workspace = true, optional = true }
 url.workspace = true
 util.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+# `wasm` = wasmtime-backed `WasmStore` for extension grammars; the browser links grammars itself.
+tree-sitter = { workspace = true, optional = true, features = ["wasm"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+tree-sitter = { workspace = true, optional = true }
 
 [dev-dependencies]
 fs = { workspace = true, features = ["test-support"] }

@@ -1,0 +1,16 @@
+[package]
+name = "pet-hatch"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+pet-core = { git = "https://github.com/microsoft/python-environment-tools.git", rev = "bb8e04607b96a3865d6aa4bb2a5a5a82ce05b5f0" }
+pet-fs = { git = "https://github.com/microsoft/python-environment-tools.git", rev = "bb8e04607b96a3865d6aa4bb2a5a5a82ce05b5f0" }
+pet-python-utils = { git = "https://github.com/microsoft/python-environment-tools.git", rev = "bb8e04607b96a3865d6aa4bb2a5a5a82ce05b5f0" }
+serde = { version = "1.0.152", features = ["derive"] }
+toml = "0.9.7"
+log = "0.4.21"
+
+[dev-dependencies]
+tempfile = "3.13"

@@ -27,9 +27,10 @@ use git::{
     REBASE_APPLY_DIR, REBASE_MERGE_DIR, REFS_DIR, REFTABLE_DIR, REPO_EXCLUDE, SEQUENCER_DIR,
     status::GitSummary,
 };
+#[cfg(not(target_family = "wasm"))]
+use gpui::Priority;
 use gpui::{
-    App, AppContext as _, AsyncApp, BackgroundExecutor, Context, Entity, EventEmitter, Priority,
-    Task,
+    App, AppContext as _, AsyncApp, BackgroundExecutor, Context, Entity, EventEmitter, Task,
 };
 pub use ignore::{IgnoreKind, IgnoreStack};
 use language::{
@@ -69,7 +70,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering::SeqCst},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use sum_tree::{Bias, Dimensions, Edit, KeyedItem, SeekTarget, SumTree, Summary, TreeMap, TreeSet};
 use text::{LineEnding, Rope};
@@ -78,6 +79,8 @@ use util::{
     paths::{PathMatcher, PathStyle, SanitizedPath, home_dir},
     rel_path::RelPath,
 };
+// `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` natively.
+use web_time::Instant;
 pub use worktree_settings::WorktreeSettings;
 
 pub const FS_WATCH_LATENCY: Duration = Duration::from_millis(100);
@@ -582,8 +585,23 @@ impl Worktree {
                         entry.is_hidden = settings.is_path_hidden(path);
                     }
                 }
+                #[cfg(not(target_family = "wasm"))]
                 cx.foreground_executor()
                     .block_on(snapshot.insert_entry(entry, fs.as_ref()));
+                // The browser cannot block. The root entry's relative path is empty, so
+                // `insert_entry` never reaches its only await (loading a `.gitignore`) and
+                // completes on its first poll.
+                #[cfg(target_family = "wasm")]
+                if snapshot
+                    .insert_entry(entry, fs.as_ref())
+                    .now_or_never()
+                    .is_none()
+                {
+                    log::error!(
+                        "root entry of worktree {:?} was not inserted synchronously",
+                        abs_path
+                    );
+                }
             }
 
             let (scan_requests_tx, scan_requests_rx) = async_channel::unbounded();
@@ -5252,61 +5270,70 @@ impl BackgroundScanner {
         }
 
         let progress_update_count = AtomicUsize::new(0);
+        let scan_jobs_rx = &scan_jobs_rx;
+        let progress_update_count = &progress_update_count;
+        let worker = move || async move {
+            let mut last_progress_update_count = 0;
+            let progress_update_timer = self.progress_timer(enable_progress_updates).fuse();
+            futures::pin_mut!(progress_update_timer);
+
+            loop {
+                select_biased! {
+                    // Process any path refresh requests before moving on to process
+                    // the scan queue, so that user operations are prioritized.
+                    request = self.next_scan_request().fuse() => {
+                        let Ok(request) = request else { break };
+                        if !self.process_scan_request(request, true).await {
+                            return;
+                        }
+                    }
+
+                    // Send periodic progress updates to the worktree. Use an atomic counter
+                    // to ensure that only one of the workers sends a progress update after
+                    // the update interval elapses.
+                    _ = progress_update_timer => {
+                        match progress_update_count.compare_exchange(
+                            last_progress_update_count,
+                            last_progress_update_count + 1,
+                            SeqCst,
+                            SeqCst
+                        ) {
+                            Ok(_) => {
+                                last_progress_update_count += 1;
+                                self.send_status_update(true, SmallVec::new(), &[])
+                                    .await;
+                            }
+                            Err(count) => {
+                                last_progress_update_count = count;
+                            }
+                        }
+                        progress_update_timer.set(self.progress_timer(enable_progress_updates).fuse());
+                    }
+
+                    // Recursively load directories from the file system.
+                    job = scan_jobs_rx.recv().fuse() => {
+                        let Ok(job) = job else { break };
+                        if let Err(err) = self.scan_dir(&job).await
+                            && job.path.is_empty() {
+                                log::error!("error scanning directory {:?}: {}", job.abs_path, err);
+                            }
+                    }
+                }
+            }
+        };
+
+        #[cfg(not(target_family = "wasm"))]
         self.executor
             .scoped_priority(Priority::Low, |scope| {
                 for _ in 0..self.executor.num_cpus() {
-                    scope.spawn(async {
-                        let mut last_progress_update_count = 0;
-                        let progress_update_timer = self.progress_timer(enable_progress_updates).fuse();
-                        futures::pin_mut!(progress_update_timer);
-
-                        loop {
-                            select_biased! {
-                                // Process any path refresh requests before moving on to process
-                                // the scan queue, so that user operations are prioritized.
-                                request = self.next_scan_request().fuse() => {
-                                    let Ok(request) = request else { break };
-                                    if !self.process_scan_request(request, true).await {
-                                        return;
-                                    }
-                                }
-
-                                // Send periodic progress updates to the worktree. Use an atomic counter
-                                // to ensure that only one of the workers sends a progress update after
-                                // the update interval elapses.
-                                _ = progress_update_timer => {
-                                    match progress_update_count.compare_exchange(
-                                        last_progress_update_count,
-                                        last_progress_update_count + 1,
-                                        SeqCst,
-                                        SeqCst
-                                    ) {
-                                        Ok(_) => {
-                                            last_progress_update_count += 1;
-                                            self.send_status_update(true, SmallVec::new(), &[])
-                                                .await;
-                                        }
-                                        Err(count) => {
-                                            last_progress_update_count = count;
-                                        }
-                                    }
-                                    progress_update_timer.set(self.progress_timer(enable_progress_updates).fuse());
-                                }
-
-                                // Recursively load directories from the file system.
-                                job = scan_jobs_rx.recv().fuse() => {
-                                    let Ok(job) = job else { break };
-                                    if let Err(err) = self.scan_dir(&job).await
-                                        && job.path.is_empty() {
-                                            log::error!("error scanning directory {:?}: {}", job.abs_path, err);
-                                        }
-                                }
-                            }
-                        }
-                    });
+                    scope.spawn(worker());
                 }
             })
             .await;
+        // `BackgroundExecutor::scoped` blocks on drop, which the browser cannot do; run the
+        // workers as concurrent futures on the calling task instead.
+        #[cfg(target_family = "wasm")]
+        futures::future::join_all((0..self.executor.num_cpus()).map(|_| worker())).await;
     }
 
     async fn send_status_update(
@@ -5831,44 +5858,57 @@ impl BackgroundScanner {
         let (ignore_queue_tx, ignore_queue_rx) = async_channel::unbounded();
         {
             for (parent_abs_path, ignore_stack) in ignores_to_update {
-                ignore_queue_tx
-                    .send_blocking(UpdateIgnoreStatusJob {
-                        abs_path: parent_abs_path,
-                        ignore_stack,
-                        ignore_queue: ignore_queue_tx.clone(),
-                        scan_queue: scan_job_tx.clone(),
-                    })
-                    .unwrap();
+                let job = UpdateIgnoreStatusJob {
+                    abs_path: parent_abs_path,
+                    ignore_stack,
+                    ignore_queue: ignore_queue_tx.clone(),
+                    scan_queue: scan_job_tx.clone(),
+                };
+                #[cfg(not(target_family = "wasm"))]
+                ignore_queue_tx.send_blocking(job).unwrap();
+                // `async-channel` does not compile `send_blocking` for wasm; the queue is
+                // unbounded, so the asynchronous send completes on its first poll.
+                #[cfg(target_family = "wasm")]
+                ignore_queue_tx.send(job).await.unwrap();
             }
         }
         drop(ignore_queue_tx);
 
+        let ignore_queue_rx = &ignore_queue_rx;
+        let prev_snapshot = &prev_snapshot;
+        let worker = move || async move {
+            loop {
+                select_biased! {
+                    // Process any path refresh requests before moving on to process
+                    // the queue of ignore statuses.
+                    request = self.next_scan_request().fuse() => {
+                        let Ok(request) = request else { break };
+                        if !self.process_scan_request(request, true).await {
+                            return;
+                        }
+                    }
+
+                    // Recursively process directories whose ignores have changed.
+                    job = ignore_queue_rx.recv().fuse() => {
+                        let Ok(job) = job else { break };
+                        self.update_ignore_status(job, prev_snapshot).await;
+                    }
+                }
+            }
+        };
+
+        #[cfg(not(target_family = "wasm"))]
         self.executor
             .scoped(|scope| {
                 for _ in 0..self.executor.num_cpus() {
-                    scope.spawn(async {
-                        loop {
-                            select_biased! {
-                                // Process any path refresh requests before moving on to process
-                                // the queue of ignore statuses.
-                                request = self.next_scan_request().fuse() => {
-                                    let Ok(request) = request else { break };
-                                    if !self.process_scan_request(request, true).await {
-                                        return;
-                                    }
-                                }
-
-                                // Recursively process directories whose ignores have changed.
-                                job = ignore_queue_rx.recv().fuse() => {
-                                    let Ok(job) = job else { break };
-                                    self.update_ignore_status(job, &prev_snapshot).await;
-                                }
-                            }
-                        }
-                    });
+                    scope.spawn(worker());
                 }
             })
             .await;
+        // `BackgroundExecutor::scoped` blocks on drop, which the browser cannot do; run the
+        // workers as concurrent futures on the calling task instead.
+        #[cfg(target_family = "wasm")]
+        futures::future::join_all((0..self.executor.num_cpus()).map(|_| worker())).await;
     }
 
     async fn ignores_needing_update(&self) -> Vec<Arc<Path>> {

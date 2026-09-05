@@ -1,6 +1,8 @@
-use std::{collections::VecDeque, time::Instant};
+use std::collections::VecDeque;
 
 use gpui::SharedString;
+// `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` natively.
+use web_time::Instant;
 
 use super::JobId;
 

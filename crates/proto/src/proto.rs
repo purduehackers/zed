@@ -6,13 +6,10 @@ mod typed_envelope;
 
 pub use error::*;
 pub use prost::{DecodeError, Message};
-use std::{
-    cmp,
-    fmt::Debug,
-    iter, mem,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{cmp, fmt::Debug, iter, mem, time::Duration};
 pub use typed_envelope::*;
+// `std::time::SystemTime::now()` panics on wasm; `web_time` re-exports `std` on native.
+use web_time::{SystemTime, UNIX_EPOCH};
 
 include!(concat!(env!("OUT_DIR"), "/zed.messages.rs"));
 
@@ -408,6 +405,33 @@ messages!(
     (KillKernel, Background),
     (GetRemoteProfilingData, Background),
     (GetRemoteProfilingDataResponse, Background),
+    (SpawnTerminal, Background),
+    (SpawnTerminalResponse, Background),
+    (TerminalInput, Background),
+    (TerminalOutput, Background),
+    (AckTerminalOutput, Background),
+    (ResizeTerminal, Background),
+    (CloseTerminal, Background),
+    (TerminalExited, Background),
+    (ListTerminals, Background),
+    (ListTerminalsResponse, Background),
+    (AttachTerminal, Background),
+    (AttachTerminalResponse, Background),
+    (SaveClientState, Background),
+    (SaveClientStateResponse, Background),
+    (LoadClientState, Background),
+    (LoadClientStateResponse, Background),
+    (LifecycleNotice, Foreground),
+    (PortsChanged, Background),
+    (ForwardPort, Background),
+    (ForwardPortResponse, Background),
+    (UnforwardPort, Background),
+    (FilesUploaded, Foreground),
+    (ListExtensions, Background),
+    (ListExtensionsResponse, Background),
+    (InstallRegistryExtension, Background),
+    (UninstallExtension, Background),
+    (ExtensionsChanged, Background),
 );
 
 request_messages!(
@@ -644,6 +668,16 @@ request_messages!(
     (SpawnKernel, SpawnKernelResponse),
     (KillKernel, Ack),
     (GetRemoteProfilingData, GetRemoteProfilingDataResponse),
+    (SpawnTerminal, SpawnTerminalResponse),
+    (ListTerminals, ListTerminalsResponse),
+    (AttachTerminal, AttachTerminalResponse),
+    (SaveClientState, SaveClientStateResponse),
+    (LoadClientState, LoadClientStateResponse),
+    (ForwardPort, ForwardPortResponse),
+    (UnforwardPort, Ack),
+    (ListExtensions, ListExtensionsResponse),
+    (InstallRegistryExtension, Ack),
+    (UninstallExtension, Ack),
 );
 
 lsp_messages!(
@@ -873,7 +907,20 @@ entity_messages!(
     FindSearchCandidatesChunk,
     FindSearchCandidatesCancelled,
     DownloadFileByPath,
-    GetRemoteProfilingData
+    GetRemoteProfilingData,
+    SpawnTerminal,
+    TerminalInput,
+    TerminalOutput,
+    AckTerminalOutput,
+    ResizeTerminal,
+    CloseTerminal,
+    TerminalExited,
+    ListTerminals,
+    AttachTerminal,
+    LifecycleNotice,
+    PortsChanged,
+    FilesUploaded,
+    ExtensionsChanged,
 );
 
 entity_messages!(
@@ -897,6 +944,31 @@ impl From<Timestamp> for SystemTime {
 impl From<SystemTime> for Timestamp {
     fn from(time: SystemTime) -> Self {
         let duration = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+        Self {
+            seconds: duration.as_secs(),
+            nanos: duration.subsec_nanos(),
+        }
+    }
+}
+
+// On wasm `web_time::SystemTime` is a distinct type from `std::time::SystemTime`, which still
+// exists there (only `now()` panics) and is what `fs::MTime` and file metadata carry, so keep
+// converting it too. Natively the two are the same type and these would be duplicate impls.
+#[cfg(target_family = "wasm")]
+impl From<Timestamp> for std::time::SystemTime {
+    fn from(val: Timestamp) -> Self {
+        std::time::UNIX_EPOCH
+            .checked_add(Duration::new(val.seconds, val.nanos))
+            .unwrap()
+    }
+}
+
+#[cfg(target_family = "wasm")]
+impl From<std::time::SystemTime> for Timestamp {
+    fn from(time: std::time::SystemTime) -> Self {
+        let duration = time
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
         Self {
             seconds: duration.as_secs(),
             nanos: duration.subsec_nanos(),
@@ -1111,6 +1183,182 @@ mod tests {
             id: u32::MAX,
         };
         assert_eq!(PeerId::from_u64(peer_id.as_u64()), peer_id);
+    }
+
+    #[test]
+    fn test_remote_session_messages_round_trip() {
+        fn round_trip<T>(message: T, background: bool)
+        where
+            T: EnvelopedMessage + Clone + PartialEq + Debug,
+        {
+            let envelope = message.clone().into_envelope(7, None, None);
+            let bytes = envelope.encode_to_vec();
+            let decoded = Envelope::decode(bytes.as_slice()).expect("decodes");
+            assert_eq!(decoded.id, 7);
+            let typed = build_typed_envelope(
+                PeerId { owner_id: 0, id: 0 },
+                web_time::Instant::now(),
+                decoded,
+            )
+            .expect("typed envelope");
+            assert_eq!(typed.payload_type_name(), T::NAME);
+            assert_eq!(typed.is_background(), background, "{}", T::NAME);
+            let payload = typed
+                .into_any()
+                .downcast::<TypedEnvelope<T>>()
+                .expect("payload type")
+                .payload;
+            assert_eq!(payload, message);
+        }
+
+        round_trip(
+            SaveClientState {
+                project_id: REMOTE_SERVER_PROJECT_ID,
+                sqlite: vec![1, 2, 3],
+                version: 4,
+                gzip: true,
+                client_build: Some("build".into()),
+                stopping: true,
+            },
+            true,
+        );
+        round_trip(
+            SaveClientStateResponse {
+                accepted: true,
+                version: 4,
+            },
+            true,
+        );
+        round_trip(
+            LoadClientState {
+                project_id: REMOTE_SERVER_PROJECT_ID,
+                metadata_only: true,
+            },
+            true,
+        );
+        round_trip(
+            LoadClientStateResponse {
+                sqlite: vec![9],
+                version: 3,
+                gzip: false,
+                client_build: None,
+            },
+            true,
+        );
+        round_trip(
+            LifecycleNotice {
+                project_id: REMOTE_SERVER_PROJECT_ID,
+                kind: LifecycleKind::IdleStopIn as i32,
+                seconds: 300,
+            },
+            false,
+        );
+        round_trip(
+            PortsChanged {
+                project_id: REMOTE_SERVER_PROJECT_ID,
+                ports: vec![ListeningPort {
+                    port: 3000,
+                    pid: 42,
+                    process_name: "node".into(),
+                }],
+                forwards: vec![PortForward {
+                    port: 3000,
+                    visibility: PortVisibility::PortPublic as i32,
+                    label: Some("web".into()),
+                    url: "https://x.example".into(),
+                }],
+            },
+            true,
+        );
+        round_trip(
+            ForwardPort {
+                project_id: REMOTE_SERVER_PROJECT_ID,
+                port: 3000,
+                visibility: PortVisibility::PortPrivate as i32,
+                label: None,
+            },
+            true,
+        );
+        round_trip(
+            ForwardPortResponse {
+                url: "https://x.example".into(),
+            },
+            true,
+        );
+        round_trip(
+            UnforwardPort {
+                project_id: REMOTE_SERVER_PROJECT_ID,
+                port: 3000,
+            },
+            true,
+        );
+        round_trip(
+            FilesUploaded {
+                project_id: REMOTE_SERVER_PROJECT_ID,
+                paths: vec![ProjectPath {
+                    worktree_id: 1,
+                    path: "src/main.rs".into(),
+                }],
+            },
+            false,
+        );
+        round_trip(
+            ListExtensions {
+                project_id: REMOTE_SERVER_PROJECT_ID,
+                search: Some("toml".into()),
+                include_available: true,
+            },
+            true,
+        );
+        round_trip(
+            ListExtensionsResponse {
+                installed: vec![InstalledExtension {
+                    id: "toml".into(),
+                    version: "1.0.0".into(),
+                    name: "TOML".into(),
+                    description: None,
+                    provides: vec!["languages".into()],
+                    dev: false,
+                }],
+                available: vec![AvailableExtension {
+                    id: "html".into(),
+                    version: "2.0.0".into(),
+                    name: "HTML".into(),
+                    description: Some("markup".into()),
+                    authors: vec!["zed".into()],
+                    repository: "https://example.com".into(),
+                    provides: vec!["languages".into()],
+                    download_count: 10,
+                }],
+            },
+            true,
+        );
+        round_trip(
+            InstallRegistryExtension {
+                project_id: REMOTE_SERVER_PROJECT_ID,
+                id: "toml".into(),
+                version: None,
+            },
+            true,
+        );
+        round_trip(
+            UninstallExtension {
+                project_id: REMOTE_SERVER_PROJECT_ID,
+                id: "toml".into(),
+            },
+            true,
+        );
+        round_trip(
+            ExtensionsChanged {
+                project_id: REMOTE_SERVER_PROJECT_ID,
+                installed: vec![],
+            },
+            true,
+        );
+
+        assert_eq!(PortVisibility::PortPrivate as i32, 0);
+        assert_eq!(PortVisibility::PortPublic as i32, 1);
+        assert_eq!(LifecycleKind::Resumed as i32, 3);
     }
 
     #[test]

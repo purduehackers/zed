@@ -38,6 +38,15 @@ pub fn home_dir() -> &'static PathBuf {
     })
 }
 
+/// Returns the path to the user's home directory. The browser has no OS home directory;
+/// `/home/web` is the fixed home of the wasm client (DECISIONS.md D11), under which settings and
+/// the keymap live at Zed's usual relative paths.
+#[cfg(target_family = "wasm")]
+pub fn home_dir() -> &'static PathBuf {
+    static HOME_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    HOME_DIR.get_or_init(|| PathBuf::from("/home/web"))
+}
+
 pub trait PathExt {
     /// Compacts a given file path by replacing the user's home directory
     /// prefix with a tilde (`~`).
@@ -1319,14 +1328,180 @@ impl WslPath {
     }
 }
 
+/// url 2.5's `PATH_SEGMENT` and `SPECIAL_PATH_SEGMENT` (url/src/parser.rs:20-42), which `url` does not export.
+const PATH_SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'<')
+    .add(b'>')
+    .add(b'`')
+    .add(b'#')
+    .add(b'?')
+    .add(b'{')
+    .add(b'}')
+    .add(b'/')
+    .add(b'%');
+const SPECIAL_PATH_SEGMENT: &percent_encoding::AsciiSet = &PATH_SEGMENT.add(b'\\');
+
 pub trait UrlExt {
     /// A version of `url::Url::to_file_path` that does platform handling based on the provided `PathStyle` instead of the host platform.
     ///
     /// Prefer using this over `url::Url::to_file_path` when you need to handle paths in a cross-platform way as is the case for remoting interactions.
     fn to_file_path_ext(&self, path_style: PathStyle) -> Result<PathBuf, ()>;
+
+    /// `url::Url::from_file_path` with the platform decided at run time by `path_style`
+    /// (counterpart of `to_file_path_ext`). It is also the only way to build a `file://`
+    /// URL on wasm32-unknown-unknown, where `Url::from_file_path` is not compiled.
+    /// Unlike `url`, a `..` component (or a leading `.`) is rejected for both styles.
+    /// Verbatim Windows paths (`\\?\C:\…`, `\\?\UNC\server\share\…`) convert like their plain
+    /// forms, as in `url`. A non-UTF-8 path is accepted for `PathStyle::Unix` on a Unix host
+    /// (its bytes are percent-encoded, as `url` does) and rejected everywhere else.
+    fn from_file_path_ext<P: AsRef<Path>>(path: P, path_style: PathStyle) -> Result<url::Url, ()>
+    where
+        Self: Sized;
 }
 
 impl UrlExt for url::Url {
+    // Mirrors `url`'s `path_to_file_url_segments` (Unix) and `path_to_file_url_segments_windows`,
+    // with the `cfg` replaced by runtime branching on `PathStyle`, and `..` rejected instead of
+    // being written raw (a `Url` cannot carry a raw `..` segment; `Url::parse` would resolve it).
+    fn from_file_path_ext<P: AsRef<Path>>(path: P, path_style: PathStyle) -> Result<url::Url, ()> {
+        use percent_encoding::percent_encode;
+        use std::fmt::Write as _;
+
+        /// Writes `/X:` for a drive path and returns what follows the drive. Only a verbatim
+        /// (`\\?\X:`) drive may end right after the colon; a plain `C:relative` has no root.
+        fn push_windows_drive<'a>(
+            path: &'a str,
+            separators: &[char],
+            verbatim: bool,
+            serialization: &mut String,
+        ) -> Result<&'a str, ()> {
+            let bytes = path.as_bytes();
+            if bytes.len() < 2 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' {
+                return Err(());
+            }
+            let rest = &path[2..];
+            if !rest.starts_with(separators) && !(verbatim && rest.is_empty()) {
+                return Err(());
+            }
+            serialization.push('/');
+            serialization.push_str(&path[..2]);
+            Ok(rest)
+        }
+
+        /// Writes `host/share` for a UNC path (`unc` starts at the server name) and returns what
+        /// follows the share. `std` only recognises a plain `\\server\share` prefix when both
+        /// parts are present; a verbatim `\\?\UNC\server` may omit the share.
+        fn push_windows_unc<'a>(
+            unc: &'a str,
+            separators: &[char],
+            verbatim: bool,
+            serialization: &mut String,
+        ) -> Result<&'a str, ()> {
+            let (server, rest) = unc.split_once(separators).unwrap_or((unc, ""));
+            let (share, rest) = rest.split_once(separators).unwrap_or((rest, ""));
+            if server.is_empty() || (share.is_empty() && !verbatim) {
+                return Err(());
+            }
+            let host = url::Host::parse(server).map_err(|_| ())?;
+            write!(serialization, "{host}").map_err(|_| ())?;
+            serialization.push('/');
+            serialization.extend(percent_encode(share.as_bytes(), PATH_SEGMENT));
+            Ok(rest)
+        }
+
+        let path = path.as_ref();
+        let mut serialization = String::from("file://");
+        let mut pushed_segment = false;
+
+        // What follows the root / drive / UNC prefix, the separators it is split on, and the
+        // encode set `url` uses for that platform.
+        let (remainder, separators, encode_set): (&[u8], &[char], &percent_encoding::AsciiSet) =
+            match path_style {
+                PathStyle::Unix => {
+                    // `url` percent-encodes the raw bytes of a Unix path, so a non-UTF-8 path is
+                    // accepted on a Unix host; elsewhere an `OsStr` has no byte view and must be
+                    // UTF-8.
+                    #[cfg(unix)]
+                    let bytes = {
+                        use std::os::unix::ffi::OsStrExt as _;
+                        path.as_os_str().as_bytes()
+                    };
+                    #[cfg(not(unix))]
+                    let bytes = path.to_str().ok_or(())?.as_bytes();
+                    if bytes.first() != Some(&b'/') {
+                        return Err(());
+                    }
+                    let separators: &[char] = &['/'];
+                    (bytes, separators, SPECIAL_PATH_SEGMENT)
+                }
+                PathStyle::Windows => {
+                    // `url` requires UTF-8 for every Windows component.
+                    let path = path.to_str().ok_or(())?;
+                    let (rest, separators): (&str, &[char]) =
+                        if let Some(verbatim) = path.strip_prefix("\\\\?\\") {
+                            // `\\?\C:\…` and `\\?\UNC\server\share\…` convert like `C:\…` and
+                            // `\\server\share\…` (`url` treats `Prefix::VerbatimDisk`/`VerbatimUNC`
+                            // like `Disk`/`UNC`); `std` recognises the verbatim form only with
+                            // backslashes and splits its components on `\` alone, so a `/` stays
+                            // inside a component. Any other `\\?\` prefix has no file-URL form.
+                            let separators: &[char] = &['\\'];
+                            let rest = match verbatim.strip_prefix("UNC\\") {
+                                Some(unc) => {
+                                    push_windows_unc(unc, separators, true, &mut serialization)?
+                                }
+                                None => {
+                                    push_windows_drive(verbatim, separators, true, &mut serialization)?
+                                }
+                            };
+                            pushed_segment = verbatim.starts_with("UNC\\");
+                            (rest, separators)
+                        } else {
+                            let separators: &[char] = &['\\', '/'];
+                            let rest = if let Some(unc) = path
+                                .strip_prefix("\\\\")
+                                .or_else(|| path.strip_prefix("//"))
+                            {
+                                // `\\.\` (device) prefixes have no file-URL form, and `?` is not a
+                                // host (`//?/…` is not verbatim for `std`).
+                                if unc.starts_with('?') || unc.starts_with('.') {
+                                    return Err(());
+                                }
+                                pushed_segment = true;
+                                push_windows_unc(unc, separators, false, &mut serialization)?
+                            } else {
+                                push_windows_drive(path, separators, false, &mut serialization)?
+                            };
+                            (rest, separators)
+                        };
+                    (rest.as_bytes(), separators, PATH_SEGMENT)
+                }
+            };
+
+        // The separators are ASCII, so a byte-wise split keeps every segment valid UTF-8 when the
+        // input was.
+        for segment in remainder.split(|byte| separators.contains(&(*byte as char))) {
+            match segment {
+                // Empty (repeated separators, trailing separator) and `.` segments are dropped,
+                // as `Path::components` does.
+                b"" | b"." => continue,
+                b".." => return Err(()),
+                segment => {
+                    serialization.push('/');
+                    serialization.extend(percent_encode(segment, encode_set));
+                    pushed_segment = true;
+                }
+            }
+        }
+        // `file:///` for `/`; a Windows drive letter must end with a slash.
+        if !pushed_segment {
+            serialization.push('/');
+        }
+
+        url::Url::parse(&serialization).map_err(|_| ())
+    }
+
     // Copied from `url::Url::to_file_path`, but the `cfg` handling is replaced with runtime branching on `PathStyle`
     fn to_file_path_ext(&self, source_path_style: PathStyle) -> Result<PathBuf, ()> {
         if let Some(segments) = self.path_segments() {
@@ -3287,5 +3462,218 @@ mod tests {
             url.to_file_path_ext(PathStyle::Windows),
             Ok(PathBuf::from("C:\\Users\\file.txt"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_url_from_file_path_ext_unix_matches_url() {
+        use super::UrlExt;
+
+        for path in [
+            "/",
+            "/a",
+            "/a/b c",
+            "/tmp/100%.txt",
+            "/x/#?{}`y",
+            "/ünïcode/日本",
+            "/a/./b",
+            "/a//b/",
+            "/Users/test/[slug].tsx",
+        ] {
+            assert_eq!(
+                url::Url::from_file_path_ext(path, PathStyle::Unix),
+                url::Url::from_file_path(path),
+                "path {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_url_from_file_path_ext_unix_rejects_relative() {
+        use super::UrlExt;
+
+        assert_eq!(
+            url::Url::from_file_path_ext("a/b", PathStyle::Unix),
+            Err(())
+        );
+        assert_eq!(url::Url::from_file_path_ext("", PathStyle::Unix), Err(()));
+        assert_eq!(
+            url::Url::from_file_path_ext("./a", PathStyle::Unix),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn test_url_from_file_path_ext_rejects_parent_dir() {
+        use super::UrlExt;
+
+        // Documents the divergence from `url`, which would write `..` raw.
+        assert_eq!(
+            url::Url::from_file_path_ext("/a/../b", PathStyle::Unix),
+            Err(())
+        );
+        assert_eq!(
+            url::Url::from_file_path_ext("C:\\a\\..\\b", PathStyle::Windows),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn test_url_from_file_path_ext_windows_drive() {
+        use super::UrlExt;
+
+        assert_eq!(
+            url::Url::from_file_path_ext("C:\\Users\\x y", PathStyle::Windows)
+                .unwrap()
+                .as_str(),
+            "file:///C:/Users/x%20y"
+        );
+        assert_eq!(
+            url::Url::from_file_path_ext("C:\\", PathStyle::Windows)
+                .unwrap()
+                .as_str(),
+            "file:///C:/"
+        );
+        assert_eq!(
+            url::Url::from_file_path_ext("c:/Users/x", PathStyle::Windows)
+                .unwrap()
+                .as_str(),
+            "file:///c:/Users/x"
+        );
+    }
+
+    #[test]
+    fn test_url_from_file_path_ext_windows_unc() {
+        use super::UrlExt;
+
+        assert_eq!(
+            url::Url::from_file_path_ext("\\\\srv\\share\\f", PathStyle::Windows)
+                .unwrap()
+                .as_str(),
+            "file://srv/share/f"
+        );
+    }
+
+    #[test]
+    fn test_url_from_file_path_ext_windows_verbatim() {
+        use super::UrlExt;
+
+        // `\\?\` paths convert like their plain forms (`url` handles `Prefix::VerbatimDisk` and
+        // `Prefix::VerbatimUNC` in the same arms as `Disk` and `UNC`); `std::fs::canonicalize`
+        // returns them on Windows.
+        for (path, expected) in [
+            ("\\\\?\\C:\\x", "file:///C:/x"),
+            ("\\\\?\\C:\\Users\\x y", "file:///C:/Users/x%20y"),
+            ("\\\\?\\C:\\", "file:///C:/"),
+            ("\\\\?\\C:", "file:///C:/"),
+            ("\\\\?\\UNC\\srv\\share\\f", "file://srv/share/f"),
+            ("\\\\?\\UNC\\srv\\share", "file://srv/share"),
+            // Verbatim components are split on `\` only, so `/` stays inside a component.
+            ("\\\\?\\C:\\a/b", "file:///C:/a%2Fb"),
+        ] {
+            assert_eq!(
+                url::Url::from_file_path_ext(path, PathStyle::Windows)
+                    .unwrap()
+                    .as_str(),
+                expected,
+                "path {path:?}"
+            );
+        }
+        // Other verbatim prefixes (`\\?\pipe\…`) and forward-slash `//?/…` have no file-URL form.
+        assert_eq!(
+            url::Url::from_file_path_ext("\\\\?\\pipe\\x", PathStyle::Windows),
+            Err(())
+        );
+        assert_eq!(
+            url::Url::from_file_path_ext("\\\\?\\C:relative", PathStyle::Windows),
+            Err(())
+        );
+        assert_eq!(
+            url::Url::from_file_path_ext("//?/C:/x", PathStyle::Windows),
+            Err(())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_url_from_file_path_ext_windows_matches_url() {
+        use super::UrlExt;
+
+        for path in [
+            "C:\\",
+            "C:\\Users\\x y",
+            "c:/Users/x",
+            "\\\\srv\\share\\f",
+            "\\\\?\\C:\\x",
+            "\\\\?\\C:\\",
+            "\\\\?\\UNC\\srv\\share\\f",
+            "\\\\?\\C:\\a/b",
+            "\\\\?\\pipe\\x",
+            "\\\\.\\COM1",
+            "C:relative",
+            "\\\\srv",
+        ] {
+            assert_eq!(
+                url::Url::from_file_path_ext(path, PathStyle::Windows),
+                url::Url::from_file_path(path),
+                "path {path:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_url_from_file_path_ext_unix_non_utf8_matches_url() {
+        use super::UrlExt;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let path = Path::new(OsStr::from_bytes(b"/tmp/\xff\xfe/a b"));
+        let url = url::Url::from_file_path_ext(path, PathStyle::Unix).unwrap();
+        assert_eq!(url.as_str(), "file:///tmp/%FF%FE/a%20b");
+        assert_eq!(Ok(url), url::Url::from_file_path(path));
+    }
+
+    #[test]
+    fn test_url_from_file_path_ext_windows_rejects() {
+        use super::UrlExt;
+
+        assert_eq!(
+            url::Url::from_file_path_ext("C:relative", PathStyle::Windows),
+            Err(())
+        );
+        assert_eq!(
+            url::Url::from_file_path_ext("\\\\.\\COM1", PathStyle::Windows),
+            Err(())
+        );
+        assert_eq!(
+            url::Url::from_file_path_ext("\\\\srv", PathStyle::Windows),
+            Err(())
+        );
+        assert_eq!(
+            url::Url::from_file_path_ext("/x", PathStyle::Windows),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn test_url_file_path_ext_roundtrip() {
+        use super::UrlExt;
+
+        for path in ["/", "/a/b c", "/tmp/100%.txt", "/ünïcode/日本"] {
+            let url = url::Url::from_file_path_ext(path, PathStyle::Unix).unwrap();
+            assert_eq!(
+                url.to_file_path_ext(PathStyle::Unix),
+                Ok(PathBuf::from(path)),
+                "path {path:?}"
+            );
+        }
+        for path in ["C:\\", "C:\\Users\\x y", "\\\\srv\\share\\f g"] {
+            let url = url::Url::from_file_path_ext(path, PathStyle::Windows).unwrap();
+            assert_eq!(
+                url.to_file_path_ext(PathStyle::Windows),
+                Ok(PathBuf::from(path)),
+                "path {path:?}"
+            );
+        }
     }
 }

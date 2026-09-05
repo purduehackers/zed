@@ -13,8 +13,11 @@ use gpui::{
     AppContext as _, AsyncApp, Context, Entity, EventEmitter, SharedString, Subscription, Task,
     TaskExt,
 };
-use http_client::{HttpClient, github::AssetKind};
+use http_client::HttpClient;
+#[cfg(not(target_family = "wasm"))]
+use http_client::github::AssetKind;
 use node_runtime::NodeRuntime;
+#[cfg(not(target_family = "wasm"))]
 use percent_encoding::percent_decode_str;
 use remote::RemoteClient;
 use rpc::{AnyProtoClient, TypedEnvelope, proto};
@@ -23,6 +26,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use settings::{AgentConfigOptionValue, RegisterSetting, SettingsStore, update_settings_file};
 use sha2::{Digest, Sha256};
+#[cfg(not(target_family = "wasm"))]
 use url::Url;
 use util::{ResultExt as _, debug_panic};
 
@@ -893,6 +897,7 @@ impl ExternalAgentServer for RemoteExternalAgentServer {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[derive(Debug, PartialEq, Eq)]
 enum RegistryArchiveKind {
     Archive(AssetKind),
@@ -904,6 +909,7 @@ enum RegistryArchiveKind {
     },
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn registry_archive_kind_for_url(archive_url: &str) -> Result<RegistryArchiveKind> {
     const UNSUPPORTED_SUFFIXES: &[&str] = &[
         // Installer formats explicitly rejected by the registry schema.
@@ -948,6 +954,7 @@ fn registry_archive_kind_for_url(archive_url: &str) -> Result<RegistryArchiveKin
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn raw_binary_file_name(archive_path: &str) -> Result<String> {
     let last_segment = archive_path
         .rsplit('/')
@@ -969,12 +976,14 @@ fn raw_binary_file_name(archive_path: &str) -> Result<String> {
     Ok(file_name)
 }
 
+#[cfg(not(target_family = "wasm"))]
 struct GithubReleaseArchive {
     repo_name_with_owner: String,
     tag: String,
     asset_name: String,
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn github_release_archive_from_url(archive_url: &str) -> Option<GithubReleaseArchive> {
     fn decode_path_segment(segment: &str) -> Option<String> {
         percent_decode_str(segment)
@@ -1114,6 +1123,82 @@ async fn remove_stale_versioned_archive_cache_dirs(
     Ok(())
 }
 
+/// Fetches a registry agent's archive (or raw binary) into `version_dir`, verified against the
+/// registry's checksum or, for a GitHub release asset without one, the release's digest.
+#[cfg(not(target_family = "wasm"))]
+async fn download_registry_archive(
+    http_client: &Arc<dyn HttpClient>,
+    archive_url: &str,
+    sha256: Option<&str>,
+    version_dir: &Path,
+) -> Result<()> {
+    let sha256 = if let Some(provided_sha) = sha256 {
+        Some(provided_sha.to_string())
+    } else if let Some(github_archive) = github_release_archive_from_url(archive_url) {
+        if let Ok(release) = ::http_client::github::get_release_by_tag_name(
+            &github_archive.repo_name_with_owner,
+            &github_archive.tag,
+            http_client.clone(),
+        )
+        .await
+        {
+            if let Some(asset) = release
+                .assets
+                .iter()
+                .find(|a| a.name == github_archive.asset_name)
+            {
+                asset.digest.as_ref().and_then(|d| {
+                    d.strip_prefix("sha256:")
+                        .map(|s| s.to_string())
+                        .or_else(|| Some(d.clone()))
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    match registry_archive_kind_for_url(archive_url)? {
+        RegistryArchiveKind::Archive(asset_kind) => {
+            ::http_client::github_download::download_server_binary(
+                &**http_client,
+                archive_url,
+                sha256.as_deref(),
+                version_dir,
+                asset_kind,
+            )
+            .await?;
+        }
+        RegistryArchiveKind::RawBinary { file_name } => {
+            ::http_client::github_download::download_server_raw_binary(
+                &**http_client,
+                archive_url,
+                sha256.as_deref(),
+                version_dir,
+                &file_name,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Registry agents are installed inside the sandbox, never by the browser (`http_client`'s
+/// GitHub download helpers are not compiled there).
+#[cfg(target_family = "wasm")]
+async fn download_registry_archive(
+    _http_client: &Arc<dyn HttpClient>,
+    archive_url: &str,
+    _sha256: Option<&str>,
+    _version_dir: &Path,
+) -> Result<()> {
+    bail!("cannot download {archive_url} in the browser")
+}
+
 struct LocalRegistryArchiveAgent {
     fs: Arc<dyn Fs>,
     http_client: Arc<dyn HttpClient>,
@@ -1225,58 +1310,13 @@ impl ExternalAgentServer for LocalRegistryArchiveAgent {
                         .ok();
                 }
 
-                let sha256 = if let Some(provided_sha) = &target_config.sha256 {
-                    Some(provided_sha.clone())
-                } else if let Some(github_archive) = github_release_archive_from_url(archive_url) {
-                    if let Ok(release) = ::http_client::github::get_release_by_tag_name(
-                        &github_archive.repo_name_with_owner,
-                        &github_archive.tag,
-                        http_client.clone(),
-                    )
-                    .await
-                    {
-                        if let Some(asset) = release
-                            .assets
-                            .iter()
-                            .find(|a| a.name == github_archive.asset_name)
-                        {
-                            asset.digest.as_ref().and_then(|d| {
-                                d.strip_prefix("sha256:")
-                                    .map(|s| s.to_string())
-                                    .or_else(|| Some(d.clone()))
-                            })
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                match registry_archive_kind_for_url(archive_url)? {
-                    RegistryArchiveKind::Archive(asset_kind) => {
-                        ::http_client::github_download::download_server_binary(
-                            &*http_client,
-                            archive_url,
-                            sha256.as_deref(),
-                            &version_dir,
-                            asset_kind,
-                        )
-                        .await?;
-                    }
-                    RegistryArchiveKind::RawBinary { file_name } => {
-                        ::http_client::github_download::download_server_raw_binary(
-                            &*http_client,
-                            archive_url,
-                            sha256.as_deref(),
-                            &version_dir,
-                            &file_name,
-                        )
-                        .await?;
-                    }
-                }
+                download_registry_archive(
+                    &http_client,
+                    archive_url,
+                    target_config.sha256.as_deref(),
+                    &version_dir,
+                )
+                .await?;
             }
 
             let cmd = &target_config.cmd;

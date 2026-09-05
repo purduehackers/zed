@@ -247,7 +247,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use task::TaskVariables;
 use text::{BufferId, FromAnchor, OffsetUtf16, Rope, ToOffset as _, ToPoint as _};
@@ -261,6 +261,7 @@ use ui::{
 };
 use ui_input::ErasedEditor;
 use util::{RangeExt, ResultExt, TryFutureExt, maybe, post_inc};
+use web_time::Instant;
 use workspace::{
     CollaboratorId, Item as WorkspaceItem, ItemId, ItemNavHistory, NavigationEntry, OpenInTerminal,
     OpenTerminal, Pane, RestoreOnStartupBehavior, SERIALIZATION_THROTTLE_TIME, SplitDirection,
@@ -4790,6 +4791,24 @@ impl Editor {
                 .borrow()
                 .as_ref()
                 .is_some_and(|menu| menu.visible())
+    }
+
+    /// The visible code context menu as `(kind, rows)`: `"completions"` with the number of rows
+    /// it offers, or `"code_actions"` (whose contents this does not expose, so `rows` is 0);
+    /// `None` when no menu is visible. [`Self::context_menu_visible`] answers the same question
+    /// without saying which menu it is, which a caller that has to tell a completions menu from a
+    /// code-action one (the browser test hooks of `zed_web`) cannot use.
+    pub fn visible_context_menu(&self) -> Option<(&'static str, usize)> {
+        if self.edit_prediction_preview_is_active() {
+            return None;
+        }
+        match self.context_menu.borrow().as_ref()? {
+            CodeContextMenu::Completions(menu) if menu.visible() => {
+                Some(("completions", menu.entries.borrow().len()))
+            }
+            CodeContextMenu::CodeActions(menu) if menu.visible() => Some(("code_actions", 0)),
+            _ => None,
+        }
     }
 
     pub fn context_menu_origin(&self) -> Option<ContextMenuOrigin> {

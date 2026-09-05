@@ -68,6 +68,7 @@ use client::UserStore;
 use cloud_api_types::Plan;
 use collections::HashMap;
 use editor::{Editor, MultiBuffer};
+#[cfg(not(target_family = "wasm"))]
 use extension_host::ExtensionStore;
 use feature_flags::{CreateThreadToolFeatureFlag, FeatureFlagAppExt as _};
 
@@ -1526,6 +1527,7 @@ impl AgentPanel {
         });
 
         // Subscribe to extension events to sync agent servers when extensions change
+        #[cfg(not(target_family = "wasm"))]
         let extension_subscription = ExtensionStore::try_global(cx).map(|store| {
             cx.subscribe(&store, |this, _source, event, cx| match event {
                 extension_host::Event::ExtensionUninstalled(id) => {
@@ -1534,6 +1536,9 @@ impl AgentPanel {
                 _ => {}
             })
         });
+        // The browser has no local extension host (BUILD-SPEC 3.2); nothing to observe.
+        #[cfg(target_family = "wasm")]
+        let extension_subscription: Option<Subscription> = None;
 
         let connection_store = cx.new(|cx| AgentConnectionStore::new(project.clone(), cx));
         let _project_subscription =
@@ -4395,6 +4400,8 @@ impl AgentPanel {
         })
     }
 
+    // Only reached from the `ExtensionStore` subscription above, which the browser build leaves out.
+    #[cfg(not(target_family = "wasm"))]
     fn migrate_agent_server_from_extensions(&mut self, id: Arc<str>, cx: &mut Context<Self>) {
         self.project.update(cx, |project, cx| {
             project.agent_server_store().update(cx, |store, cx| {

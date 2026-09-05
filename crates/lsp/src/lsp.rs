@@ -1,3 +1,7 @@
+// The browser never runs a language-server process (LSP traffic travels over the remote
+// protocol), so the process-backed transport below is compiled there only for its types.
+#![cfg_attr(target_family = "wasm", allow(dead_code))]
+
 mod input_handler;
 
 pub use lsp_types::request::*;
@@ -19,9 +23,11 @@ use postage::{barrier, prelude::Stream};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json, value::RawValue};
+#[cfg(not(target_family = "wasm"))]
 use util::command::{Child, Stdio};
 
 use gpui_util::{ResultExt, TryFutureExt};
+#[cfg(not(target_family = "wasm"))]
 use std::path::Path;
 use std::{
     any::TypeId,
@@ -37,9 +43,11 @@ use std::{
         atomic::{AtomicI32, Ordering::SeqCst},
     },
     task::Poll,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use util::{ConnectionResult, redact};
+// `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` natively.
+use web_time::Instant;
 
 const JSON_RPC_VERSION: &str = "2.0";
 const CONTENT_LEN_HEADER: &str = "Content-Length: ";
@@ -89,11 +97,31 @@ pub enum IoKind {
     StdErr,
 }
 
+/// The browser never spawns language-server processes (they run in the sandbox and are reached
+/// over the remote protocol), so `util::command` is not compiled there; this uninhabited type
+/// keeps the process-holding fields their shape.
+#[cfg(target_family = "wasm")]
+#[derive(Debug)]
+pub(crate) enum Child {}
+
+#[cfg(target_family = "wasm")]
+impl Child {
+    fn id(&self) -> u32 {
+        match *self {}
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        match *self {}
+    }
+}
+
 /// Represents a launchable language server. This can either be a standalone binary or the path
 /// to a runtime with arguments to instruct it to launch the actual language server file.
 #[derive(Clone, Serialize)]
 pub struct LanguageServerBinary {
     pub path: PathBuf,
+    // serde implements `Serialize` for `OsString` on unix and windows only.
+    #[cfg_attr(target_family = "wasm", serde(serialize_with = "serialize_os_strings"))]
     pub arguments: Vec<OsString>,
     pub env: Option<HashMap<String, String>>,
 }
@@ -423,9 +451,18 @@ pub const SEMANTIC_TOKEN_MODIFIERS: &[SemanticTokenModifier] = &[
     SemanticTokenModifier::new("constant"),
 ];
 
+#[cfg(target_family = "wasm")]
+fn serialize_os_strings<S: serde::Serializer>(
+    arguments: &[OsString],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(arguments.iter().map(|argument| argument.to_string_lossy()))
+}
+
 impl LanguageServer {
     /// Starts a language server process.
     /// A request_timeout of zero or Duration::MAX indicates an indefinite timeout.
+    #[cfg(not(target_family = "wasm"))]
     pub fn new(
         stderr_capture: Arc<Mutex<Option<String>>>,
         server_id: LanguageServerId,
@@ -1628,7 +1665,12 @@ impl LanguageServer {
             .unwrap()
         }));
 
+        #[cfg(not(target_family = "wasm"))]
         outbound_tx.send_blocking(serializer)?;
+        // async-channel compiles no blocking operations for wasm; the channel is unbounded, so
+        // `try_send` fails only when it is closed, exactly as `send_blocking` does.
+        #[cfg(target_family = "wasm")]
+        outbound_tx.try_send(serializer)?;
         Ok(())
     }
 

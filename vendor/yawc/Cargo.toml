@@ -1,0 +1,196 @@
+[package]
+name = "yawc"
+version = "0.3.3"
+edition = "2021"
+authors = ["Dario <dario@infinitefieldtrading.com>"]
+description = "Yet another websocket library. But a fast, secure WebSocket implementation with RFC 6455 compliance and compression support"
+documentation = "https://docs.rs/yawc"
+repository = "https://github.com/infinitefield/yawc"
+license = "MPL-2.0"
+keywords = ["websocket", "websockets", "ws", "networking", "wasm"]
+categories = [
+    "network-programming",
+    "asynchronous",
+    "web-programming",
+    "web-programming::websocket",
+    "wasm",
+]
+readme = "README.md"
+rust-version = "1.82.0"
+
+# [profile.release]
+# debug = true
+
+# Package build settings
+exclude = ["/.github/*", "/examples/*", "/tests/*", "/.gitignore"]
+include = ["/src/**/*", "/Cargo.toml", "/README.md", "/LICENSE"]
+
+# Documentation settings
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# Optional feature configurations
+[features]
+default = ["rustls-ring"]
+zlib = ["flate2/any_zlib", "flate2/zlib-rs"]
+simd = ["simdutf8"]
+reqwest = ["dep:reqwest"]
+axum = ["axum-core", "http"]
+rustls-ring = ["tokio-rustls/ring"]
+rustls-aws-lc-rs = ["tokio-rustls/aws-lc-rs"]
+smol = ["dep:smol"]
+
+# Examples configuration
+[[example]]
+name = "axum"
+required-features = ["axum"]
+test = false
+
+[[example]]
+name = "axum_proxy"
+path = "examples/axum_proxy/main.rs"
+required-features = ["axum", "reqwest"]
+test = false
+
+[[example]]
+name = "client_smol"
+path = "examples/client_smol.rs"
+required-features = ["smol"]
+test = false
+
+[[example]]
+name = "echo_server_smol"
+path = "examples/echo_server_smol.rs"
+required-features = ["smol"]
+test = false
+
+[[example]]
+name = "autobahn_client"
+test = false
+
+[[example]]
+name = "autobahn_server"
+required-features = ["axum"]
+test = false
+
+[[example]]
+name = "client"
+test = false
+
+[[example]]
+name = "custom_dns"
+test = false
+
+[[example]]
+name = "echo_server"
+required-features = ["axum"]
+test = false
+
+[[example]]
+name = "proxy"
+test = false
+
+# ==============================================================================
+# Common dependencies (shared across all targets)
+# ==============================================================================
+[dependencies]
+url = "2"
+bytes = "1.11"
+futures = "0.3"
+thiserror = "2"
+rand = "0.8"
+
+# ==============================================================================
+# WebAssembly target-specific dependencies
+# ==============================================================================
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", default-features = false, features = [
+    "console",
+    "WebSocket",
+    "BinaryType",
+    "CloseEvent",
+    "MessageEvent",
+] }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+getrandom = { version = "0.2", features = ["js"] }
+
+# ==============================================================================
+# Native target-specific dependencies
+# ==============================================================================
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# HTTP clients
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "logging",
+    "tls12",
+] }
+reqwest = { version = "0.13", default-features = false, optional = true }
+webpki-roots = "1"
+http-body-util = "0.1"
+
+# HTTP servers (optional)
+axum-core = { version = "0.5", optional = true }
+http = { version = "1", optional = true }
+
+# Async runtime and utilities
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "macros",
+    "net",
+    "time",
+    "io-util",
+] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# Encoding and cryptography
+base64 = "0.22"
+sha1 = "0.10"
+
+# Utilities
+nom = "8"
+pin-project = "1"
+log = "0.4"
+
+# Optional dependencies
+simdutf8 = { version = "0.1", optional = true }
+serde = { version = "1", optional = true }
+smol = { version = "2.0.2", optional = true }
+
+# Compression
+flate2 = "1"
+
+# ==============================================================================
+# Development dependencies
+# ==============================================================================
+[dev-dependencies]
+anyhow = "1"
+serde_json = "1"
+wasm-bindgen-test = "0.3"
+
+# ==============================================================================
+# Development dependencies (native only)
+# ==============================================================================
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+anyhow = "1"
+axum = "0.8"
+console-subscriber = "0.5.0"
+hyper = { version = "1.7", features = ["http1", "server", "client"] }
+log = "0.4"
+reqwest = { version = "0.13" }
+serde = { version = "1", features = ["derive"] }
+simple_logger = "5"
+# tokio = { version = "1", features = ["full", "tracing"] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+webpki-roots = "1"
+criterion = { version = "0.5", features = ["async_tokio"] }
+rand = "0.8"
+rustls = { version = "0.23", features = ["ring"] }
+futures-rustls = "0.26"
+rustls-native-certs = "0.8"
+rustls-pki-types = "1.0"
+smol = "2.0.2"

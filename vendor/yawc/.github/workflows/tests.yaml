@@ -1,0 +1,46 @@
+name: Tests
+
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt
+          targets: wasm32-unknown-unknown
+      - uses: denoland/setup-deno@v1
+        with:
+          deno-version: v2.x
+      - uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Build
+        run: cargo build --verbose --all-features --all-targets
+      - name: Test
+        run: cargo test --verbose
+      - name: Test zlib
+        run: cargo test --verbose --features zlib
+      - name: Test WASM
+        run: |
+          env WASM_BINDGEN_USE_BROWSER=1 wasm-pack test --headless --chrome --lib
+          wasm-pack test --node --lib
+      - name: Check formatting
+        run: cargo fmt -- --check --verbose
+      - name: Autobahn|Testsuite client (with zlib)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          deno run -A --unstable autobahn/client-test.js zlib
+      - name: Autobahn|Testsuite server (with zlib)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          deno run -A --unstable autobahn/server-test.js zlib

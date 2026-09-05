@@ -63,6 +63,20 @@ impl ReqwestClient {
         Ok(client.into())
     }
 
+    /// Like [`ReqwestClient::user_agent`], but never routes through a proxy: the system
+    /// proxy that reqwest reads from `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` is disabled, so a
+    /// hostile environment cannot redirect this client's traffic (loopback supervisor calls
+    /// carrying a bearer secret, registry downloads) to a host of its choosing.
+    pub fn user_agent_without_proxy(agent: &str) -> anyhow::Result<Self> {
+        let mut map = HeaderMap::new();
+        map.insert(http::header::USER_AGENT, HeaderValue::from_str(agent)?);
+        let client = Self::builder(None)
+            .no_proxy()
+            .default_headers(map)
+            .build()?;
+        Ok(client.into())
+    }
+
     pub fn proxy_and_user_agent(proxy: Option<Url>, user_agent: &str) -> anyhow::Result<Self> {
         Self::proxy_user_agent_and_read_timeout(proxy, user_agent, None)
     }

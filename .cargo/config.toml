@@ -20,5 +20,73 @@ rustflags = [
 [target.aarch64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
+# Browser client (Zed Codespaces). Only consulted for `--target wasm32-unknown-unknown`.
+# NOTE: a target-specific rustflags table makes cargo drop `[build].rustflags` for that
+# target, so the two flags from `[build]` are repeated. `-Zbuild-std=std,panic_abort` is
+# passed by script/check-wasm; an `[unstable]` table here would affect stable native builds.
+# getrandom 0.3.4 picks its wasm_js backend from the feature alone (gpui enables it); the
+# cfg below is only required by getrandom 0.3.0-0.3.3 and is kept for parity with the fork.
+#
+# Linear-memory layout these flags produce (wasm-ld with rustc's wasm32 defaults,
+# `--stack-first` and `-z stack-size=1048576`; addresses from the 0.2.120 bundle of commit
+# c3cf80c0d that hung):
+#   [0, 1 MiB)                  the main thread's shadow stack (`__stack_pointer` = 1048576)
+#   [1 MiB, __data_end)         .tdata (the TLS template), .rodata, .data, .bss, then the
+#                               `__wasm_init_memory_flag` word lld adds for --shared-memory
+#                               (__data_end = 21824964)
+#   [__heap_base, __heap_end)   __heap_base = __data_end rounded up to 16 (21824976);
+#                               __heap_end = --initial-memory (134217728). Rust 1.97's std
+#                               allocator (dlmalloc 0.2.13, src/wasm.rs) resolves both
+#                               symbols at link time and gives this whole range to dlmalloc
+#                               as its first arena, before it ever calls memory.grow.
+#   [__heap_end, --max-memory)  memory.grow territory.
+# wasm-bindgen's threads transform needs one more page for its thread-id counter, the lock
+# of its scratch stack and the scratch stack itself (it mallocs every worker's TLS block
+# and stack from there). wasm-bindgen 0.2.127 (wasm-bindgen#5225) reserves that page after
+# the module's initial memory, i.e. at __heap_end, where dlmalloc never looks; that is why
+# the workspace pins 0.2.127. 0.2.120-0.2.126 carve the page out at `__heap_base` instead
+# (they need `--export=__heap_base`, which rustc stopped emitting on its own in
+# rust-lang/rust#156174): dlmalloc's first chunk header then lands on the transform's
+# lock word (1027 = chunk size 1024 | PINUSE | CINUSE, written when the page's start
+# function mallocs its own TLS block) and every worker spins forever in
+# `__wbindgen_start`. Do not export `__heap_base` for a transform that reads it.
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-C", "symbol-mangling-version=v0",
+    "--cfg", "tokio_unstable",
+    "--cfg", "getrandom_backend=\"wasm_js\"",
+    # Threads: atomics, bulk-memory (passive data segments and memory.init, which lld's
+    # `__wasm_init_memory` and the transform's TLS setup use) and mutable-globals (the
+    # per-thread `__stack_pointer` / `__tls_base` globals are exported and written).
+    "-C", "target-feature=+atomics,+bulk-memory,+mutable-globals",
+    # A shared, imported memory: the threads transform refuses anything else. The glue
+    # creates the Memory from the module's limits and hands it to every worker.
+    "-C", "link-arg=--shared-memory",
+    "-C", "link-arg=--import-memory",
+    # 128 MiB initial, 4 GiB maximum (BUILD-SPEC 3.5). The initial size is the arena
+    # dlmalloc takes over at link time (see the layout above), so boot does not grow the
+    # memory page by page; it is also what the transform's page is placed after.
+    "-C", "link-arg=--initial-memory=134217728",
+    "-C", "link-arg=--max-memory=4294967296",
+    # The TLS symbols the threads transform consumes (it bails without them): it removes
+    # the __wasm_init_tls / __tls_size / __tls_align exports again and initialises TLS
+    # per thread by writing the `__tls_base` global.
+    "-C", "link-arg=--export=__wasm_init_tls",
+    "-C", "link-arg=--export=__tls_size",
+    "-C", "link-arg=--export=__tls_align",
+    "-C", "link-arg=--export=__tls_base",
+    # b7: lets the loader run static constructors (`inventory` registries) once, because the
+    # wasm-bindgen threads transform does not call `__wasm_call_ctors` itself.
+    "-C", "link-arg=--export=__wasm_call_ctors",
+]
+
 [env]
 MACOSX_DEPLOYMENT_TARGET = "10.15.7"
+# wasi-sdk clang/llvm-ar for C code in the browser closure (tree-sitter runtime and grammars,
+# zstd-sys, later SQLite). `relative = true` resolves against the repository root. The AR
+# entry is required: for wasm32 targets cc-rs only looks for llvm-ar next to a clang-like
+# compiler and gives up otherwise. Both wrappers resolve the same SDK (`WASI_SDK_PATH`, else
+# target/wasi-sdk as placed by script/ensure-wasi-sdk, verified against script/wasi-sdk.sha256)
+# and refuse any other version. They are bash scripts: wasm builds are macOS/Linux only.
+CC_wasm32_unknown_unknown = { value = "script/wasm-cc", relative = true }
+AR_wasm32_unknown_unknown = { value = "script/wasm-ar", relative = true }

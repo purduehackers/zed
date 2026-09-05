@@ -31,11 +31,8 @@ test-support = [
 [dependencies]
 agent_settings.workspace = true
 anyhow.workspace = true
-auto_update.workspace = true
 fs.workspace = true
 platform_title_bar.workspace = true
-call.workspace = true
-channel.workspace = true
 chrono.workspace = true
 client.workspace = true
 cloud_api_types.workspace = true
@@ -43,9 +40,8 @@ command_palette_hooks.workspace = true
 db.workspace = true
 
 git_ui_core.workspace = true
-gpui = { workspace = true, features = ["screen-capture"] }
+gpui.workspace = true
 icons.workspace = true
-livekit_client.workspace = true
 project.workspace = true
 recent_projects.workspace = true
 remote.workspace = true
@@ -63,6 +59,15 @@ util.workspace = true
 workspace.workspace = true
 zed_actions.workspace = true
 arrayvec = "0.7.6"
+
+# Collaboration (calls, channels, LiveKit) and the updater are desktop-only: the browser
+# build (BUILD-SPEC 3.2) compiles `collab_web.rs`/`update_version_web.rs` stubs instead.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+auto_update.workspace = true
+call.workspace = true
+channel.workspace = true
+gpui = { workspace = true, features = ["screen-capture"] }
+livekit_client.workspace = true
 
 [dev-dependencies]
 call = { workspace = true, features = ["test-support"] }

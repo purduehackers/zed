@@ -3,20 +3,22 @@ use std::sync::Arc;
 use collections::HashMap;
 use settings::RegisterSetting;
 
+#[cfg(not(target_family = "wasm"))]
+use crate::provider::bedrock::{self, AmazonBedrockSettings};
 use crate::provider::{
     anthropic, anthropic::AnthropicSettings, anthropic_compatible::AnthropicCompatibleSettings,
-    bedrock, bedrock::AmazonBedrockSettings, cloud::ZedDotDevSettings, deepseek::DeepSeekSettings,
-    google::GoogleSettings, llama_cpp::LlamaCppSettings, lmstudio::LmStudioSettings, mistral,
-    mistral::MistralSettings, ollama::OllamaSettings, open_ai::OpenAiSettings,
-    open_ai_compatible::OpenAiCompatibleSettings, open_router, open_router::OpenRouterSettings,
-    opencode, opencode::OpenCodeSettings, resolve_custom_headers,
-    vercel_ai_gateway::VercelAiGatewaySettings, x_ai::XAiSettings,
+    cloud::ZedDotDevSettings, deepseek::DeepSeekSettings, google::GoogleSettings,
+    llama_cpp::LlamaCppSettings, lmstudio::LmStudioSettings, mistral, mistral::MistralSettings,
+    ollama::OllamaSettings, open_ai::OpenAiSettings, open_ai_compatible::OpenAiCompatibleSettings,
+    open_router, open_router::OpenRouterSettings, opencode, opencode::OpenCodeSettings,
+    resolve_custom_headers, vercel_ai_gateway::VercelAiGatewaySettings, x_ai::XAiSettings,
 };
 
 #[derive(Debug, RegisterSetting)]
 pub struct AllLanguageModelSettings {
     pub anthropic: AnthropicSettings,
     pub anthropic_compatible: HashMap<Arc<str>, AnthropicCompatibleSettings>,
+    #[cfg(not(target_family = "wasm"))]
     pub bedrock: AmazonBedrockSettings,
     pub deepseek: DeepSeekSettings,
     pub google: GoogleSettings,
@@ -51,6 +53,7 @@ impl settings::Settings for AllLanguageModelSettings {
         let language_models = content.language_models.clone().unwrap();
         let anthropic = language_models.anthropic.unwrap();
         let anthropic_compatible = language_models.anthropic_compatible.unwrap();
+        #[cfg(not(target_family = "wasm"))]
         let bedrock = language_models.bedrock.unwrap();
         let deepseek = language_models.deepseek.unwrap();
         let google = language_models.google.unwrap();
@@ -93,6 +96,7 @@ impl settings::Settings for AllLanguageModelSettings {
                     )
                 })
                 .collect(),
+            #[cfg(not(target_family = "wasm"))]
             bedrock: AmazonBedrockSettings {
                 available_models: bedrock.available_models.unwrap_or_default(),
                 mantle_available_models: bedrock.mantle_available_models.unwrap_or_default(),

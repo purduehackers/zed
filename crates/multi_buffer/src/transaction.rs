@@ -1,12 +1,10 @@
 use gpui::{App, Context, Entity};
 use language::{self, Buffer, BufferEditSource, TransactionId};
-use std::{
-    collections::HashMap,
-    ops::Range,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, ops::Range, time::Duration};
 use sum_tree::Bias;
 use text::BufferId;
+// `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` natively.
+use web_time::Instant;
 
 use crate::{Anchor, BufferState, MultiBufferOffset};
 

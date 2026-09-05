@@ -1,3 +1,4 @@
+#[cfg(not(target_family = "wasm"))]
 mod dev_container_suggest;
 pub mod disconnected_overlay;
 mod remote_connections;
@@ -21,6 +22,7 @@ use remote::{RemoteConnectionOptions, same_remote_connection_identity};
 pub use remote_connection::{RemoteConnectionModal, connect, connect_with_modal};
 pub use remote_connections::{navigate_to_positions, open_remote_project};
 
+#[cfg(not(target_family = "wasm"))]
 use disconnected_overlay::DisconnectedOverlay;
 use fuzzy_nucleo::{StringMatch, StringMatchCandidate, match_strings};
 use gpui::{
@@ -38,6 +40,7 @@ pub use remote_servers::RemoteServerProjects;
 use settings::{DefaultOpenBehavior, Settings, WorktreeId};
 use workspace::ProjectGroupKey;
 
+#[cfg(not(target_family = "wasm"))]
 use dev_container::{DevContainerContext, find_devcontainer_configs};
 use ui::{
     ButtonLike, ContextMenu, Divider, HighlightedLabel, KeyBinding, ListItem, ListItemSpacing,
@@ -49,7 +52,9 @@ use workspace::{
     SerializedWorkspaceLocation, Workspace, WorkspaceDb, WorkspaceId,
     notifications::DetachAndPromptErr, with_active_or_new_workspace,
 };
-use zed_actions::{OpenDevContainer, OpenRecent, OpenRemote};
+#[cfg(not(target_family = "wasm"))]
+use zed_actions::OpenDevContainer;
+use zed_actions::{OpenRecent, OpenRemote};
 
 actions!(
     recent_projects,
@@ -501,8 +506,15 @@ pub fn init(cx: &mut App) {
         });
     });
 
+    // In the browser the disconnect UI belongs to the shell page, which reads the close
+    // code (b7 §3.28); the in-canvas overlay's "Reconnect" would re-dial with the options
+    // snapshot and take a session back after a 4001 takeover.
+    #[cfg(not(target_family = "wasm"))]
     cx.observe_new(DisconnectedOverlay::register).detach();
 
+    // Dev containers are built by the control plane in the browser build (BUILD-SPEC 3.1):
+    // `zed_actions::OpenDevContainer` stays registered but has no handler there.
+    #[cfg(not(target_family = "wasm"))]
     cx.on_action(|_: &OpenDevContainer, cx| {
         with_active_or_new_workspace(cx, move |workspace, window, cx| {
             if !workspace.project().read(cx).is_local() {
@@ -540,6 +552,7 @@ pub fn init(cx: &mut App) {
     });
 
     // Subscribe to worktree additions to suggest opening the project in a dev container
+    #[cfg(not(target_family = "wasm"))]
     cx.observe_new(
         |workspace: &mut Workspace, window: Option<&mut Window>, cx: &mut Context<Workspace>| {
             let Some(window) = window else {
@@ -1995,6 +2008,7 @@ pub(crate) fn icon_for_remote_connection(options: Option<&RemoteConnectionOption
             RemoteConnectionOptions::Ssh(_) => IconName::Server,
             RemoteConnectionOptions::Wsl(_) => IconName::Linux,
             RemoteConnectionOptions::Docker(_) => IconName::Box,
+            RemoteConnectionOptions::WebSocket(_) => IconName::Server,
             #[cfg(any(test, feature = "test-support"))]
             RemoteConnectionOptions::Mock(_) => IconName::Server,
         },

@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+# Builds the browser bundle (BUILD-SPEC 3.5, 11.2; b7 §3.31 as a script):
+#   nightly + build-std wasm build of `zed_web` → wasm-bindgen 0.2.127 (--target web) →
+#   the glue patch → wasm-opt → the eval gate → the asset tarball → build.json → the dev
+#   harness, written to <out_dir>/<build_id>/ (default target/web-bundle/<build_id>/).
+#
+#   script/build-web [--profile web-release|dev] [--out-dir DIR] [--build-id ID]
+#                    [--skip-wasm-opt] [--max-brotli-bytes N] [--check-only] [--test-hooks] [--names]
+#                    [--print-build-id] [--serve [--port N] [--csp-unsafe-eval]]
+#
+# `--check-only` stops after the toolchain, forbidden-crate and vendored-wasm_thread checks
+# (the CI gate). `--test-hooks` enables the `zed_web/test-hooks` cargo feature
+# (`window.__zs_test`, the Playwright suite's hooks) and writes the bundle to a separate
+# `<build-id>-test` directory with a `-test` build id, so a test bundle is never mistaken for
+# (or fetched as) a production one; nothing else ever enables the feature. `--names` keeps the
+# wasm name section (symbols unstripped, wasm-opt -g) so browser stack traces show Rust function
+# names instead of `wasm-function[N]`; the bundle id gets a `-names` suffix. `--print-build-id`
+# prints the id the other flags would produce (the dirty-tree hash included) and exits, so a
+# caller such as apps/web/scripts/dev-local.sh can tell whether that bundle already exists
+# before paying for a build. To stage a bundle for the app pass `--out-dir ../apps/web/public/editor`:
+# under a served static root (any `public/` directory) the dev harness (index.html,
+# loader.js) is not written, since it reads a session token from the query string and would
+# be served cross-origin-isolated with no CSP. `--serve` needs the harness, so it refuses
+# such an out-dir. The wasm rustflags and C toolchain come from .cargo/config.toml (b5);
+# the build itself goes through script/check-wasm with ZS_WASM_MODE=build, which refuses
+# stray RUSTFLAGS.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+profile="web-release"
+out_dir="target/web-bundle"
+build_id=""
+skip_wasm_opt=0
+max_brotli_bytes=""
+check_only=0
+test_hooks=0
+keep_names=0
+print_build_id=0
+serve=0
+port=8080
+csp_unsafe_eval=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --profile) profile="$2"; shift 2 ;;
+        --out-dir) out_dir="$2"; shift 2 ;;
+        --build-id) build_id="$2"; shift 2 ;;
+        --skip-wasm-opt) skip_wasm_opt=1; shift ;;
+        --max-brotli-bytes) max_brotli_bytes="$2"; shift 2 ;;
+        --check-only) check_only=1; shift ;;
+        --test-hooks) test_hooks=1; shift ;;
+        --names) keep_names=1; shift ;;
+        --print-build-id) print_build_id=1; shift ;;
+        --serve) serve=1; shift ;;
+        --port) port="$2"; shift 2 ;;
+        --csp-unsafe-eval) csp_unsafe_eval=1; shift ;;
+        -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+        *) echo "build-web: unknown argument $1" >&2; exit 2 ;;
+    esac
+done
+
+# The harness is a development page only: never into a served static root.
+with_harness=1
+case "/$out_dir/" in
+    */public/*) with_harness=0 ;;
+esac
+if [[ $serve -eq 1 && $with_harness -eq 0 ]]; then
+    echo "build-web: --serve needs the dev harness, which is not written under a public/ directory ($out_dir); use the default --out-dir" >&2
+    exit 2
+fi
+
+# Build id: `<zed-commit>-<patch>` (CONTRACTS.md §12), default `<short sha>-0` for a clean
+# tree. A dirty tree must never reuse an id: bundles are served immutable and precached by the
+# shell's service worker, so the same id with different bytes leaves browsers running stale
+# code. For a dirty tree the patch is `d<7 hex>` derived from the working-tree diff and the
+# list of untracked files, so every distinct source state gets a distinct id.
+if [[ -z "$build_id" ]]; then
+    commit="$(git rev-parse --short=9 HEAD 2>/dev/null || echo unknown)"
+    if [[ -n "$(git status --porcelain --untracked-files=all 2>/dev/null)" ]]; then
+        dirty="$( { git diff HEAD --no-color 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null | sort | xargs -I{} sh -c 'printf "%s\n" "{}"; cat "{}" 2>/dev/null'; } | shasum -a 256 | cut -c1-7)"
+        build_id="${commit}-d${dirty}"
+    else
+        build_id="${commit}-0"
+    fi
+fi
+if [[ ! "$build_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+    echo "build-web: invalid build id '$build_id'" >&2
+    exit 2
+fi
+# A test-hooks bundle carries its own id (`<id>-test`) and directory; the shell only loads it
+# for workspaces whose `client_build` names it (ZS_CLIENT_BUILD_ID in dev-local.sh browser mode).
+# Suffixing is idempotent: an id that already carries the suffixes these flags add (the value
+# `--print-build-id` printed, handed back through `--build-id`) is kept as it is.
+if [[ $test_hooks -eq 1 && "$build_id" != *-test && "$build_id" != *-test-names ]]; then
+    build_id="$build_id-test"
+fi
+if [[ $keep_names -eq 1 && "$build_id" != *-names ]]; then
+    build_id="$build_id-names"
+fi
+if [[ $print_build_id -eq 1 ]]; then
+    echo "$build_id"
+    exit 0
+fi
+
+wasm_bindgen_version="0.2.127"   # the workspace pin (Cargo.toml `wasm-bindgen`)
+
+# 1. Toolchain.
+if ! command -v wasm-bindgen >/dev/null 2>&1; then
+    echo "build-web: wasm-bindgen not found; install with: cargo install wasm-bindgen-cli --version $wasm_bindgen_version" >&2
+    exit 2
+fi
+installed="$(wasm-bindgen --version | awk '{print $2}')"
+if [[ "$installed" != "$wasm_bindgen_version" ]]; then
+    echo "build-web: wasm-bindgen $installed found, the workspace pins $wasm_bindgen_version (cargo install wasm-bindgen-cli --version $wasm_bindgen_version)" >&2
+    exit 2
+fi
+if [[ $skip_wasm_opt -eq 0 ]] && ! command -v wasm-opt >/dev/null 2>&1; then
+    echo "build-web: wasm-opt not found; install binaryen >= 116 or pass --skip-wasm-opt" >&2
+    exit 2
+fi
+
+# 2. Forbidden crates: per-crate inverse queries of the browser closure (b7 §6).
+forbidden=(wasmtime cranelift-codegen livekit webrtc-sys aws-config aws-sdk-bedrockruntime
+    aws-lc-sys rustls-platform-verifier tiny_http tokio tokio-rustls tokio-native-tls
+    gpui_tokio extension_host call dev_container auto_update http_client_tls bedrock reqwest
+    audio cpal rodio miniprofiler_ui)
+echo "build-web: checking the browser closure for forbidden crates"
+failed=()
+for crate in "${forbidden[@]}"; do
+    output="$(RUSTC_BOOTSTRAP=1 cargo tree --target wasm32-unknown-unknown -p zed_web -i "$crate" -e normal 2>&1 || true)"
+    if [[ -n "$output" ]] && ! grep -q 'nothing to print\|did not match any packages' <<<"$output"; then
+        failed+=("$crate")
+        echo "build-web: forbidden crate '$crate' is in the wasm closure:" >&2
+        echo "$output" | head -20 >&2
+    fi
+done
+if [[ ${#failed[@]} -gt 0 ]]; then
+    echo "build-web: forbidden crates in the browser closure: ${failed[*]}" >&2
+    exit 1
+fi
+
+# 2b. The vendored `wasm_thread` must stay eval-free (b7 §3.33; the editor CSP has no
+#     'unsafe-eval'), and it must be the copy the build resolves.
+if grep -rn 'js_sys::eval' vendor/wasm_thread/src >/dev/null; then
+    echo "build-web: vendor/wasm_thread/src still calls js_sys::eval" >&2
+    grep -rn 'js_sys::eval' vendor/wasm_thread/src >&2
+    exit 1
+fi
+if ! grep -q '^\[patch."https://github.com/zed-industries/wasm_thread"\]' Cargo.toml; then
+    echo "build-web: Cargo.toml has no [patch] entry for vendor/wasm_thread" >&2
+    exit 1
+fi
+if [[ $check_only -eq 1 ]]; then
+    echo "build-web: OK (check-only)"
+    exit 0
+fi
+
+# 3. The wasm build (nightly-on-stable via RUSTC_BOOTSTRAP, -Zbuild-std; flags from .cargo/config.toml).
+extra=()
+if [[ "$profile" == "dev" ]]; then
+    extra+=(--features util/debug-embed)
+fi
+if [[ $test_hooks -eq 1 ]]; then
+    echo "build-web: building with the zed_web/test-hooks feature (window.__zs_test); bundle id $build_id"
+    extra+=(--features zed_web/test-hooks)
+fi
+if [[ $keep_names -eq 1 ]]; then
+    # Overrides the profile's `strip = "symbols"` so the linker keeps the name section.
+    export CARGO_PROFILE_WEB_RELEASE_STRIP=none
+fi
+ZS_WASM_MODE=build ZS_BUILD_ID="$build_id" ./script/check-wasm -p zed_web --profile "$profile" ${extra[@]+"${extra[@]}"}
+
+profile_dir="$profile"
+[[ "$profile" == "dev" ]] && profile_dir="debug"
+wasm_in="target/wasm32-unknown-unknown/$profile_dir/zed_web.wasm"
+if [[ ! -f "$wasm_in" ]]; then
+    echo "build-web: $wasm_in was not produced" >&2
+    exit 1
+fi
+
+bundle="$out_dir/$build_id"
+rm -rf "$bundle"
+mkdir -p "$bundle"
+
+# 4. wasm-bindgen glue, then the memory patch (shared-memory accessor fallback, one-shot
+#    ctor helper, DataView retry after memory.grow); the patch is a no-op where the glue
+#    already handles growth.
+wasm-bindgen --target web --no-typescript --out-dir "$bundle" --out-name zed_web "$wasm_in"
+./script/patch-wasm-bindgen-memory.sh "$bundle/zed_web.js"
+
+# 5. wasm-opt. `--enable-simd`: the linked module carries v128 instructions (a crate in the
+#    closure emits simd128 code), which the validator rejects without the flag; every browser
+#    that can run the shared-memory build (COOP/COEP, Chrome 92+/Firefox 89+/Safari 16.4+)
+#    also has wasm SIMD.
+if [[ $skip_wasm_opt -eq 0 ]]; then
+    opt_flags=()
+    [[ $keep_names -eq 1 ]] && opt_flags+=(-g)
+    wasm-opt -Oz ${opt_flags[@]+"${opt_flags[@]}"} --enable-threads --enable-bulk-memory --enable-mutable-globals --enable-sign-ext \
+        --enable-nontrapping-float-to-int --enable-reference-types --enable-multivalue --enable-simd \
+        -o "$bundle/zed_web_bg.wasm.opt" "$bundle/zed_web_bg.wasm"
+    mv "$bundle/zed_web_bg.wasm.opt" "$bundle/zed_web_bg.wasm"
+fi
+
+# 5b. Eval gate on the artifact: the scripts the pinned wasm_thread used to `eval` were
+#     embedded as data (`include_str!`); their presence means the git copy was linked.
+for marker in 'function script_path()' 'Worker._$P'; do
+    if grep -qF "$marker" "$bundle/zed_web_bg.wasm"; then
+        echo "build-web: zed_web_bg.wasm carries the eval'd wasm_thread script ($marker); the vendored copy was not used" >&2
+        exit 1
+    fi
+done
+if grep -qE 'new Function\(|[^a-zA-Z_.]eval\(' "$bundle/zed_web.js"; then
+    echo "build-web: zed_web.js contains eval/new Function, which the editor CSP blocks" >&2
+    exit 1
+fi
+
+# 6. The asset pack (fonts, icons, images, themes, sounds; prompts and *.md stay embedded).
+tar -C assets -cf "$bundle/zed-assets.tar" --exclude='._*' --exclude='.DS_Store' --exclude='themes/src' \
+    fonts icons images themes sounds
+
+# 7. build.json (never emit .br files: Vercel recompresses precompressed files).
+wasm_bytes="$(wc -c <"$bundle/zed_web_bg.wasm" | tr -d ' ')"
+wasm_brotli_bytes=null
+if command -v brotli >/dev/null 2>&1; then
+    wasm_brotli_bytes="$(brotli -c -q 5 "$bundle/zed_web_bg.wasm" | wc -c | tr -d ' ')"
+    if [[ -n "$max_brotli_bytes" && "$wasm_brotli_bytes" -gt "$max_brotli_bytes" ]]; then
+        echo "build-web: brotli size $wasm_brotli_bytes exceeds the budget $max_brotli_bytes" >&2
+        exit 1
+    fi
+elif [[ -n "$max_brotli_bytes" ]]; then
+    echo "build-web: --max-brotli-bytes needs the brotli CLI" >&2
+    exit 2
+fi
+commit="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+test_hooks_json=false
+[[ $test_hooks -eq 1 ]] && test_hooks_json=true
+cat >"$bundle/build.json" <<JSON
+{ "build_id": "$build_id", "commit": "$commit", "wasm_bytes": $wasm_bytes, "wasm_brotli_bytes": $wasm_brotli_bytes, "test_hooks": $test_hooks_json }
+JSON
+
+# 8. The dev harness (apps/web never serves these two files; see the header).
+if [[ $with_harness -eq 1 ]]; then
+    cp crates/zed_web/web/index.html crates/zed_web/web/loader.js "$bundle/"
+else
+    echo "build-web: $out_dir is a served static root; the dev harness (index.html, loader.js) was not written"
+fi
+
+echo "build-web: bundle at $bundle ($wasm_bytes bytes of wasm)"
+ls -la "$bundle"
+
+if [[ $serve -eq 1 ]]; then
+    # The same CSP the editor route ships (CONTRACTS.md §8.4, minus the nonce/strict-dynamic
+    # pair that only makes sense for the shell's own inline script), so a bundle that needs
+    # eval fails here before it fails in production; `--csp-unsafe-eval` mirrors b9's
+    # ZS_CSP_UNSAFE_EVAL=1 escape hatch.
+    csp="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'"
+    if [[ $csp_unsafe_eval -eq 1 ]]; then
+        echo "build-web: WARNING: serving with 'unsafe-eval' in script-src (--csp-unsafe-eval)" >&2
+        csp="$csp 'unsafe-eval'"
+    fi
+    csp="$csp; connect-src 'self' ws: wss: http: https:; worker-src 'self' blob:; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; font-src 'self' blob: data:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+    echo "build-web: serving $out_dir on http://localhost:$port/$build_id/index.html (COOP/COEP, CSP)"
+    python3 - "$out_dir" "$port" "$csp" <<'PY'
+import http.server, os, sys
+os.chdir(sys.argv[1])
+csp = sys.argv[3]
+class Handler(http.server.SimpleHTTPRequestHandler):
+    extensions_map = {**http.server.SimpleHTTPRequestHandler.extensions_map, ".js": "text/javascript", ".mjs": "text/javascript", ".wasm": "application/wasm", ".tar": "application/x-tar"}
+    def end_headers(self):
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header("Content-Security-Policy", csp)
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[2])), Handler).serve_forever()
+PY
+fi

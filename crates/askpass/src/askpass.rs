@@ -2,9 +2,10 @@ mod encrypted_password;
 
 pub use encrypted_password::{EncryptedPassword, IKnowWhatIAmDoingAndIHaveReadTheDocs};
 
+#[cfg(not(target_family = "wasm"))]
 use net::async_net::UnixListener;
 use smol::lock::Mutex;
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_family = "wasm")))]
 use util::fs::make_file_executable;
 
 use std::ffi::OsStr;
@@ -13,18 +14,21 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use anyhow::{Context as _, Result};
+#[cfg(not(target_family = "wasm"))]
+use anyhow::Context as _;
+use anyhow::Result;
 use futures::channel::{mpsc, oneshot};
-use futures::{
-    AsyncBufReadExt as _, AsyncWriteExt as _, FutureExt as _, SinkExt, StreamExt, io::BufReader,
-    select_biased,
-};
+#[cfg(not(target_family = "wasm"))]
+use futures::{AsyncBufReadExt as _, AsyncWriteExt as _, io::BufReader};
+use futures::{FutureExt as _, SinkExt, StreamExt, select_biased};
 use gpui::{AsyncApp, BackgroundExecutor, Task};
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_family = "wasm")))]
 use smol::fs;
-use util::{ResultExt as _, debug_panic, maybe};
+use util::debug_panic;
+#[cfg(not(target_family = "wasm"))]
+use util::{ResultExt as _, maybe};
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_family = "wasm")))]
 use util::{paths::PathExt, shell::ShellKind};
 
 /// Path to the program used for askpass
@@ -115,10 +119,10 @@ pub struct AskPassSession {
     executor: BackgroundExecutor,
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_family = "wasm")))]
 const ASKPASS_SCRIPT_NAME: &str = "askpass.sh";
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_family = "wasm")))]
 const GPG_WRAPPER_SCRIPT_NAME: &str = "gpg-wrapper.sh";
 
 impl AskPassSession {
@@ -250,6 +254,7 @@ impl AskPassSession {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub struct PasswordProxy {
     _task: Task<()>,
     /// On Unix: path to the generated .sh askpass script (set as SSH_ASKPASS).
@@ -263,6 +268,7 @@ pub struct PasswordProxy {
     askpass_socket_path: std::path::PathBuf,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl PasswordProxy {
     pub async fn new(
         mut get_password: Box<
@@ -410,7 +416,44 @@ impl PasswordProxy {
     }
 }
 
+/// The browser has neither sockets nor child processes, so no askpass session can be
+/// created there (`new` fails and the remote server handles credentials); the accessors
+/// exist only so `AskPassSession` compiles unchanged.
+#[cfg(target_family = "wasm")]
+pub struct PasswordProxy {
+    never: std::convert::Infallible,
+}
+
+#[cfg(target_family = "wasm")]
+impl PasswordProxy {
+    /// Always fails: see the type's documentation.
+    pub async fn new(
+        _get_password: Box<
+            dyn FnMut(String) -> Task<ControlFlow<(), Result<EncryptedPassword>>>
+                + 'static
+                + Send
+                + Sync,
+        >,
+        _executor: BackgroundExecutor,
+    ) -> Result<Self> {
+        anyhow::bail!(
+            "askpass is unavailable in the browser; the remote server prompts for credentials"
+        )
+    }
+
+    /// Unreachable: no `PasswordProxy` is ever constructed on wasm.
+    pub fn script_path(&self) -> &OsStr {
+        match self.never {}
+    }
+
+    /// Unreachable: no `PasswordProxy` is ever constructed on wasm.
+    pub fn gpg_wrapper_path(&self) -> Option<&std::path::Path> {
+        match self.never {}
+    }
+}
+
 /// Runs Zed in netcat mode for use in askpass.
+#[cfg(not(target_family = "wasm"))]
 pub fn main(socket: &str) {
     use std::io::{self, Read};
     use std::process::exit;
@@ -425,11 +468,13 @@ pub fn main(socket: &str) {
 }
 
 /// Runs Zed in askpass mode using prompts passed as arguments.
+#[cfg(not(target_family = "wasm"))]
 pub fn main_from_args(socket: &str, args: impl IntoIterator<Item = String>) {
     let prompt = args.into_iter().collect::<Vec<_>>().join("\0");
     connect_and_write_prompt(socket, prompt.into_bytes())
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn connect_and_write_prompt(socket: &str, mut buffer: Vec<u8>) {
     use net::UnixStream;
     use std::io::{self, Read, Write};
@@ -476,7 +521,7 @@ pub fn set_askpass_program(path: std::path::PathBuf) {
 
 /// Generates the Unix shell askpass script.
 /// Not used on Windows — cli.exe is invoked directly as SSH_ASKPASS.
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_family = "wasm")))]
 fn generate_askpass_script(
     askpass_program: &std::path::Path,
     askpass_socket: &std::path::Path,
@@ -501,7 +546,7 @@ fn generate_askpass_script(
 }
 
 #[inline]
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_family = "wasm")))]
 fn generate_gpg_wrapper_script(
     askpass_program: &std::path::Path,
     askpass_socket: &std::path::Path,
@@ -608,7 +653,7 @@ printf '%s\n' "$passphrase" |
 
 /// Finds the real `gpg` (or `gpg2`) executable on `PATH`.
 #[inline]
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_family = "wasm")))]
 fn find_gpg_program() -> Option<std::path::PathBuf> {
     ["gpg", "gpg2"]
         .into_iter()

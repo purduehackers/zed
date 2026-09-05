@@ -461,15 +461,18 @@ impl ProfilePickerDelegate {
 
         let cancel_flag = AtomicBool::new(false);
 
-        self.foreground.block_on(match_strings(
-            self.string_candidates.as_ref(),
-            query,
-            false,
-            true,
-            100,
-            &cancel_flag,
-            self.background.clone(),
-        ))
+        crate::block_on_match_strings(
+            &self.foreground,
+            match_strings(
+                self.string_candidates.as_ref(),
+                query,
+                false,
+                true,
+                100,
+                &cancel_flag,
+                self.background.clone(),
+            ),
+        )
     }
 }
 

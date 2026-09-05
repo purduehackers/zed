@@ -17,6 +17,7 @@ test-support = []
 
 [dependencies]
 anyhow.workspace = true
+futures.workspace = true
 gpui.workspace = true
 indoc.workspace = true
 inventory.workspace = true
@@ -31,4 +32,5 @@ zed_env_vars.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+sqlez = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true

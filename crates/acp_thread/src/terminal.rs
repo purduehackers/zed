@@ -11,15 +11,17 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap as StdHashMap,
     path::PathBuf,
-    process::ExitStatus,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
 };
 use task::Shell;
-use util::get_default_system_shell_preferring_bash;
+// `std::process::ExitStatus` natively, `task`'s struct on wasm (b3).
+use terminal::ExitStatus;
+// `std::time::Instant` natively; on wasm `Instant::now()` panics.
+use util::shell::get_default_system_shell_preferring_bash;
+use web_time::Instant;
 
 /// Request to run a terminal command inside an OS-level sandbox.
 ///
@@ -427,6 +429,30 @@ pub struct TerminalOutput {
     pub content_line_count: usize,
 }
 
+/// ACP exit status from the terminal's exit status. Natively this is the
+/// portable-pty mapping used today (signal name via `strsignal`, code forced to 1
+/// for signalled children); on wasm the status is `task::ExitStatus`, whose signal
+/// is a number.
+fn acp_exit_status(status: Option<ExitStatus>) -> acp::TerminalExitStatus {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let status = status.map(portable_pty::ExitStatus::from);
+        acp::TerminalExitStatus::new()
+            .exit_code(status.as_ref().map(|status| status.exit_code()))
+            .signal(status.and_then(|status| status.signal().map(ToOwned::to_owned)))
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        acp::TerminalExitStatus::new()
+            .exit_code(status.map(|status| status.code().unwrap_or(1) as u32))
+            .signal(
+                status
+                    .and_then(|status| status.signal())
+                    .map(|signal| format!("signal {signal}")),
+            )
+    }
+}
+
 impl Terminal {
     pub fn new(
         id: acp::TerminalId,
@@ -501,11 +527,7 @@ impl Terminal {
                     })
                     .ok();
 
-                    let exit_status = exit_status.map(portable_pty::ExitStatus::from);
-
-                    acp::TerminalExitStatus::new()
-                        .exit_code(exit_status.as_ref().map(|e| e.exit_code()))
-                        .signal(exit_status.and_then(|e| e.signal().map(ToOwned::to_owned)))
+                    acp_exit_status(exit_status)
                 })
                 .shared(),
         }
@@ -539,17 +561,11 @@ impl Terminal {
 
     pub fn current_output(&self, cx: &App) -> acp::TerminalOutputResponse {
         if let Some(output) = self.output.as_ref() {
-            let exit_status = output.exit_status.map(portable_pty::ExitStatus::from);
-
             acp::TerminalOutputResponse::new(
                 output.content.clone(),
                 output.original_content_len > output.content.len(),
             )
-            .exit_status(
-                acp::TerminalExitStatus::new()
-                    .exit_code(exit_status.as_ref().map(|e| e.exit_code()))
-                    .signal(exit_status.and_then(|e| e.signal().map(ToOwned::to_owned))),
-            )
+            .exit_status(acp_exit_status(output.exit_status))
         } else {
             let (current_content, original_len) = self.truncated_output(cx);
             let truncated = current_content.len() < original_len;
@@ -757,5 +773,30 @@ mod linux_tests {
 
         wrap.to_policy()
             .expect("uncapturable protected paths must be dropped, not fail the policy");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acp_exit_status_maps_success_and_absence() {
+        let success = acp_exit_status(Some(ExitStatus::default()));
+        assert_eq!(success.exit_code, Some(0));
+        assert_eq!(success.signal, None);
+
+        let unknown = acp_exit_status(None);
+        assert_eq!(unknown.exit_code, None);
+        assert_eq!(unknown.signal, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acp_exit_status_maps_signals_like_portable_pty() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let terminated = acp_exit_status(Some(ExitStatus::from_raw(15)));
+        assert_eq!(terminated.exit_code, Some(1));
+        assert!(terminated.signal.is_some());
     }
 }

@@ -5,9 +5,10 @@ use language_model::{ConfiguredModel, LanguageModelRegistry, LanguageModelReques
 use language_models::provider::anthropic::telemetry::{
     AnthropicCompletionType, AnthropicEventData, AnthropicEventReporter, AnthropicEventType,
 };
-use std::time::Instant;
 use terminal::Terminal;
 use uuid::Uuid;
+// `web_time::Instant` is `std::time::Instant` natively; on wasm `Instant::now()` panics.
+use web_time::Instant;
 
 pub struct TerminalCodegen {
     pub status: CodegenStatus,

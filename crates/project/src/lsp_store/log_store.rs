@@ -1,8 +1,4 @@
-use std::{
-    collections::VecDeque,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use collections::HashMap;
 use futures::{StreamExt, channel::mpsc};
@@ -16,6 +12,8 @@ use lsp::{
 use rpc::proto;
 use serde::Deserialize;
 use settings::WorktreeId;
+// `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` natively.
+use web_time::Instant;
 
 use crate::{LanguageServerLogType, LspStore, Project, ProjectItem as _};
 

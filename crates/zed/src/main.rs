@@ -1437,6 +1437,15 @@ pub(crate) async fn restore_or_create_workspace(
                                 .fill_connection_options_from_settings(options)
                         });
                     }
+                    if let RemoteConnectionOptions::WebSocket(options) = &connection_options
+                        && !cx.update(|cx| options.can_dial(cx))
+                    {
+                        log::info!(
+                            "skipping restore of cloud workspace {}: no session provider registered",
+                            options.workspace_id
+                        );
+                        continue;
+                    }
 
                     let paths = multi_workspace
                         .active_workspace

@@ -26,6 +26,8 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{ops::Range, time::Duration};
+// `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` natively.
+use web_time::Instant;
 
 use collections::{HashMap, HashSet};
 use editor::{Editor, MultiBufferSnapshot, PathKey, multibuffer_context_lines};
@@ -73,8 +75,8 @@ pub struct Delegate {
     pub(crate) selected_index: usize,
     pub(crate) cancel_flag: Arc<AtomicBool>,
     pub(crate) text_finder_turning_into_project_search: Arc<AtomicBool>,
-    pub(crate) last_selection_change_time: Option<std::time::Instant>,
-    pub(crate) last_click: Option<(usize, std::time::Instant)>,
+    pub(crate) last_selection_change_time: Option<Instant>,
+    pub(crate) last_click: Option<(usize, Instant)>,
     pub(crate) search_options: SearchOptions,
     /// Kept around for switching to project search
     pub(crate) active_query: Option<SearchQuery>,
@@ -842,7 +844,7 @@ impl PickerDelegate for Delegate {
         _cx: &mut Context<Picker<Self>>,
     ) {
         self.selected_index = ix;
-        self.last_selection_change_time = Some(std::time::Instant::now());
+        self.last_selection_change_time = Some(Instant::now());
     }
 
     fn update_matches(
@@ -929,7 +931,7 @@ impl PickerDelegate for Delegate {
     fn confirm(&mut self, _: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
         // Clicks (set_selected_index called immediately before confirm) require double-click.
         // Enter key proceeds immediately.
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         let is_click = self
             .last_selection_change_time
             .map(|t| now.duration_since(t) < CLICK_THRESHOLD)

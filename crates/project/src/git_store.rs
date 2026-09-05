@@ -65,6 +65,8 @@ use rpc::{
     AnyProtoClient, TypedEnvelope,
     proto::{self, git_reset, split_repository_update},
 };
+// Only the Cargo-registry permalink lookup deserializes here, and that is native-only.
+#[cfg(not(target_family = "wasm"))]
 use serde::Deserialize;
 use settings::{GitDiffBaseSetting, Settings, SettingsLocation, SettingsStore, WorktreeId};
 use smallvec::SmallVec;
@@ -81,7 +83,7 @@ use std::{
         Arc,
         atomic::{self, AtomicU64},
     },
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 use sum_tree::{Edit, SumTree, TreeMap};
 use task::Shell;
@@ -92,6 +94,8 @@ use util::{
     post_inc,
     rel_path::RelPath,
 };
+// `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` natively.
+use web_time::Instant;
 use worktree::{
     File, PathChange, PathKey, PathProgress, PathSummary, PathTarget, ProjectEntryId,
     UpdatedGitRepositoriesSet, UpdatedGitRepository, Worktree, WorktreeSettings,
@@ -10891,6 +10895,7 @@ pub fn linked_worktree_short_name(
     Some(name.into())
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn get_permalink_in_rust_registry_src(
     provider_registry: Arc<GitHostingProviderRegistry>,
     path: PathBuf,
@@ -10940,6 +10945,18 @@ fn get_permalink_in_rust_registry_src(
         ),
     );
     Ok(permalink)
+}
+
+/// The Cargo registry is a directory on the local disk, read with `std::fs`, which the browser
+/// build has no access to (`std::fs` is unsupported on wasm32-unknown-unknown), so there is no
+/// crate metadata to build a permalink from there.
+#[cfg(target_family = "wasm")]
+fn get_permalink_in_rust_registry_src(
+    _provider_registry: Arc<GitHostingProviderRegistry>,
+    _path: PathBuf,
+    _selection: Range<u32>,
+) -> Result<url::Url> {
+    bail!("the Cargo registry is not available in the browser")
 }
 
 fn serialize_blame_buffer_response(blame: Option<git::blame::Blame>) -> proto::BlameBufferResponse {

@@ -6,10 +6,13 @@ use gpui::TasksIncluded;
 use language::File;
 use lsp::LanguageServerId;
 
-use extension::ExtensionHostProxy;
+use extension::{ExtensionEvents, ExtensionHostProxy};
 use extension_host::headless_host::HeadlessExtensionStore;
 use fs::Fs;
-use gpui::{App, AppContext as _, AsyncApp, Context, Entity, PromptLevel, TaskExt};
+use gpui::{
+    App, AppContext as _, AsyncApp, Context, Entity, PromptLevel, Subscription, Task, TaskExt,
+    UpdateGlobal as _, WeakEntity,
+};
 use http_client::HttpClient;
 use language::{Buffer, BufferEvent, LanguageRegistry, proto::serialize_operation};
 use node_runtime::NodeRuntime;
@@ -35,7 +38,15 @@ use rpc::{
 };
 use smol::process::Child;
 
-use settings::initial_server_settings_content;
+use crate::{
+    client_state::ClientStateStore,
+    control::{ControlChannel, ControlEvent},
+    extensions::{InstalledExtensionRecord, RegistryConfig, SandboxExtensions},
+    ports::PortForwarder,
+    pty,
+};
+
+use settings::{SettingsStore, initial_server_settings_content};
 use std::{
     num::NonZeroU64,
     path::{Path, PathBuf},
@@ -71,6 +82,48 @@ pub struct HeadlessProject {
     // Local variant is used within LSP store, but that's a separate entity.
     pub _toolchain_store: Entity<ToolchainStore>,
     pub kernels: HashMap<String, Child>,
+    /// Handle to the process-level PTY manager (D3, D24). The manager is an
+    /// `App` global that outlives this project and every session; this is not
+    /// an owner.
+    pub pty_manager: Arc<pty::PtyManager>,
+    /// Serve mode: called instead of quitting the process when a client sends
+    /// `ShutdownRemoteServer` (the session is closed, the process stays alive).
+    pub shutdown_request_handler: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Serve mode: everything sandbox-specific (client state, control channel, port
+    /// forwarding, registry extensions); `None` in SSH `run` mode. Installed once per
+    /// process by `enable_sandbox` and untouched by `reset_for_new_client`.
+    pub sandbox: Option<SandboxRuntime>,
+}
+
+/// What `HeadlessProject::enable_sandbox` needs from `serve`.
+pub struct SandboxConfig {
+    /// The `--control-secret-file` contents: bearer of the control listener and of the
+    /// server's calls to the supervisor.
+    pub control_secret: Vec<u8>,
+    /// Base URL of the supervisor's loopback API (`crate::ports::DEFAULT_SUPERVISOR_URL`
+    /// unless overridden).
+    pub supervisor_url: String,
+    /// Proxy-less HTTP client for the supervisor (loopback traffic must bypass any proxy).
+    pub supervisor_http: Arc<dyn HttpClient>,
+    /// The extension registry.
+    pub registry: RegistryConfig,
+    /// Where client-state images are stored
+    /// (`paths::remote_server_state_dir().join("client_state")`).
+    pub client_state_dir: PathBuf,
+}
+
+/// The sandbox pieces `enable_sandbox` installed; they outlive every session.
+pub struct SandboxRuntime {
+    /// Server-side client-state blob store.
+    pub client_state: Entity<ClientStateStore>,
+    /// The control channel `serve` mounts on the loopback listener.
+    pub control: Arc<ControlChannel>,
+    /// Supervisor client for port forwards and the installed-extension report.
+    pub ports: Arc<PortForwarder>,
+    /// Registry-driven extension management.
+    pub extensions: Entity<SandboxExtensions>,
+    _install_drain: Task<()>,
+    _extension_events: Option<Subscription>,
 }
 
 pub struct HeadlessAppState {
@@ -289,6 +342,13 @@ impl HeadlessProject {
         session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &agent_server_store);
         session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &context_server_store);
 
+        // Process-level (D3, D24): the first project in this process installs the
+        // manager; a fresh session's replacement project reuses it, so PTYs
+        // survive. `serve` may install it explicitly before building the project.
+        let pty_manager = pty::PtyManager::global(cx).unwrap_or_else(|| {
+            pty::PtyManager::install(REMOTE_SERVER_PROJECT_ID, Arc::new(session.clone()), cx)
+        });
+
         session.add_request_handler(cx.weak_entity(), Self::handle_list_remote_directory);
         session.add_request_handler(cx.weak_entity(), Self::handle_get_path_metadata);
         session.add_request_handler(cx.weak_entity(), Self::handle_shutdown_remote_server);
@@ -314,17 +374,19 @@ impl HeadlessProject {
         session.add_entity_request_handler(BufferStore::handle_update_buffer);
         session.add_entity_message_handler(BufferStore::handle_close_buffer);
 
-        session.add_request_handler(
-            extensions.downgrade(),
-            HeadlessExtensionStore::handle_sync_extensions,
-        );
-        session.add_request_handler(
-            extensions.downgrade(),
-            HeadlessExtensionStore::handle_install_extension,
-        );
+        session.add_request_handler(cx.weak_entity(), Self::handle_sync_extensions);
+        session.add_request_handler(cx.weak_entity(), Self::handle_install_extension);
 
         session.add_request_handler(cx.weak_entity(), Self::handle_spawn_kernel);
         session.add_request_handler(cx.weak_entity(), Self::handle_kill_kernel);
+
+        session.add_entity_request_handler(Self::handle_spawn_terminal);
+        session.add_entity_message_handler(Self::handle_terminal_input);
+        session.add_entity_message_handler(Self::handle_ack_terminal_output);
+        session.add_entity_message_handler(Self::handle_resize_terminal);
+        session.add_entity_message_handler(Self::handle_close_terminal);
+        session.add_entity_request_handler(Self::handle_list_terminals);
+        session.add_entity_request_handler(Self::handle_attach_terminal);
 
         BufferStore::init(&session);
         WorktreeStore::init(&session);
@@ -359,7 +421,256 @@ impl HeadlessProject {
             profiling_collector: gpui::ProfilingCollector::new(startup_time),
             _toolchain_store: toolchain_store,
             kernels: Default::default(),
+            pty_manager,
+            shutdown_request_handler: None,
+            sandbox: None,
         }
+    }
+
+    /// Serve mode: switches on everything sandbox-specific. Called at most once per
+    /// process, right after construction (registering a handler twice panics, and
+    /// `reset_for_new_client` keeps the session's handler table, so the runtime survives
+    /// every fresh session). Returns the control channel for the loopback listener.
+    pub fn enable_sandbox(
+        &mut self,
+        config: SandboxConfig,
+        cx: &mut Context<Self>,
+    ) -> Arc<ControlChannel> {
+        if let Some(sandbox) = &self.sandbox {
+            debug_assert!(false, "enable_sandbox runs at most once per process");
+            log::error!("enable_sandbox called twice; keeping the existing runtime");
+            return sandbox.control.clone();
+        }
+        let session = self.session.clone();
+        let client_state =
+            cx.new(|cx| ClientStateStore::new(self.fs.clone(), config.client_state_dir, cx));
+        // The stopping wait must end only on the D6 flush (tagged `stopping`), never on a
+        // ticker save that was already in flight when the notice went out.
+        let (control, mut install_requests) = ControlChannel::new(
+            session.clone(),
+            config.control_secret.clone(),
+            client_state.read(cx).stopping_saved_versions(),
+            cx.background_executor().clone(),
+        );
+        let ports = PortForwarder::new(
+            config.supervisor_http,
+            config.supervisor_url,
+            config.control_secret,
+        );
+        let extension_dir = self.extensions.read(cx).extension_dir.clone();
+        let extensions = cx.new(|_| {
+            SandboxExtensions::new(
+                self.extensions.clone(),
+                config.registry,
+                self.fs.clone(),
+                extension_dir,
+            )
+        });
+
+        session.add_request_handler(
+            client_state.downgrade(),
+            ClientStateStore::handle_save_client_state,
+        );
+        session.add_request_handler(
+            client_state.downgrade(),
+            ClientStateStore::handle_load_client_state,
+        );
+        session.add_request_handler(cx.weak_entity(), PortForwarder::handle_forward_port);
+        session.add_request_handler(cx.weak_entity(), PortForwarder::handle_unforward_port);
+        session.add_request_handler(
+            extensions.downgrade(),
+            SandboxExtensions::handle_list_extensions,
+        );
+        session.add_request_handler(
+            extensions.downgrade(),
+            SandboxExtensions::handle_install_registry_extension,
+        );
+        session.add_request_handler(
+            extensions.downgrade(),
+            SandboxExtensions::handle_uninstall_extension,
+        );
+
+        extensions
+            .update(cx, |extensions, cx| extensions.load_installed_from_disk(cx))
+            .detach_and_log_err(cx);
+
+        let install_drain = cx.spawn({
+            let extensions = extensions.clone();
+            async move |_, cx| {
+                while let Some(ControlEvent::InstallExtensions(ids)) =
+                    futures::StreamExt::next(&mut install_requests).await
+                {
+                    for id in ids {
+                        let id: Arc<str> = id.into();
+                        // The installed check happens under the extensions' operation
+                        // lock, after the startup scan that holds it has populated the
+                        // installed set.
+                        let install = extensions.update(cx, |extensions, cx| {
+                            extensions.install_if_missing(id.clone(), cx)
+                        });
+                        if let Err(error) = install.await {
+                            log::error!(
+                                "installing extension {id} for the supervisor failed: {error:#}"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+
+        let extension_events = ExtensionEvents::try_global(cx).map(|events| {
+            cx.subscribe(&events, |this, _, event, cx| {
+                if matches!(event, extension::Event::ExtensionsInstalledChanged) {
+                    this.send_extensions_changed(cx);
+                }
+            })
+        });
+
+        self.sandbox = Some(SandboxRuntime {
+            client_state,
+            control: control.clone(),
+            ports,
+            extensions,
+            _install_drain: install_drain,
+            _extension_events: extension_events,
+        });
+        control
+    }
+
+    /// `SyncExtensions`: the SSH store's sync in `run` mode. In serve mode the desktop's
+    /// list is not authoritative for a sandbox, so the sync is additive and never removes a
+    /// registry-installed extension (`SandboxExtensions::handle_sync_extensions`).
+    async fn handle_sync_extensions(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::SyncExtensions>,
+        cx: AsyncApp,
+    ) -> Result<proto::SyncExtensionsResponse> {
+        let (store, sandbox) = this.read_with(&cx, |this, _| {
+            (
+                this.extensions.clone(),
+                this.sandbox
+                    .as_ref()
+                    .map(|sandbox| sandbox.extensions.clone()),
+            )
+        });
+        match sandbox {
+            Some(sandbox) => SandboxExtensions::handle_sync_extensions(sandbox, envelope, cx).await,
+            None => HeadlessExtensionStore::handle_sync_extensions(store, envelope, cx).await,
+        }
+    }
+
+    /// `InstallExtension` (the SSH upload path): the SSH store's install in `run` mode. In
+    /// serve mode the id, version and upload directory are validated first
+    /// (`SandboxExtensions::install_uploaded`), so a hostile client cannot name a directory
+    /// outside the uploads directory or an id that escapes the extensions directory.
+    async fn handle_install_extension(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::InstallExtension>,
+        cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        let (store, sandbox) = this.read_with(&cx, |this, _| {
+            (
+                this.extensions.clone(),
+                this.sandbox
+                    .as_ref()
+                    .map(|sandbox| sandbox.extensions.clone()),
+            )
+        });
+        match sandbox {
+            Some(sandbox) => {
+                SandboxExtensions::handle_install_extension(sandbox, envelope, cx).await
+            }
+            None => HeadlessExtensionStore::handle_install_extension(store, envelope, cx).await,
+        }
+    }
+
+    /// Serve mode: called after every attach, fresh or reconnect. Replays the last port
+    /// picture and a pending `Resumed`, then sends the current `ExtensionsChanged`.
+    /// Idempotent: every message carries the full picture.
+    pub fn on_session_attached(&mut self, cx: &mut Context<Self>) {
+        let Some(sandbox) = &self.sandbox else {
+            return;
+        };
+        sandbox.control.replay_after_attach();
+        self.send_extensions_changed(cx);
+    }
+
+    /// Sends the installed set to the client and reports it to the supervisor.
+    fn send_extensions_changed(&self, cx: &mut Context<Self>) {
+        let Some(sandbox) = &self.sandbox else {
+            return;
+        };
+        let records = sandbox.extensions.read(cx).installed_extension_records();
+        self.session
+            .send(proto::ExtensionsChanged {
+                project_id: REMOTE_SERVER_PROJECT_ID,
+                installed: records
+                    .iter()
+                    .map(InstalledExtensionRecord::to_proto)
+                    .collect(),
+            })
+            .log_err();
+        let ids: Vec<String> = records.iter().map(|record| record.id.to_string()).collect();
+        let ports = sandbox.ports.clone();
+        cx.background_spawn(async move {
+            let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+            ports.report_installed_extensions(&ids).await.log_err();
+        })
+        .detach();
+    }
+
+    /// Serve mode: after `/files` wrote `abs_paths`, rescans them in their worktrees and
+    /// tells the client which project paths changed. Paths outside every worktree are
+    /// skipped.
+    pub fn notify_files_uploaded(
+        this: WeakEntity<Self>,
+        abs_paths: Vec<PathBuf>,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<()>> {
+        cx.spawn(async move |cx| {
+            let (session, per_worktree) = this.update(cx, |this, cx| {
+                let worktree_store = this.worktree_store.read(cx);
+                let mut per_worktree: HashMap<WorktreeId, (Entity<Worktree>, Vec<Arc<RelPath>>)> =
+                    HashMap::default();
+                for abs_path in &abs_paths {
+                    match worktree_store.find_worktree(abs_path, cx) {
+                        Some((worktree, rel_path)) => {
+                            let id = worktree.read(cx).id();
+                            per_worktree
+                                .entry(id)
+                                .or_insert_with(|| (worktree, Vec::new()))
+                                .1
+                                .push(rel_path);
+                        }
+                        None => log::debug!("uploaded path {abs_path:?} is outside every worktree"),
+                    }
+                }
+                (this.session.clone(), per_worktree)
+            })?;
+
+            let mut paths = Vec::new();
+            for (worktree_id, (worktree, rel_paths)) in per_worktree {
+                let barrier = worktree.update(cx, |worktree, _| {
+                    worktree
+                        .as_local()
+                        .map(|local| local.refresh_entries_for_paths(rel_paths.clone()))
+                });
+                if let Some(mut barrier) = barrier {
+                    futures::StreamExt::next(&mut barrier).await;
+                }
+                paths.extend(rel_paths.into_iter().map(|rel_path| proto::ProjectPath {
+                    worktree_id: worktree_id.to_proto(),
+                    path: rel_path.as_unix_str().to_owned(),
+                }));
+            }
+            if !paths.is_empty() {
+                session.send(proto::FilesUploaded {
+                    project_id: REMOTE_SERVER_PROJECT_ID,
+                    paths,
+                })?;
+            }
+            Ok(())
+        })
     }
 
     fn on_buffer_event(
@@ -577,6 +888,55 @@ impl HeadlessProject {
             });
         });
         Ok(proto::Ack {})
+    }
+
+    /// Serve mode: installs the callback `handle_shutdown_remote_server` runs instead of
+    /// quitting the process.
+    pub fn set_shutdown_request_handler(&mut self, handler: Arc<dyn Fn() + Send + Sync>) {
+        self.shutdown_request_handler = Some(handler);
+    }
+
+    /// Serve mode, fresh session (D3, D24): forget the previous client's buffers, drop every
+    /// worktree so a client that has no state re-adds its roots without duplicating scanners
+    /// (`handle_add_worktree` never dedupes), and reset the user settings the previous client
+    /// pushed. Never touches the `PtyManager` (terminals survive; the client re-attaches them),
+    /// `kernels`, or any store entity's identity (re-subscribing panics in `subscribe_to_entity`).
+    /// Returns the number of dirty buffers discarded.
+    pub fn reset_for_new_client(&mut self, cx: &mut Context<Self>) -> usize {
+        let dirty = self
+            .buffer_store
+            .read(cx)
+            .buffers()
+            .filter(|buffer| buffer.read(cx).is_dirty())
+            .count();
+        // BufferStore keeps strong `Entity<Buffer>` refs in `shared_buffers` and never reacts to
+        // WorktreeRemoved; without this the buffers, their `File.worktree` entities and the
+        // worktrees' background scanners would leak.
+        self.buffer_store
+            .update(cx, |store, _| store.forget_shared_buffers());
+        let ids: Vec<WorktreeId> = self
+            .worktree_store
+            .read(cx)
+            .worktrees()
+            .map(|worktree| worktree.read(cx).id())
+            .collect();
+        self.worktree_store.update(cx, |store, cx| {
+            for id in ids {
+                store.remove_worktree(id, cx);
+            }
+        });
+        // Local settings of the removed worktrees were cleared by the observer's WorktreeRemoved
+        // arm; user settings live in the global store and are reset to defaults here so the next
+        // client starts clean until its own UpdateUserSettings arrives. The observer entity is
+        // kept (it is subscribed under REMOTE_SERVER_PROJECT_ID).
+        SettingsStore::update_global(cx, |store, cx| {
+            // `{}` cannot fail to parse; the result only reports parse diagnostics.
+            let _parse_result = store.set_user_settings("{}", cx);
+        });
+        if dirty > 0 {
+            log::warn!("fresh session discarded {dirty} dirty buffer(s) of the previous client");
+        }
+        dirty
     }
 
     pub async fn handle_open_buffer_by_path(
@@ -1203,10 +1563,17 @@ impl HeadlessProject {
     }
 
     async fn handle_shutdown_remote_server(
-        _this: Entity<Self>,
+        this: Entity<Self>,
         _envelope: TypedEnvelope<proto::ShutdownRemoteServer>,
         cx: AsyncApp,
     ) -> Result<proto::Ack> {
+        if let Some(on_shutdown) =
+            this.read_with(&cx, |this, _| this.shutdown_request_handler.clone())
+        {
+            // serve: the broker flushes this Ack, then closes the session.
+            on_shutdown();
+            return Ok(proto::Ack {});
+        }
         cx.spawn(async move |cx| {
             cx.update(|cx| {
                 // TODO: This is a hack, because in a headless project, shutdown isn't executed
@@ -1331,6 +1698,164 @@ impl HeadlessProject {
             .collect();
         Ok(proto::DirectoryEnvironment { environment })
     }
+
+    /// Longest client-controlled string accepted on `SpawnTerminal`. A terminal
+    /// entry lives for the process's lifetime and its title/cwd are echoed by
+    /// `ListTerminals`, so an oversized value would poison the inventory (and
+    /// could push a `ListTerminalsResponse` past the 16 MiB frame ceiling) for
+    /// the rest of the session.
+    const MAX_SPAWN_STRING_BYTES: usize = 8 * 1024;
+    /// Largest environment map accepted on `SpawnTerminal`.
+    const MAX_SPAWN_ENV_ENTRIES: usize = 4096;
+
+    async fn handle_spawn_terminal(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::SpawnTerminal>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::SpawnTerminalResponse> {
+        let payload = envelope.payload;
+        if let Some(title) = &payload.title {
+            anyhow::ensure!(
+                title.len() <= Self::MAX_SPAWN_STRING_BYTES,
+                "terminal title is too long"
+            );
+        }
+        if let Some(task_id) = &payload.task_id {
+            anyhow::ensure!(
+                task_id.len() <= Self::MAX_SPAWN_STRING_BYTES,
+                "terminal task id is too long"
+            );
+        }
+        if let Some(working_directory) = &payload.working_directory {
+            anyhow::ensure!(
+                working_directory.len() <= Self::MAX_SPAWN_STRING_BYTES,
+                "terminal working directory is too long"
+            );
+        }
+        anyhow::ensure!(
+            payload.env.len() <= Self::MAX_SPAWN_ENV_ENTRIES,
+            "terminal environment has too many entries"
+        );
+        anyhow::ensure!(
+            payload
+                .env
+                .iter()
+                .all(|(key, value)| key.len() + value.len() <= Self::MAX_SPAWN_STRING_BYTES),
+            "terminal environment entry is too long"
+        );
+        let shell = task::shell_from_proto(payload.shell.context("missing shell")?)?;
+        let options = pty::SpawnOptions {
+            shell,
+            working_directory: payload.working_directory.map(PathBuf::from),
+            env: payload.env.into_iter().collect(),
+            cols: terminal_dimension(payload.cols),
+            rows: terminal_dimension(payload.rows),
+            task_id: payload.task_id,
+            title: payload.title,
+        };
+        let terminal_id = this.update(&mut cx, |this, _| this.pty_manager.spawn(options))?;
+        Ok(proto::SpawnTerminalResponse { terminal_id })
+    }
+
+    async fn handle_terminal_input(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::TerminalInput>,
+        mut cx: AsyncApp,
+    ) -> Result<()> {
+        let proto::TerminalInput {
+            terminal_id, data, ..
+        } = envelope.payload;
+        this.update(&mut cx, |this, _| this.pty_manager.write(terminal_id, data))
+    }
+
+    async fn handle_ack_terminal_output(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::AckTerminalOutput>,
+        mut cx: AsyncApp,
+    ) -> Result<()> {
+        let proto::AckTerminalOutput {
+            terminal_id,
+            offset,
+            ..
+        } = envelope.payload;
+        this.update(&mut cx, |this, _| this.pty_manager.ack(terminal_id, offset));
+        Ok(())
+    }
+
+    async fn handle_resize_terminal(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::ResizeTerminal>,
+        mut cx: AsyncApp,
+    ) -> Result<()> {
+        let proto::ResizeTerminal {
+            terminal_id,
+            cols,
+            rows,
+            ..
+        } = envelope.payload;
+        this.update(&mut cx, |this, _| {
+            this.pty_manager.resize(
+                terminal_id,
+                terminal_dimension(cols),
+                terminal_dimension(rows),
+            )
+        })
+    }
+
+    async fn handle_close_terminal(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::CloseTerminal>,
+        mut cx: AsyncApp,
+    ) -> Result<()> {
+        let terminal_id = envelope.payload.terminal_id;
+        // The client's `Drop` legitimately sends a close after the exit path
+        // already removed the entry.
+        if let Err(error) = this.update(&mut cx, |this, _| this.pty_manager.close(terminal_id)) {
+            log::debug!("ignoring CloseTerminal for {terminal_id}: {error:#}");
+        }
+        Ok(())
+    }
+
+    async fn handle_list_terminals(
+        this: Entity<Self>,
+        _envelope: TypedEnvelope<proto::ListTerminals>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::ListTerminalsResponse> {
+        let terminals = this.update(&mut cx, |this, _| this.pty_manager.list());
+        Ok(proto::ListTerminalsResponse { terminals })
+    }
+
+    async fn handle_attach_terminal(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::AttachTerminal>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::AttachTerminalResponse> {
+        let proto::AttachTerminal {
+            terminal_id,
+            from_offset,
+            cols,
+            rows,
+            ..
+        } = envelope.payload;
+        let outcome = this.update(&mut cx, |this, _| {
+            this.pty_manager.attach(
+                terminal_id,
+                from_offset,
+                terminal_dimension(cols),
+                terminal_dimension(rows),
+            )
+        })?;
+        Ok(proto::AttachTerminalResponse {
+            replayed_from: outcome.replayed_from,
+            end_offset: outcome.end_offset,
+            exit: outcome.exit,
+        })
+    }
+}
+
+/// Clamps a wire window dimension into the `u16` range a PTY accepts, never zero.
+fn terminal_dimension(value: u32) -> u16 {
+    value.clamp(1, u16::MAX as u32) as u16
 }
 
 fn prompt_to_proto(

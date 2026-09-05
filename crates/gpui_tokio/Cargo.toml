@@ -17,3 +17,6 @@ anyhow.workspace = true
 gpui.workspace = true
 gpui_util.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

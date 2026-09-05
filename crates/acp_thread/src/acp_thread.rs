@@ -33,21 +33,24 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Formatter, Write};
 use std::ops::Range;
-use std::process::ExitStatus;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::{fmt::Display, mem, path::PathBuf, sync::Arc};
+use task::ExitStatus;
 use task::{Shell, ShellBuilder};
 pub use terminal::*;
 use text::Bias;
 use ui::App;
+// `std::time::Instant` natively; on wasm `Instant::now()` panics.
 use util::markdown::MarkdownEscaped;
 use util::path_list::PathList;
 use util::{
-    ResultExt, get_default_system_shell_preferring_bash,
+    ResultExt,
     paths::{PathStyle, is_absolute},
+    shell::get_default_system_shell_preferring_bash,
 };
 use uuid::Uuid;
+use web_time::Instant;
 
 /// Returned when the model stops because it exhausted its output token budget.
 #[derive(Debug)]

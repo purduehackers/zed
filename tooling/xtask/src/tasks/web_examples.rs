@@ -64,6 +64,9 @@ pub fn run_web_examples(args: WebExamplesArgs) -> Result<()> {
 
     let mut cmd = Command::new(&cargo);
     cmd.args([
+        // `.cargo/config.toml` builds the wasm target with `+atomics` and `--shared-memory`, and
+        // rust-lld refuses to link the prebuilt (non-atomics) std into such a module.
+        "-Zbuild-std=std,panic_abort",
         "build",
         "--target",
         "wasm32-unknown-unknown",

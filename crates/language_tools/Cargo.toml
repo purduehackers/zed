@@ -32,12 +32,19 @@ serde_json.workspace = true
 settings.workspace = true
 telemetry.workspace = true
 theme.workspace = true
-tree-sitter = { workspace = true, features = ["wasm"] }
 sysinfo.workspace = true
 ui.workspace = true
 util.workspace = true
+web-time.workspace = true
 workspace.workspace = true
 zed_actions.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+# `wasm` = wasmtime-backed `WasmStore` for extension grammars; the browser links grammars itself.
+tree-sitter = { workspace = true, features = ["wasm"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+tree-sitter.workspace = true
 
 [dev-dependencies]
 editor = { workspace = true, features = ["test-support"] }

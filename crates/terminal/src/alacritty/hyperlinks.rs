@@ -12,10 +12,13 @@ use log::{info, warn};
 use regex::Regex;
 use std::{
     ops::{Index, Range as StdRange},
-    time::{Duration, Instant},
+    time::Duration,
 };
+// `std::time::Instant` natively; on wasm `Instant::now()` panics, and the hyperlink
+// timeout is evaluated on every mouse move over terminal content.
 use url::Url;
 use util::paths::{PathStyle, UrlExt};
+use web_time::Instant;
 
 use crate::Range;
 

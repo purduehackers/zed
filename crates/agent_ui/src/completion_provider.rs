@@ -2384,7 +2384,7 @@ pub(crate) fn search_symbols(
             .to_owned();
         // Note if you make changes to this filtering below, also change `project_symbols::ProjectSymbolsDelegate::filter`
         const MAX_MATCHES: usize = 100;
-        let mut visible_matches = cx.foreground_executor().block_on(fuzzy::match_strings(
+        let visible_matches = fuzzy::match_strings(
             &visible_match_candidates,
             &query,
             false,
@@ -2392,8 +2392,14 @@ pub(crate) fn search_symbols(
             MAX_MATCHES,
             &cancellation_flag,
             cx.background_executor().clone(),
-        ));
-        let mut external_matches = cx.foreground_executor().block_on(fuzzy::match_strings(
+        );
+        // The browser's main thread cannot block (`ForegroundExecutor::block_on` does not exist
+        // on wasm); this already runs inside a foreground task, so await the matcher there.
+        #[cfg(not(target_family = "wasm"))]
+        let mut visible_matches = cx.foreground_executor().block_on(visible_matches);
+        #[cfg(target_family = "wasm")]
+        let mut visible_matches = visible_matches.await;
+        let external_matches = fuzzy::match_strings(
             &external_match_candidates,
             &query,
             false,
@@ -2401,7 +2407,11 @@ pub(crate) fn search_symbols(
             MAX_MATCHES - visible_matches.len().min(MAX_MATCHES),
             &cancellation_flag,
             cx.background_executor().clone(),
-        ));
+        );
+        #[cfg(not(target_family = "wasm"))]
+        let mut external_matches = cx.foreground_executor().block_on(external_matches);
+        #[cfg(target_family = "wasm")]
+        let mut external_matches = external_matches.await;
         let sort_key_for_match = |mat: &StringMatch| {
             let symbol = &symbols[mat.candidate_id];
             (Reverse(OrderedFloat(mat.score)), symbol.label.filter_text())

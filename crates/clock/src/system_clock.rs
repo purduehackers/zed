@@ -1,4 +1,6 @@
-use std::time::Instant;
+// `web_time::Instant` is `std::time::Instant` natively; on wasm32-unknown-unknown
+// `std::time::Instant::now()` panics, and `Client::production` reaches this clock on every edit.
+use web_time::Instant;
 
 pub trait SystemClock: Send + Sync {
     /// Returns the current date and time in UTC.

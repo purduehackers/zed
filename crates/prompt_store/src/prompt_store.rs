@@ -8,6 +8,7 @@ use futures::FutureExt as _;
 use futures::future::Shared;
 
 use gpui::{App, AppContext, Entity, Global, ReadGlobal, SharedString, Task};
+#[cfg(not(target_family = "wasm"))]
 use heed::{
     Database, RoTxn,
     types::{SerdeBincode, SerdeJson, Str},
@@ -19,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::{future::Future, path::PathBuf, sync::Arc};
 use strum::{EnumIter, IntoEnumIterator as _};
 use text::LineEnding;
+#[cfg(not(target_family = "wasm"))]
 use util::ResultExt;
 use uuid::Uuid;
 
@@ -155,9 +157,23 @@ impl std::fmt::Display for PromptId {
 }
 
 pub struct PromptStore {
-    env: heed::Env,
+    backend: Backend,
     metadata_cache: RwLock<MetadataCache>,
-    bodies: Database<SerdeJson<PromptId>, Str>,
+}
+
+/// Where prompt bodies live.
+enum Backend {
+    /// The LMDB database under `paths::prompts_dir()`; the native store.
+    #[cfg(not(target_family = "wasm"))]
+    Lmdb {
+        env: heed::Env,
+        bodies: Database<SerdeJson<PromptId>, Str>,
+    },
+    /// Built-in prompts only; user prompts are not persisted in the browser.
+    #[cfg(any(target_family = "wasm", test))]
+    Memory {
+        bodies: Arc<RwLock<HashMap<PromptId, String>>>,
+    },
 }
 
 #[derive(Default)]
@@ -167,6 +183,7 @@ struct MetadataCache {
 }
 
 impl MetadataCache {
+    #[cfg(not(target_family = "wasm"))]
     fn from_db(
         db: Database<SerdeJson<PromptId>, SerdeJson<PromptMetadata>>,
         txn: &RoTxn,
@@ -199,6 +216,21 @@ impl MetadataCache {
         Ok(cache)
     }
 
+    /// A cache holding only the built-in prompts, for a store without a database.
+    #[cfg(any(target_family = "wasm", test))]
+    fn builtins_only() -> Self {
+        let mut cache = MetadataCache::default();
+        for builtin in BuiltInPrompt::iter() {
+            let metadata = PromptMetadata::builtin(builtin);
+            cache.metadata.push(metadata.clone());
+            cache
+                .metadata_by_id
+                .insert(PromptId::BuiltIn(builtin), metadata);
+        }
+        cache.sort();
+        cache
+    }
+
     fn sort(&mut self) {
         self.metadata.sort_unstable_by(|a, b| {
             a.title
@@ -214,6 +246,7 @@ impl PromptStore {
         async move { store.await.map_err(|err| anyhow!(err)) }
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub fn new(db_path: PathBuf, cx: &App) -> Task<Result<Self>> {
         cx.background_spawn(async move {
             std::fs::create_dir_all(&db_path)?;
@@ -237,13 +270,34 @@ impl PromptStore {
             txn.commit()?;
 
             Ok(PromptStore {
-                env: db_env,
+                backend: Backend::Lmdb {
+                    env: db_env,
+                    bodies,
+                },
                 metadata_cache: RwLock::new(metadata_cache),
-                bodies,
             })
         })
     }
 
+    /// The browser has no LMDB: the store serves the built-in prompts from memory and
+    /// the path is ignored.
+    #[cfg(target_family = "wasm")]
+    pub fn new(_db_path: PathBuf, _cx: &App) -> Task<Result<Self>> {
+        Task::ready(Ok(Self::in_memory()))
+    }
+
+    /// A store without a database: built-in prompts only, nothing persisted.
+    #[cfg(any(target_family = "wasm", test))]
+    pub fn in_memory() -> Self {
+        Self {
+            backend: Backend::Memory {
+                bodies: Default::default(),
+            },
+            metadata_cache: RwLock::new(MetadataCache::builtins_only()),
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     fn upgrade_dbs(
         env: &heed::Env,
         metadata_db: heed::Database<SerdeJson<PromptId>, SerdeJson<PromptMetadata>>,
@@ -304,23 +358,39 @@ impl PromptStore {
     }
 
     pub fn load(&self, id: PromptId, cx: &App) -> Task<Result<String>> {
-        let env = self.env.clone();
-        let bodies = self.bodies;
-        cx.background_spawn(async move {
-            let txn = env.read_txn()?;
-            let mut prompt: String = match bodies.get(&txn, &id)? {
-                Some(body) => body.into(),
-                None => {
-                    if let Some(built_in) = id.as_built_in() {
-                        built_in.default_content().into()
-                    } else {
-                        anyhow::bail!("prompt not found")
-                    }
+        match &self.backend {
+            #[cfg(not(target_family = "wasm"))]
+            Backend::Lmdb { env, bodies } => {
+                let env = env.clone();
+                let bodies = *bodies;
+                cx.background_spawn(async move {
+                    let txn = env.read_txn()?;
+                    let body: Option<String> = bodies.get(&txn, &id)?.map(Into::into);
+                    Self::finish_load(id, body)
+                })
+            }
+            #[cfg(any(target_family = "wasm", test))]
+            Backend::Memory { bodies } => {
+                let body = bodies.read().get(&id).cloned();
+                cx.background_spawn(async move { Self::finish_load(id, body) })
+            }
+        }
+    }
+
+    /// The stored body, or the built-in default when there is none, normalized.
+    fn finish_load(id: PromptId, body: Option<String>) -> Result<String> {
+        let mut prompt = match body {
+            Some(body) => body,
+            None => {
+                if let Some(built_in) = id.as_built_in() {
+                    built_in.default_content().into()
+                } else {
+                    anyhow::bail!("prompt not found")
                 }
-            };
-            LineEnding::normalize(&mut prompt);
-            Ok(prompt)
-        })
+            }
+        };
+        LineEnding::normalize(&mut prompt);
+        Ok(prompt)
     }
 
     pub fn all_prompt_metadata(&self) -> Vec<PromptMetadata> {
@@ -329,9 +399,11 @@ impl PromptStore {
 }
 
 /// Deprecated: Legacy V1 prompt ID format, used only for migrating data from old databases. Use `PromptId` instead.
+#[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
 struct PromptIdV1(Uuid);
 
+#[cfg(not(target_family = "wasm"))]
 impl From<UserPromptId> for PromptIdV1 {
     fn from(id: UserPromptId) -> Self {
         PromptIdV1(id.0)
@@ -339,6 +411,7 @@ impl From<UserPromptId> for PromptIdV1 {
 }
 
 /// Deprecated: Legacy V1 prompt metadata format, used only for migrating data from old databases. Use `PromptMetadata` instead.
+#[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PromptMetadataV1 {
     id: PromptIdV1,
@@ -391,5 +464,36 @@ mod tests {
             }),
             "Built-in prompt should always be in cache"
         );
+    }
+
+    #[gpui::test]
+    async fn in_memory_store_serves_builtins(cx: &mut TestAppContext) {
+        let store = cx.new(|_cx| PromptStore::in_memory());
+        let commit_message_id = PromptId::BuiltIn(BuiltInPrompt::CommitMessage);
+
+        assert!(store.read_with(cx, |store, _| {
+            store
+                .all_prompt_metadata()
+                .iter()
+                .any(|metadata| metadata.id == commit_message_id)
+        }));
+
+        let loaded_content = store
+            .update(cx, |store, cx| store.load(commit_message_id, cx))
+            .await
+            .unwrap();
+        let mut expected_content = BuiltInPrompt::CommitMessage.default_content().to_string();
+        LineEnding::normalize(&mut expected_content);
+        assert_eq!(loaded_content, expected_content);
+    }
+
+    #[gpui::test]
+    async fn in_memory_store_unknown_user_prompt_errors(cx: &mut TestAppContext) {
+        let store = cx.new(|_cx| PromptStore::in_memory());
+        let error = store
+            .update(cx, |store, cx| store.load(PromptId::new(), cx))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "prompt not found");
     }
 }

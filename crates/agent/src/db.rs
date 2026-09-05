@@ -441,10 +441,21 @@ impl ThreadsDatabase {
                 test_name.unwrap_or_default()
             )))
         } else {
-            let threads_dir = paths::data_dir().join("threads");
-            std::fs::create_dir_all(&threads_dir)?;
-            let sqlite_path = threads_dir.join("threads.db");
-            Connection::open_file(&sqlite_path.to_string_lossy())
+            // The browser has no data directory (`std::fs` is unsupported on
+            // wasm32-unknown-unknown), so, like `db::open_db`, the threads
+            // database lives in memory there.
+            #[cfg(target_family = "wasm")]
+            {
+                log::debug!("browser build: opening the in-memory threads database");
+                Connection::open_memory(Some("THREAD_FALLBACK_DB"))
+            }
+            #[cfg(not(target_family = "wasm"))]
+            {
+                let threads_dir = paths::data_dir().join("threads");
+                std::fs::create_dir_all(&threads_dir)?;
+                let sqlite_path = threads_dir.join("threads.db");
+                Connection::open_file(&sqlite_path.to_string_lossy())
+            }
         };
 
         connection.exec(indoc! {"

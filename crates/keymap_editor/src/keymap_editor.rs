@@ -4,8 +4,10 @@ use std::{
     ops::{Not as _, Range},
     rc::Rc,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
+// `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` natively.
+use web_time::Instant;
 
 mod action_completion_provider;
 mod ui_components;
@@ -4031,6 +4033,162 @@ mod tests {
     use serde_json::json;
     use settings::KeymapFileLoadResult;
     use workspace::{AppState, MultiWorkspace};
+
+    /// The browser keymap layer (`assets/keymaps/web.json`, D12) is loaded strictly in the
+    /// browser, so every action it names must resolve; both chord families parse on every
+    /// host (`cmd` maps to the platform modifier everywhere).
+    #[gpui::test]
+    async fn web_keymap_parses(cx: &mut TestAppContext) {
+        // Link the crate whose action the layer binds into this test binary (the rest live
+        // in `workspace`, `project_symbols::Toggle` included).
+        let _ = std::any::type_name::<tab_switcher::Toggle>();
+        cx.update(|cx| {
+            let _state = AppState::test(cx);
+            editor::init(cx);
+        });
+        let bindings = cx
+            .update(|cx| {
+                KeymapFile::load_asset(settings::WEB_KEYMAP_PATH, Some(KeybindSource::Default), cx)
+            })
+            .expect("web.json must load with every action resolved");
+
+        let bound_to = |chord: &str| -> Vec<String> {
+            let expected = gpui::Keystroke::parse(chord).unwrap();
+            bindings
+                .iter()
+                .filter(|binding| {
+                    binding.keystrokes().len() == 1 && binding.keystrokes()[0].inner() == &expected
+                })
+                .map(|binding| binding.action().name().to_string())
+                .collect()
+        };
+        let unbound = |chord: &str| {
+            let expected = gpui::Keystroke::parse(chord).unwrap();
+            bindings.iter().any(|binding| {
+                binding.keystrokes().len() == 1
+                    && binding.keystrokes()[0].inner() == &expected
+                    && gpui::is_no_action(binding.action())
+            })
+        };
+        assert!(unbound("ctrl-q"), "ctrl-q: {:?}", bound_to("ctrl-q"));
+        assert!(unbound("cmd-q"), "cmd-q: {:?}", bound_to("cmd-q"));
+        assert!(unbound("ctrl-shift-n"));
+        assert!(unbound("cmd-shift-n"));
+        let alt_t = bound_to("alt-t");
+        assert!(
+            alt_t.iter().any(|name| {
+                name == "workspace::ToggleProjectSymbols" || name == "project_symbols::Toggle"
+            }),
+            "alt-t: {alt_t:?}"
+        );
+        assert!(bound_to("ctrl-alt-tab").contains(&"tab_switcher::Toggle".to_string()));
+        assert!(bound_to("alt-w").contains(&"pane::CloseActiveItem".to_string()));
+        assert!(bound_to("cmd-shift-]").contains(&"pane::ActivateNextItem".to_string()));
+    }
+
+    /// `web.json` carries both chord families because the browser cannot branch on the host
+    /// OS (the `os` key is `unknown` on wasm): every `null` of the `ctrl-` family must be a
+    /// no-op on a macOS host and every `cmd-` one on a Linux host, i.e. the chord is not
+    /// bound in the same (`Workspace`) context of that host's default keymap.
+    #[test]
+    fn web_keymap_nulls_are_noops_on_the_other_host() {
+        fn parse(asset: &str) -> KeymapFile {
+            KeymapFile::parse(&util::asset_str::<SettingsAssets>(asset)).unwrap()
+        }
+        fn chords_in_context(keymap: &KeymapFile, context: &str) -> HashSet<String> {
+            keymap
+                .sections()
+                .filter(|section| section.context.trim() == context)
+                .flat_map(|section| section.bindings().map(|(chord, _)| chord.clone()))
+                .collect()
+        }
+        let web = parse(settings::WEB_KEYMAP_PATH);
+        let macos = parse(settings::default_keymap_path_for(settings::KeymapOs::Mac));
+        let linux = parse(settings::default_keymap_path_for(settings::KeymapOs::Linux));
+
+        let mut checked = 0;
+        for section in web.sections() {
+            let context = section.context.trim();
+            let macos_chords = chords_in_context(&macos, context);
+            let linux_chords = chords_in_context(&linux, context);
+            for (chord, action) in section.bindings() {
+                if action.to_string() != "null" {
+                    continue;
+                }
+                checked += 1;
+                if chord.starts_with("ctrl-") {
+                    assert!(
+                        !macos_chords.contains(chord),
+                        "{chord} is bound in default-macos.json's {context} context, so the web null would unbind it there"
+                    );
+                }
+                if chord.starts_with("cmd-") {
+                    assert!(
+                        !linux_chords.contains(chord),
+                        "{chord} is bound in default-linux.json's {context} context, so the web null would unbind it there"
+                    );
+                }
+            }
+        }
+        assert!(
+            checked >= 6,
+            "expected the null entries of web.json, found {checked}"
+        );
+    }
+
+    /// The other half of the rule above: a `null` also has to *reach* the binding it names.
+    /// gpui ranks each match of a chord by the depth its context predicate reaches in the
+    /// dispatch path and sorts by that before load order (`Keymap::bindings_for_input`,
+    /// `binding_enabled`, and gpui's own `test_fail_to_disable`), and a binding with no context
+    /// is ranked at the innermost node. So a `Workspace` null cannot disable a chord the default
+    /// keymap binds without a context — the default action still fires with the focus in an
+    /// editor, which is how `cmd-q`/`ctrl-q` kept quitting the tab. Every null must therefore
+    /// either be context-less or share the context of a default section that binds it.
+    #[test]
+    fn web_keymap_nulls_reach_a_default_binding() {
+        fn parse(asset: &str) -> KeymapFile {
+            KeymapFile::parse(&util::asset_str::<SettingsAssets>(asset)).unwrap()
+        }
+        let web = parse(settings::WEB_KEYMAP_PATH);
+        let defaults = [
+            settings::KeymapOs::Mac,
+            settings::KeymapOs::Linux,
+            settings::KeymapOs::Windows,
+        ]
+        .map(|os| {
+            let path = settings::default_keymap_path_for(os);
+            (path, parse(path))
+        });
+
+        let mut checked = 0;
+        for section in web.sections() {
+            let context = section.context.trim();
+            for (chord, action) in section.bindings() {
+                if action.to_string() != "null" {
+                    continue;
+                }
+                checked += 1;
+                if context.is_empty() {
+                    continue;
+                }
+                let reached = defaults.iter().any(|(_, default)| {
+                    default.sections().any(|default_section| {
+                        default_section.context.trim() == context
+                            && default_section.bindings().any(|(bound, _)| bound == chord)
+                    })
+                });
+                assert!(
+                    reached,
+                    "the {chord} null is scoped to {context}, where no default keymap binds it; \
+                     it can only disable a binding of the same context, so drop the context"
+                );
+            }
+        }
+        assert!(
+            checked >= 6,
+            "expected the null entries of web.json, found {checked}"
+        );
+    }
 
     async fn reload_keymap_from_file(fs: &Arc<FakeFs>, cx: &mut TestAppContext) {
         let content = fs.load(paths::keymap_file().as_path()).await.unwrap();

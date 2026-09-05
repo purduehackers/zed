@@ -4,9 +4,6 @@ use collections::HashMap;
 use futures::StreamExt;
 use futures::lock::OwnedMutexGuard;
 use gpui::{App, AppContext, AsyncApp, Entity, SharedString, Task};
-use http_client::github::AssetKind;
-use http_client::github::{GitHubLspBinaryVersion, latest_github_release};
-use http_client::github_download::{GithubBinaryMetadata, download_server_binary};
 pub use language::*;
 use lsp::{InitializeParams, LanguageServerBinary, LanguageServerBinaryOptions};
 use project::lsp_store::lsp_ext_command;
@@ -28,12 +25,15 @@ use std::{
 };
 use task::{TaskTemplate, TaskTemplates, TaskVariables, VariableName};
 use util::command::{Stdio, new_command};
-use util::fs::{make_file_executable, remove_matching};
 use util::merge_json_value_into;
 use util::rel_path::RelPath;
 use util::{ResultExt, maybe};
 
 use crate::language_settings::LanguageSettings;
+use crate::lsp_download::{
+    AssetKind, GitHubLspBinaryVersion, GithubBinaryMetadata, download_server_binary,
+    latest_github_release, make_file_executable, remove_matching,
+};
 
 pub(crate) fn semantic_token_rules() -> SemanticTokenRules {
     let content = grammars::get_file("rust/semantic_token_rules.json")
@@ -67,6 +67,15 @@ impl RustLspAdapter {
 impl RustLspAdapter {
     const GITHUB_ASSET_KIND: AssetKind = AssetKind::Zip;
     const ARCH_SERVER_NAME: &str = "pc-windows-msvc";
+}
+
+// wasm32-unknown-unknown: there is no rust-analyzer build for the browser and it never downloads
+// one (`lsp_download`), but the install path is compiled there too; these name the target it
+// would ask for.
+#[cfg(target_family = "wasm")]
+impl RustLspAdapter {
+    const GITHUB_ASSET_KIND: AssetKind = AssetKind::Gz;
+    const ARCH_SERVER_NAME: &str = "unknown-unknown";
 }
 
 const SERVER_NAME: LanguageServerName = LanguageServerName::new_static("rust-analyzer");

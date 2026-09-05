@@ -241,11 +241,14 @@ members = [
     "crates/zed_actions",
     "crates/zed_credentials_provider",
     "crates/zed_env_vars",
+    "crates/zed_web",
+    "crates/zed_web_core",
     "crates/zeta_prompt",
     "crates/zlog",
     "crates/zlog_settings",
     "crates/ztracing",
     "crates/ztracing_macro",
+    "crates/zs_smol_shim",
 
     #
     # Extensions
@@ -265,6 +268,8 @@ members = [
     "tooling/xtask",
 ]
 default-members = ["crates/zed"]
+# Vendored third-party crates (D31): path `[patch]` entries, not workspace members.
+exclude = ["vendor/yawc", "vendor/lsp-types", "vendor/agent-client-protocol", "vendor/alacritty_terminal", "vendor/wasm_thread", "vendor/pet-fs", "vendor/tree-sitter-python", "vendor/tree-sitter-rust", "vendor/tree-sitter-bash", "vendor/tree-sitter-cpp", "vendor/tree-sitter-yaml", "vendor/tree-sitter-md", "vendor/async-tar", "vendor/pet-conda", "vendor/pet-hatch", "vendor/pet-uv", "vendor/pet-env-var-path", "vendor/pet-pyenv", "vendor/pet-virtualenvwrapper", "vendor/pet-venv", "vendor/pet", "vendor/futures-util"]
 
 [workspace.package]
 publish = false
@@ -504,6 +509,7 @@ x_ai = { path = "crates/x_ai" }
 zed_actions = { path = "crates/zed_actions" }
 zed_credentials_provider = { path = "crates/zed_credentials_provider" }
 zed_env_vars = { path = "crates/zed_env_vars" }
+zed_web_core = { path = "crates/zed_web_core" }
 zeta_prompt = { path = "crates/zeta_prompt" }
 zlog = { path = "crates/zlog" }
 zlog_settings = { path = "crates/zlog_settings" }
@@ -535,9 +541,11 @@ async-channel = "2.5.0"
 async-compat = "0.2.1"
 async-compression = { version = "0.4", features = ["bzip2", "gzip", "futures-io"] }
 async-dispatcher = "0.1"
+async-executor = "1.13"
 async-fs = "2.1"
 async-io = "2.6.0"
 async-lock = "3.4.2"
+async-net = "2.0"
 async-pipe = { git = "https://github.com/zed-industries/async-pipe-rs", rev = "82d00a04211cf4e1236029aa03e6b6ce2a74c553" }
 # `unstable` is required to compile async-tar's Windows symlink support.
 async-process = "2.5.0"
@@ -565,6 +573,7 @@ base64 = "0.22"
 betlang = "0.1.1"
 bitflags = "2.6.0"
 block = "0.1"
+blocking = "1.6"
 block2 = "0.6"
 brush-parser = "0.3"
 bytes = "1.0"
@@ -636,8 +645,11 @@ hex = "0.4.3"
 html5ever = "0.39"
 http = "1.1"
 http-body = "1.0"
+http-body-util = "0.1.3"
 httparse = "1.10"
 human_bytes = "0.4.1"
+hyper = { version = "1.7", default-features = false }
+hyper-util = { version = "0.1.17", default-features = false }
 idna = "1.0"
 ignore = "0.4.22"
 # image's default features minus "avif", which only adds an encoder (rav1e);
@@ -684,6 +696,7 @@ metal = "0.33"
 mime = "0.3.17"
 minidumper = "0.11"
 moka = { version = "0.12.10", features = ["sync"] }
+multer = "3.1"
 nanoid = "0.4"
 nbformat = "1.2.0"
 nix = "0.29"
@@ -735,6 +748,7 @@ open = "5.0.0"
 ordered-float = "2.1.1"
 palette = { version = "0.7.5", default-features = false, features = ["std"] }
 parking_lot = "0.12.1"
+parking_lot_core = "0.9.12"
 parse_int = "0.9"
 partial-json-fixer = "0.5.3"
 pathfinder_geometry = "0.5"
@@ -743,10 +757,16 @@ percent-encoding = "2.3.2"
 pet = { git = "https://github.com/microsoft/python-environment-tools.git", rev = "bb8e04607b96a3865d6aa4bb2a5a5a82ce05b5f0" }
 pet-conda = { git = "https://github.com/microsoft/python-environment-tools.git", rev = "bb8e04607b96a3865d6aa4bb2a5a5a82ce05b5f0" }
 pet-core = { git = "https://github.com/microsoft/python-environment-tools.git", rev = "bb8e04607b96a3865d6aa4bb2a5a5a82ce05b5f0" }
+pet-env-var-path = { git = "https://github.com/microsoft/python-environment-tools.git", rev = "bb8e04607b96a3865d6aa4bb2a5a5a82ce05b5f0" }
 pet-fs = { git = "https://github.com/microsoft/python-environment-tools.git", rev = "bb8e04607b96a3865d6aa4bb2a5a5a82ce05b5f0" }
+pet-hatch = { git = "https://github.com/microsoft/python-environment-tools.git", rev = "bb8e04607b96a3865d6aa4bb2a5a5a82ce05b5f0" }
 pet-poetry = { git = "https://github.com/microsoft/python-environment-tools.git", rev = "bb8e04607b96a3865d6aa4bb2a5a5a82ce05b5f0" }
+pet-pyenv = { git = "https://github.com/microsoft/python-environment-tools.git", rev = "bb8e04607b96a3865d6aa4bb2a5a5a82ce05b5f0" }
 pet-reporter = { git = "https://github.com/microsoft/python-environment-tools.git", rev = "bb8e04607b96a3865d6aa4bb2a5a5a82ce05b5f0" }
+pet-uv = { git = "https://github.com/microsoft/python-environment-tools.git", rev = "bb8e04607b96a3865d6aa4bb2a5a5a82ce05b5f0" }
+pet-venv = { git = "https://github.com/microsoft/python-environment-tools.git", rev = "bb8e04607b96a3865d6aa4bb2a5a5a82ce05b5f0" }
 pet-virtualenv = { git = "https://github.com/microsoft/python-environment-tools.git", rev = "bb8e04607b96a3865d6aa4bb2a5a5a82ce05b5f0" }
+pet-virtualenvwrapper = { git = "https://github.com/microsoft/python-environment-tools.git", rev = "bb8e04607b96a3865d6aa4bb2a5a5a82ce05b5f0" }
 piper = "0.2"
 portable-pty = "0.9.0"
 postage = { version = "0.5", features = ["futures-traits"] }
@@ -821,6 +841,7 @@ stacksafe = "1.0"
 streaming-iterator = "0.1"
 strsim = "0.11"
 strum = { version = "0.28", features = ["derive"] }
+subtle = "2.6"
 swash = "0.2.6"
 syn = { version = "2.0.101", features = ["full", "extra-traits", "visit-mut"] }
 sys-locale = "0.3.1"
@@ -862,6 +883,7 @@ tree-sitter-heex = { git = "https://github.com/zed-industries/tree-sitter-heex",
 tree-sitter-html = "0.23"
 tree-sitter-jsdoc = "0.23"
 tree-sitter-json = "0.24"
+tree-sitter-language = "0.1"
 tree-sitter-md = { git = "https://github.com/zed-industries/tree-sitter-markdown", rev = "b596e737286780d7bfa9fcddceaeeb754574b352" } # fork of 9a23c1a with serialize() buffer-overflow fix; https://github.com/tree-sitter-grammars/tree-sitter-markdown/issues/243
 tree-sitter-python = "0.25"
 tree-sitter-regex = "0.24"
@@ -895,7 +917,11 @@ wasmtime = { version = "48", default-features = false, features = [
     "incremental-cache",
     "parallel-compilation",
 ] }
-wasm-bindgen = "0.2.120"
+# 0.2.127 or newer for the browser bundle: its threads transform reserves the thread page
+# after the module's initial memory (wasm-bindgen#5225). 0.2.120-0.2.126 carve it out at
+# `__heap_base`, inside the range Rust 1.97's dlmalloc claims at link time (see the wasm32
+# block in .cargo/config.toml). script/build-web pins the CLI to the same version.
+wasm-bindgen = "0.2.127"
 wasm-bindgen-futures = "0.4"
 wasmtime-wasi = "48"
 wax = "0.7"
@@ -973,13 +999,46 @@ features = [
     "Win32_Media",
 ]
 
+[patch."https://github.com/zed-industries/lsp-types"]
+# Zed Codespaces (D10): f1783e63 plus a wasm32-unknown-unknown implementation of
+# Uri::from_file_path/to_file_path. The vendored version (0.95.1) must stay equal to the
+# version at the rev on the `lsp-types` line above, or cargo reports the patch as unused;
+# vendor/README.md records the upstream rev, the diff and the git-patch form.
+lsp-types = { path = "vendor/lsp-types" }
+
 [patch.crates-io]
+# Zed Codespaces: Shared's browser waker mutex must use the D42-aware parker too.
+# Native std and no-std behavior are unchanged; vendor/README.md records provenance.
+futures-util = { path = "vendor/futures-util" }
+# Zed Codespaces (D42): vendored copy of parking_lot_core 0.9.12 whose shared-memory wasm
+# parker spins instead of `memory.atomic.wait32` on a thread the embedder marks (the
+# browser's main thread, where the instruction throws a JS exception through the wasm frames
+# and leaks every guard on the stack). Native code and every other target are byte-identical
+# to the registry crate; vendor/README.md records the diff.
+parking_lot_core = { path = "vendor/parking_lot_core" }
 # Unify `tree_sitter_language::LanguageFn` between crates.io grammar crates and
 # the git tree-sitter above; two instances of the crate would make grammar
 # constants type-incompatible with `tree_sitter::Language`.
 tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "43623ec9bf0eaaf7113285c46e8a09018f181b18" }
 async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }
 async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
+# Zed Codespaces: smol is a facade over async-* crates; on wasm32 the OS-bound halves are stubs.
+smol = { path = "crates/zs_smol_shim" }
+# Zed Codespaces (D10): agent-client-protocol 2.0.0 (rust-sdk ce023279, src/agent-client-protocol)
+# with the process/stdio transports gated for the browser. vendor/README.md records the diff and
+# the git-patch form this line becomes once a fork exists.
+agent-client-protocol = { path = "vendor/agent-client-protocol" }
+# Zed Codespaces (D10): tree-sitter-python 0.25.0 whose bindings/rust/build.rs carries the
+# tree-sitter CLI template's wasm32-unknown-unknown block (the tree-sitter-language crate's wasm
+# libc headers on the include path, so scanner.c stops reaching the wasi sysroot's stdio.h);
+# vendor/README.md records the diff and the git-patch form this line becomes once a fork exists.
+tree-sitter-python = { path = "vendor/tree-sitter-python" }
+# Zed Codespaces (D10): tree-sitter-rust 0.24.2 with the same build.rs wasm32-unknown-unknown block
+# as tree-sitter-python above (vendor/README.md records the diff and the git-patch form).
+tree-sitter-rust = { path = "vendor/tree-sitter-rust" }
+# Zed Codespaces (D10): tree-sitter-bash 0.25.1 with the same build.rs wasm32-unknown-unknown block
+# as tree-sitter-python above (vendor/README.md records the diff and the git-patch form).
+tree-sitter-bash = { path = "vendor/tree-sitter-bash" }
 windows-capture = { git = "https://github.com/zed-industries/windows-capture.git", rev = "f0d6c1b6691db75461b732f6d5ff56eed002eeb9" }
 calloop = { git = "https://github.com/zed-industries/calloop" }
 livekit = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "0a1c519cfce9b365229026b55de9b9dbdb6fed3c" }
@@ -999,6 +1058,130 @@ webrtc-sys = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev 
 # per-crate scratch dirs are sufficient. Upstream issue:
 # https://github.com/dtolnay/cxx/issues/1752
 scratch = { path = "corgi-patches/scratch" }
+
+# Vendored copy of zed-industries/yawc at 71a452f551cac178367eaac5d7418a09afa1f3a2 with the
+# wasm `connect_with_protocols` and `Drop` additions (see vendor/README.md).
+[patch."https://github.com/zed-industries/yawc"]
+yawc = { path = "vendor/yawc" }
+
+# Zed Codespaces (D10): vendored copy of alacritty_terminal at 4c129667 plus
+# vendor/alacritty_terminal.patch, which gates alacritty's PTY/event-loop/thread modules
+# and the `home`/`libc`/`polling` dependencies on wasm32; the grid, Term and vte layers
+# are pure Rust and are what the browser terminal uses. The `alacritty_terminal` line
+# above is unchanged (a git dependency carries no version requirement, so the vendored
+# 0.26.1-dev satisfies it). vendor/README.md records the upstream rev and the git-patch
+# form this entry becomes once a fork exists. See docs/briefs/b6-leaf-gates.md 3.1.
+[patch."https://github.com/zed-industries/alacritty"]
+alacritty_terminal = { path = "vendor/alacritty_terminal" }
+
+# The browser's `wasm_thread` without `js_sys::eval` (D10, b7 §3.33): the editor route's CSP
+# is `script-src 'self' 'wasm-unsafe-eval'` and the pinned revision evals `self`, a
+# stack-trace script and a module-worker polyfill. The copy is the pinned rev 0cf96c7 plus
+# `js_sys::global()`/`web_sys` lookups and the `globalThis.__zsBindgenShimUrl` shim URL the
+# loader sets; vendor/README.md records the diff and the git-patch form.
+[patch."https://github.com/zed-industries/wasm_thread"]
+wasm_thread = { path = "vendor/wasm_thread" }
+
+# Zed Codespaces (D10): vendored copy of zed-industries/async-tar at bd3ad6f8 with the
+# local-filesystem surface (`Archive::unpack`, `Entry::unpack*`, `Builder::append_path*`,
+# `append_dir*`, `append_file`, `Header::set_metadata*` and the `Drop` that blocks on
+# `finish`) gated `cfg(not(target_family = "wasm"))`: `async_std::fs` does not exist on
+# wasm32-unknown-unknown. The `async-tar` line above is unchanged (a git dependency carries
+# no version requirement, so the vendored 0.6.1 satisfies it); vendor/README.md records the
+# diff and the git-patch form this entry becomes once a fork exists.
+[patch."https://github.com/zed-industries/async-tar"]
+async-tar = { path = "vendor/async-tar" }
+
+# Zed Codespaces (D10): vendored copy of pet-fs (microsoft/python-environment-tools at the
+# bb8e0460 rev on the `pet*` lines above). `strip_trailing_separator` and `norm_case` are
+# `#[cfg(windows)]`/`#[cfg(unix)]` bodies upstream, so on wasm32-unknown-unknown (neither)
+# they compile to `()`; the copy extends the Unix branch to `target_family = "wasm"`. Only
+# `pet-fs` is replaced; every other `pet*` crate (the six lines above and the in-repo crates
+# they pull in) stays on the git checkout, and their `path = "../pet-fs"` dependencies
+# resolve to this copy. vendor/README.md records the diff and the git-patch form this entry
+# becomes once a fork exists.
+[patch."https://github.com/microsoft/python-environment-tools.git"]
+pet-fs = { path = "vendor/pet-fs" }
+# Zed Codespaces (D10): vendored copy of pet-conda from the same rev, the second `pet*` crate
+# replaced (the note above predates it). Its `cfg(unix)` arms (conda/mamba executable paths,
+# bin names, known install locations) are extended to `target_family = "wasm"` and it carries
+# a wasm arm of pet-python-utils' `find_executable`; vendor/README.md records the diff and
+# the git-patch form this entry becomes once a fork exists.
+pet-conda = { path = "vendor/pet-conda" }
+# Zed Codespaces (D10): vendored copy of pet-hatch from the same rev, the third `pet*` crate
+# replaced. It carries a wasm arm of pet-python-utils' `find_executable` and a wasm
+# `Environment` for `Hatch::default()` (pet-core's `EnvironmentApi` implements the trait only
+# on Windows and Unix); vendor/README.md records the diff and the git-patch form this entry
+# becomes once a fork exists.
+pet-hatch = { path = "vendor/pet-hatch" }
+# Zed Codespaces (D10): vendored copy of pet-uv from the same rev, the fourth `pet*` crate
+# replaced. Its `cfg(unix)` arms (`is_symlink_or_junction`, the default uv Python install
+# directory) are extended to `target_family = "wasm"` and it carries wasm arms of
+# pet-python-utils' `find_executable` and of pet-core's `Environment` for `Uv::default()`;
+# vendor/README.md records the diff and the git-patch form this entry becomes once a fork
+# exists.
+pet-uv = { path = "vendor/pet-uv" }
+# Zed Codespaces (D10): vendored copy of pet-env-var-path from the same rev, the fifth `pet*`
+# crate replaced. `normalize_search_path` is a `#[cfg(unix)]`/`#[cfg(windows)]` body upstream,
+# so on wasm32-unknown-unknown (neither) the function compiles to `()` (E0308); the copy extends
+# the Unix arm to `target_family = "wasm"`. vendor/README.md records the diff and the git-patch
+# form this entry becomes once a fork exists.
+pet-env-var-path = { path = "vendor/pet-env-var-path" }
+# Zed Codespaces (D10): vendored copy of pet-pyenv from the same rev, another `pet*` crate
+# replaced. Its `cfg(unix)` arms (`get_home_pyenv_dir`, `get_pyenv_manager_version`) are
+# extended to `target_family = "wasm"` and it carries a wasm arm of pet-python-utils'
+# `find_executable`; vendor/README.md records the diff and the git-patch form this entry
+# becomes once a fork exists.
+pet-pyenv = { path = "vendor/pet-pyenv" }
+# Zed Codespaces (D10): vendored copy of pet-virtualenvwrapper from the same rev, another `pet*`
+# crate replaced. `get_default_virtualenvwrapper_path` is `#[cfg(windows)]`/`#[cfg(unix)]` upstream,
+# so on wasm32-unknown-unknown (neither) its unconditional call in `get_work_on_home_path` is
+# unresolved (E0425); the copy extends the Unix arm to `target_family = "wasm"`. vendor/README.md
+# records the diff and the git-patch form this entry becomes once a fork exists.
+pet-virtualenvwrapper = { path = "vendor/pet-virtualenvwrapper" }
+# Zed Codespaces (D10): vendored copy of pet-venv from the same rev, another `pet*` crate
+# replaced. `lib.rs` imports pet-python-utils' `find_executable_or_broken`, which is
+# `#[cfg(windows)]`/`#[cfg(unix)]` upstream, so on wasm32-unknown-unknown (neither) the import is
+# unresolved (E0432); the copy gates the import and carries a wasm arm with the Unix body (the
+# same shim shape as pet-pyenv's `find_executable`). vendor/README.md records the diff and the
+# git-patch form this entry becomes once a fork exists.
+pet-venv = { path = "vendor/pet-venv" }
+# Zed Codespaces (D10): vendored copy of pet from the same rev, another `pet*` crate replaced.
+# `find.rs`/`resolve.rs` import pet-python-utils' `find_executable` (E0432 on wasm), `locators.rs`
+# calls a `#[cfg(unix)]`/`#[cfg(windows)]` `find_symlinks` (E0425), and `lib.rs` coerces pet-core's
+# `EnvironmentApi` to `&dyn Environment` (E0277: its impl is Windows/Unix only); the copy gates the
+# import, extends the Unix `find_symlinks` to `target_family = "wasm"`, and carries a wasm
+# `find_executable` and a wasm `WasmEnvironmentApi`. vendor/README.md records the diff and the
+# git-patch form this entry becomes once a fork exists.
+pet = { path = "vendor/pet" }
+
+# Zed Codespaces (D10): tree-sitter-cpp at the 5cb9b693 rev on the `tree-sitter-cpp` line
+# above, whose bindings/rust/build.rs carries the tree-sitter CLI template's
+# wasm32-unknown-unknown block (the tree-sitter-language crate's wasm libc headers on the
+# include path, so scanner.c stops reaching the wasi sysroot's stdio.h). A git dependency
+# carries no version requirement, so the vendored 0.23.4 satisfies it; vendor/README.md
+# records the diff and the git-patch form this entry becomes once a fork exists.
+[patch."https://github.com/tree-sitter/tree-sitter-cpp"]
+tree-sitter-cpp = { path = "vendor/tree-sitter-cpp" }
+
+# Zed Codespaces (D10): tree-sitter-yaml at the baff0b51 rev on the `tree-sitter-yaml` line
+# above, whose bindings/rust/build.rs carries the tree-sitter CLI template's
+# wasm32-unknown-unknown block (the tree-sitter-language crate's wasm libc headers on the
+# include path, so scanner.c stops reaching the wasi sysroot's stdio.h). A git dependency
+# carries no version requirement, so the vendored 0.6.1 satisfies it; vendor/README.md
+# records the diff and the git-patch form this entry becomes once a fork exists.
+[patch."https://github.com/zed-industries/tree-sitter-yaml"]
+tree-sitter-yaml = { path = "vendor/tree-sitter-yaml" }
+
+# Zed Codespaces (D10): tree-sitter-md at the b596e737 rev on the `tree-sitter-md` line above,
+# whose bindings/rust/build.rs carries the tree-sitter CLI template's wasm32-unknown-unknown
+# block (the tree-sitter-language crate's wasm libc headers on the include path, so the two
+# scanners' `assert` expands to the shim's inline `__assert_fail` instead of leaving wasi-libc's
+# `__assert_fail` undefined at the bundle link). A git dependency carries no version
+# requirement, so the vendored 0.3.2 satisfies it; vendor/README.md records the diff and the
+# git-patch form this entry becomes once a fork exists.
+[patch."https://github.com/zed-industries/tree-sitter-markdown"]
+tree-sitter-md = { path = "vendor/tree-sitter-md" }
 
 [profile.dev]
 split-debuginfo = "unpacked"
@@ -1087,6 +1270,22 @@ codegen-units = 1
 
 [profile.release.package]
 zed = { codegen-units = 16 }
+
+# The browser bundle (`script/build-web`): size over speed, symbols stripped; the
+# wasm-bindgen glue and `wasm-opt` run on top of this output.
+[profile.web-release]
+inherits = "release"
+debug = false
+strip = "symbols"
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+
+# Host build scripts and proc-macros of the bundle build stay unstripped: with the parent's
+# `strip = "symbols"` rustc rejects the stripped `sqlez_macros` dylib (E0463 "can't find
+# crate" while compiling `db` for wasm32, seen on macOS); they are never shipped.
+[profile.web-release.build-override]
+strip = "none"
 
 [profile.release-fast]
 inherits = "release"

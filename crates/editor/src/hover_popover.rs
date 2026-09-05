@@ -30,6 +30,7 @@ use theme_settings::ThemeSettings;
 use ui::{CopyButton, Scrollbars, WithScrollbar, prelude::*, theme_is_transparent};
 use url::Url;
 use util::TryFutureExt;
+use util::paths::{PathStyle, UrlExt};
 use workspace::{OpenOptions, OpenVisible, Workspace};
 
 pub const MIN_POPOVER_CHARACTER_WIDTH: f32 = 20.;
@@ -1004,14 +1005,16 @@ pub fn diagnostics_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
 fn parse_file_link(link: &str) -> Option<(PathBuf, Option<String>)> {
     let uri = Url::parse(link).ok().filter(|uri| uri.scheme() == "file")?;
     let fragment = uri.fragment().map(ToOwned::to_owned);
-    let path = uri.to_file_path().unwrap_or_else(|_| {
-        let encoded = uri.path();
+    let path = uri
+        .to_file_path_ext(PathStyle::local())
+        .unwrap_or_else(|_| {
+            let encoded = uri.path();
 
-        urlencoding::decode(encoded)
-            .map(Cow::into_owned)
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(encoded))
-    });
+            urlencoding::decode(encoded)
+                .map(Cow::into_owned)
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from(encoded))
+        });
 
     Some((path, fragment))
 }

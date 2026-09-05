@@ -966,6 +966,9 @@ impl VsCodeSettings {
         let platform = "osx";
         #[cfg(target_os = "freebsd")]
         let platform = "freebsd";
+        // The browser's terminals run on the Linux remote server.
+        #[cfg(target_family = "wasm")]
+        let platform = "linux";
         let env = self
             .read_value(&format!("terminal.integrated.env.{platform}"))
             .and_then(|v| v.as_object())

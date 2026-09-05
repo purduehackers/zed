@@ -41,11 +41,18 @@ smallvec.workspace = true
 sum_tree.workspace = true
 text.workspace = true
 theme.workspace = true
-tree-sitter = { workspace = true, features = ["wasm"] }
+web-time.workspace = true
 ztracing.workspace = true
 tracing.workspace = true
 util.workspace = true
 unicode-segmentation.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+# `wasm` = wasmtime-backed `WasmStore` for extension grammars; the browser links grammars itself.
+tree-sitter = { workspace = true, features = ["wasm"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+tree-sitter.workspace = true
 
 [dev-dependencies]
 buffer_diff = { workspace = true, features = ["test-support"] }

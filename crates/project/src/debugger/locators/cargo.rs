@@ -1,15 +1,23 @@
-use anyhow::{Context as _, Result};
+#[cfg(not(target_family = "wasm"))]
+use anyhow::Context as _;
+use anyhow::Result;
 use async_trait::async_trait;
 use dap::{DapLocator, DebugRequest, adapters::DebugAdapterName};
 use gpui::{BackgroundExecutor, SharedString};
 use serde_json::{Value, json};
+#[cfg(not(target_family = "wasm"))]
 use smol::{io::AsyncReadExt, process::Stdio as SmolStdio};
+#[cfg(not(target_family = "wasm"))]
 use std::time::Duration;
-use task::{BuildTaskDefinition, DebugScenario, ShellBuilder, SpawnInTerminal, TaskTemplate};
+#[cfg(not(target_family = "wasm"))]
+use task::ShellBuilder;
+use task::{BuildTaskDefinition, DebugScenario, SpawnInTerminal, TaskTemplate};
+#[cfg(not(target_family = "wasm"))]
 use util::command::{Stdio, new_command};
 
 pub(crate) struct CargoLocator;
 
+#[cfg(not(target_family = "wasm"))]
 async fn find_best_executable(
     executables: &[String],
     test_name: &str,
@@ -113,6 +121,7 @@ impl DapLocator for CargoLocator {
         })
     }
 
+    #[cfg(not(target_family = "wasm"))]
     async fn run(
         &self,
         build_config: SpawnInTerminal,
@@ -217,8 +226,23 @@ impl DapLocator for CargoLocator {
             env: build_config.env.into_iter().collect(),
         }))
     }
+
+    /// The browser cannot spawn `cargo`; builds run inside the sandbox, where the remote server
+    /// runs this locator on the project's behalf.
+    #[cfg(target_family = "wasm")]
+    async fn run(
+        &self,
+        build_config: SpawnInTerminal,
+        _executor: BackgroundExecutor,
+    ) -> Result<DebugRequest> {
+        anyhow::bail!(
+            "cannot run `cargo` for {:?} in the browser",
+            build_config.label
+        )
+    }
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn build_test_binary_args(test_name: Option<&str>, is_test: bool, is_ignored: bool) -> Vec<String> {
     let mut args: Vec<String> = test_name.map(str::to_owned).into_iter().collect();
     if is_test {

@@ -1,0 +1,38 @@
+[package]
+name = "smol"
+version = "2.0.2"
+edition.workspace = true
+publish = false
+license = "MIT OR Apache-2.0"
+description = "Zed Codespaces: smol 2.0.2 on native targets, browser stubs on wasm32-unknown-unknown"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+# Pure-Rust parts of smol, identical on every target.
+[dependencies]
+async-channel.workspace = true
+async-executor.workspace = true
+async-lock.workspace = true
+futures-lite = "2.6"   # smol 2 re-exports futures-lite 2; the workspace pin (1.13) is a different crate
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+async-fs.workspace = true
+async-io.workspace = true
+async-net.workspace = true
+async-process.workspace = true
+blocking.workspace = true
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+async-task.workspace = true
+js-sys.workspace = true
+log.workspace = true
+wasm-bindgen.workspace = true
+
+[dev-dependencies]
+async-task.workspace = true
+tempfile.workspace = true

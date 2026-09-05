@@ -66,6 +66,9 @@ pub struct MockRemoteConnection {
     options: MockConnectionOptions,
     server_channel: Arc<ChannelClient>,
     server_cx: SendableCx,
+    /// Whether this mock claims to host PTYs itself (D27). Off by default, so
+    /// the many tests that share this transport keep the `build_command` path.
+    remote_pty: bool,
 }
 
 /// Wrapper to pass `AsyncApp` across thread boundaries in tests.
@@ -160,6 +163,18 @@ impl MockConnection {
         client_cx: &mut TestAppContext,
         server_cx: &mut TestAppContext,
     ) -> (AnyProtoClient, ConnectGuard) {
+        Self::new_with_opts_and_remote_pty(opts, false, client_cx, server_cx)
+    }
+
+    /// Like [`MockConnection::new_with_opts`], but the connection can claim to
+    /// host PTYs itself, which routes terminals through the remote terminal
+    /// protocol instead of `build_command` (D27).
+    pub(crate) fn new_with_opts_and_remote_pty(
+        opts: MockConnectionOptions,
+        remote_pty: bool,
+        client_cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) -> (AnyProtoClient, ConnectGuard) {
         let (outgoing_tx, _) = mpsc::unbounded::<Envelope>();
         let (_, incoming_rx) = mpsc::unbounded::<Envelope>();
         let server_client = server_cx
@@ -169,6 +184,7 @@ impl MockConnection {
             options: opts.clone(),
             server_channel: server_client.clone(),
             server_cx: SendableCx::new(server_cx),
+            remote_pty,
         });
 
         let (tx, rx) = oneshot::channel();
@@ -313,6 +329,10 @@ impl RemoteConnection for MockRemoteConnection {
 
     fn has_wsl_interop(&self) -> bool {
         false
+    }
+
+    fn supports_remote_pty(&self) -> bool {
+        self.remote_pty
     }
 }
 

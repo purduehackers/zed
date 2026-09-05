@@ -64,10 +64,13 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use util::{ResultExt, debug_panic, markdown::MarkdownCodeBlock, paths::PathStyle};
 use uuid::Uuid;
+// `web_time::Instant` is `std::time::Instant` natively; on wasm `Instant::now()` panics.
+// `acp_thread::RetryStatus::started_at` is typed with it, so this crate must use the same alias.
+use web_time::Instant;
 
 const TOOL_CANCELED_MESSAGE: &str = "Tool canceled by user";
 const TOOL_CALL_INTERRUPTED_BY_FOLLOW_UP_MESSAGE: &str =

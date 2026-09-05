@@ -3,15 +3,14 @@ extern crate self as util;
 
 #[cfg(not(target_family = "wasm"))]
 pub mod archive;
-#[cfg(not(target_family = "wasm"))]
+// Compiles on wasm over the smol shim's `process` module (every spawn fails with
+// `Unsupported`), so `git` and the other crates that build commands need no gates.
 pub mod command;
 #[cfg(not(target_family = "wasm"))]
 pub mod fs;
 #[cfg(not(target_family = "wasm"))]
 pub mod process;
-#[cfg(not(target_family = "wasm"))]
 pub mod shell;
-#[cfg(not(target_family = "wasm"))]
 pub mod shell_builder;
 #[cfg(not(target_family = "wasm"))]
 pub mod shell_env;

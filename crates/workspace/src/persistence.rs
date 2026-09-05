@@ -30,7 +30,8 @@ use project::{
 use language::{LanguageName, Toolchain, ToolchainScope};
 use remote::{
     DockerConnectionOptions, RemoteConnectionIdentity, RemoteConnectionOptions,
-    SshConnectionOptions, WslConnectionOptions, remote_connection_identity,
+    SshConnectionOptions, WebSocketConnectionOptions, WslConnectionOptions,
+    remote_connection_identity,
 };
 use serde::{Deserialize, Serialize};
 use sqlez::{
@@ -1738,6 +1739,13 @@ impl WorkspaceDb {
                 name = Some(identity_name);
                 user = Some(remote_user);
             }
+            // The workspace id is the whole identity (D1). `host` stays `None`: the lookup
+            // below matches on it, and the endpoint host changes on every resume.
+            RemoteConnectionIdentity::WebSocket { workspace_id } => {
+                kind = RemoteConnectionKind::WebSocket;
+                name = Some(workspace_id);
+                user = None;
+            }
             #[cfg(any(test, feature = "test-support"))]
             RemoteConnectionIdentity::Mock { id } => {
                 kind = RemoteConnectionKind::Ssh;
@@ -2029,6 +2037,11 @@ impl WorkspaceDb {
                     remote_env,
                 }))
             }
+            // A restored row carries no URL, session id or token; dialing it needs a session
+            // refresh provider.
+            RemoteConnectionKind::WebSocket => Some(RemoteConnectionOptions::WebSocket(
+                WebSocketConnectionOptions::new(String::new(), name?, String::new(), String::new()),
+            )),
         }
     }
 
@@ -2807,6 +2820,7 @@ mod tests {
     use crate::PathList;
     use crate::ProjectGroupKey;
     use crate::RemovalIntent;
+    use crate::SerializedProjectGroup;
     use crate::{
         multi_workspace::MultiWorkspace,
         persistence::{
@@ -4270,6 +4284,104 @@ mod tests {
             .unwrap();
 
         assert_eq!(connection_id, same_connection_id);
+    }
+
+    #[gpui::test]
+    async fn test_get_or_create_websocket_connection_keys_on_workspace_id() {
+        let db = WorkspaceDb::open_test_db(
+            "test_get_or_create_websocket_connection_keys_on_workspace_id",
+        )
+        .await;
+
+        let first = db
+            .get_or_create_remote_connection(RemoteConnectionOptions::WebSocket(
+                WebSocketConnectionOptions::new("wss://a.example/rpc", "w1", "s1", "t"),
+            ))
+            .await
+            .unwrap();
+        // A resume rotates the URL, the session id and the token; the row must be reused.
+        let same = db
+            .get_or_create_remote_connection(RemoteConnectionOptions::WebSocket(
+                WebSocketConnectionOptions::new("wss://b.example/rpc", "w1", "s2", "u")
+                    .with_takeover(true),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first, same);
+
+        let other = db
+            .get_or_create_remote_connection(RemoteConnectionOptions::WebSocket(
+                WebSocketConnectionOptions::new("wss://a.example/rpc", "w2", "s1", "t"),
+            ))
+            .await
+            .unwrap();
+        assert_ne!(first, other);
+
+        let restored = db.remote_connection(first).unwrap();
+        let RemoteConnectionOptions::WebSocket(restored) = restored else {
+            panic!("expected websocket options, got {restored:?}");
+        };
+        assert_eq!(restored.workspace_id, "w1");
+        assert!(restored.url.is_empty());
+        assert!(restored.session_id.is_empty());
+        assert!(restored.token.is_empty());
+        assert!(!restored.takeover);
+        assert!(restored.refresh.is_none());
+    }
+
+    #[gpui::test]
+    async fn test_websocket_project_group_round_trip_omits_secrets() {
+        let group = SerializedProjectGroup {
+            path_list: PathList::new(&[PathBuf::from("/workspaces/repo")]).serialize(),
+            location: SerializedWorkspaceLocation::Remote(RemoteConnectionOptions::WebSocket(
+                WebSocketConnectionOptions::new("wss://a.example/rpc", "w1", "s1", "secret")
+                    .with_takeover(true),
+            )),
+            expanded: true,
+        };
+
+        let json = serde_json::to_string(&group).unwrap();
+        assert!(!json.contains("secret"), "{json}");
+        assert!(!json.contains("s1"), "{json}");
+
+        let restored: SerializedProjectGroup = serde_json::from_str(&json).unwrap();
+        let SerializedWorkspaceLocation::Remote(RemoteConnectionOptions::WebSocket(options)) =
+            restored.location
+        else {
+            panic!("expected websocket options");
+        };
+        assert_eq!(options.workspace_id, "w1");
+        assert_eq!(options.url, "wss://a.example/rpc");
+        assert!(options.session_id.is_empty());
+        assert!(options.token.is_empty());
+        assert!(!options.takeover);
+    }
+
+    #[gpui::test]
+    async fn test_unknown_remote_connection_kind_is_skipped() {
+        let db = WorkspaceDb::open_test_db("test_unknown_remote_connection_kind_is_skipped").await;
+
+        let known = db
+            .get_or_create_remote_connection(RemoteConnectionOptions::WebSocket(
+                WebSocketConnectionOptions::new("wss://a.example/rpc", "w1", "s1", "t"),
+            ))
+            .await
+            .unwrap();
+        let unknown = db
+            .write(|conn| {
+                conn.select_row_bound::<&str, u64>(sql!(
+                    INSERT INTO remote_connections (kind) VALUES (?)
+                    RETURNING id
+                ))?("unknown")?
+                .context("failed to insert a row with an unknown kind")
+            })
+            .await
+            .unwrap();
+
+        let connections = db.remote_connections().unwrap();
+        assert!(connections.contains_key(&known));
+        assert!(!connections.contains_key(&RemoteConnectionId(unknown)));
+        assert!(db.remote_connection(RemoteConnectionId(unknown)).is_err());
     }
 
     #[gpui::test]

@@ -659,6 +659,11 @@ jobs:
         path: ~/.rustup
     - name: run_tests::check_wasm::install_nightly_wasm_toolchain
       run: rustup toolchain install nightly --component rust-src --target wasm32-unknown-unknown
+    - name: run_tests::check_wasm::cache_wasi_sdk
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: target/wasi-sdk
+        key: wasi-sdk-25-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('script/wasi-sdk.sha256') }}
     - name: steps::setup_sccache
       run: ./script/setup-sccache
       env:
@@ -667,10 +672,9 @@ jobs:
         R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         SCCACHE_BUCKET: sccache-zed
     - name: run_tests::check_wasm::cargo_check_wasm
-      run: cargo -Zbuild-std=std,panic_abort check --target wasm32-unknown-unknown -p gpui_platform -p cloud_api_client
-      env:
-        CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS: -C target-feature=+atomics,+bulk-memory,+mutable-globals
-        RUSTC_BOOTSTRAP: '1'
+      run: ./script/check-wasm
+    - name: run_tests::check_wasm::cargo_check_wasm_test_hooks
+      run: ./script/check-wasm -p zed_web --features zed_web/test-hooks
     - name: steps::show_sccache_stats
       run: sccache --show-stats || true
     - name: steps::cleanup_cargo_config

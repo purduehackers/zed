@@ -1,0 +1,2 @@
+# Terminal recordings contain literal CR/LF bytes, not normalized text lines.
+alacritty_terminal/tests/ref/**/*.recording -text

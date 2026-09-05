@@ -5,26 +5,34 @@ use dap_types::{
     ErrorResponse,
     messages::{Message, Response},
 };
-use futures::{AsyncRead, AsyncReadExt as _, AsyncWrite, FutureExt as _, channel::oneshot, select};
-use gpui::{AppContext as _, AsyncApp, BackgroundExecutor, Task};
+use futures::{AsyncRead, AsyncReadExt as _, AsyncWrite, channel::oneshot};
+#[cfg(not(target_family = "wasm"))]
+use futures::{FutureExt as _, select};
+#[cfg(any(not(target_family = "wasm"), test, feature = "test-support"))]
+use gpui::BackgroundExecutor;
+use gpui::{AppContext as _, AsyncApp, Task};
 use parking_lot::Mutex;
 use proto::ErrorExt;
 use settings::Settings as _;
 use smallvec::SmallVec;
+#[cfg(not(target_family = "wasm"))]
+use smol::net::TcpStream;
 use smol::{
     channel::{Receiver, Sender, unbounded},
     io::{AsyncBufReadExt as _, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
 };
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
-    process::Stdio,
     sync::Arc,
-    time::Duration,
 };
+#[cfg(not(target_family = "wasm"))]
+use std::{process::Stdio, time::Duration};
 use task::TcpArgumentsTemplate;
-use util::{ConnectionResult, ResultExt, process::Child};
+use util::ConnectionResult;
+#[cfg(not(target_family = "wasm"))]
+use util::{ResultExt, process::Child};
 
 use crate::{
     adapters::{DebugAdapterBinary, TcpArguments},
@@ -89,6 +97,7 @@ async fn start(
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
     if binary.connection.is_some() {
         Ok(Box::new(
             TcpTransport::start(binary, log_handlers, cx).await?,
@@ -97,6 +106,13 @@ async fn start(
         Ok(Box::new(
             StdioTransport::start(binary, log_handlers, cx).await?,
         ))
+    }
+    // The browser can neither spawn a debug adapter nor open a raw TCP socket to one; only
+    // the fake transport of the test builds exists there.
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = (binary, log_handlers, cx);
+        bail!("debug adapters cannot be started from the browser")
     }
 }
 
@@ -238,6 +254,7 @@ impl TransportDelegate {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
     async fn handle_adapter_log(
         stdout: impl AsyncRead + Unpin + Send + 'static,
         iokind: IoKind,
@@ -469,6 +486,7 @@ impl TransportDelegate {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub struct TcpTransport {
     executor: BackgroundExecutor,
     pub port: u16,
@@ -478,6 +496,11 @@ pub struct TcpTransport {
     _stderr_task: Option<Task<()>>,
     _stdout_task: Option<Task<()>>,
 }
+
+/// Only the port helpers exist in the browser: nothing there can spawn a debug adapter or open
+/// a raw TCP socket to one, so `TransportDelegate::start` fails before reaching a transport.
+#[cfg(target_family = "wasm")]
+pub struct TcpTransport;
 
 impl TcpTransport {
     /// Get an open port to use with the tcp client when not supplied by debug config
@@ -496,6 +519,7 @@ impl TcpTransport {
             .port())
     }
 
+    #[cfg(not(target_family = "wasm"))]
     async fn start(
         binary: &DebugAdapterBinary,
         log_handlers: LogHandlers,
@@ -569,6 +593,7 @@ impl TcpTransport {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Transport for TcpTransport {
     fn has_adapter_logs(&self) -> bool {
         true
@@ -638,6 +663,7 @@ impl Transport for TcpTransport {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Drop for TcpTransport {
     fn drop(&mut self) {
         if let Some(mut p) = self.process.lock().take() {
@@ -646,11 +672,15 @@ impl Drop for TcpTransport {
     }
 }
 
+/// Talks to a debug adapter over its stdio; the browser cannot spawn one, so this exists
+/// natively only.
+#[cfg(not(target_family = "wasm"))]
 pub struct StdioTransport {
     process: Mutex<Child>,
     _stderr_task: Option<Task<()>>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl StdioTransport {
     // #[allow(dead_code, reason = "This is used in non test builds of Zed")]
     async fn start(
@@ -691,6 +721,7 @@ impl StdioTransport {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Transport for StdioTransport {
     fn has_adapter_logs(&self) -> bool {
         true
@@ -723,6 +754,7 @@ impl Transport for StdioTransport {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Drop for StdioTransport {
     fn drop(&mut self) {
         self.process.lock().kill().log_err();

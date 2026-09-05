@@ -1,8 +1,16 @@
 mod application_menu;
+#[cfg(not(target_family = "wasm"))]
+pub mod collab;
+#[cfg(target_family = "wasm")]
+#[path = "collab_web.rs"]
 pub mod collab;
 mod onboarding_banner;
 mod plan_chip;
 mod title_bar_settings;
+#[cfg(not(target_family = "wasm"))]
+mod update_version;
+#[cfg(target_family = "wasm")]
+#[path = "update_version_web.rs"]
 mod update_version;
 
 use crate::application_menu::{ApplicationMenu, show_menus};
@@ -21,7 +29,9 @@ use crate::application_menu::{
     ActivateDirection, ActivateMenuLeft, ActivateMenuRight, OpenApplicationMenu,
 };
 
+#[cfg(not(target_family = "wasm"))]
 use auto_update::AutoUpdateStatus;
+#[cfg(not(target_family = "wasm"))]
 use call::ActiveCall;
 use client::{Client, UserStore, zed_urls};
 use command_palette_hooks::CommandPaletteFilter;
@@ -386,7 +396,10 @@ impl Render for TitleBar {
                 .when(
                     user.is_none()
                         && is_signed_out_or_auth_error
-                        && TitleBarSettings::get_global(cx).show_sign_in,
+                        && TitleBarSettings::get_global(cx).show_sign_in
+                        // The browser build has no sign-in (BUILD-SPEC 3.2); the shell page
+                        // owns authentication.
+                        && self.client.sign_in_supported(),
                     |this| this.child(self.render_sign_in_button(cx)),
                 )
                 .when(is_signing_in, |this| {
@@ -459,6 +472,7 @@ impl TitleBar {
         let git_store = project.read(cx).git_store().clone();
         let user_store = workspace.app_state().user_store.clone();
         let client = workspace.app_state().client.clone();
+        #[cfg(not(target_family = "wasm"))]
         let active_call = ActiveCall::global(cx);
 
         let platform_style = PlatformStyle::platform();
@@ -482,6 +496,7 @@ impl TitleBar {
             }),
         );
 
+        #[cfg(not(target_family = "wasm"))]
         subscriptions.push(cx.observe(&active_call, |this, _, cx| this.active_call_changed(cx)));
         subscriptions.push(
             cx.subscribe(&git_store, move |_, _, event, cx| match event {
@@ -624,6 +639,7 @@ impl TitleBar {
             RemoteConnectionOptions::Docker(_dev_container_connection) => {
                 (None, "Dev Container", IconName::Box)
             }
+            RemoteConnectionOptions::WebSocket(_) => (None, "Cloud Workspace", IconName::Server),
             #[cfg(any(test, feature = "test-support"))]
             RemoteConnectionOptions::Mock(_) => (None, "Mock Remote Project", IconName::Server),
         };
@@ -1113,11 +1129,17 @@ impl TitleBar {
         )
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn active_call_changed(&mut self, cx: &mut Context<Self>) {
         self.observe_diagnostics(cx);
         cx.notify();
     }
 
+    /// The browser build has no calls, so there are no room diagnostics to observe.
+    #[cfg(target_family = "wasm")]
+    fn observe_diagnostics(&mut self, _: &mut Context<Self>) {}
+
+    #[cfg(not(target_family = "wasm"))]
     fn observe_diagnostics(&mut self, cx: &mut Context<Self>) {
         let diagnostics = ActiveCall::global(cx)
             .read(cx)
@@ -1131,6 +1153,7 @@ impl TitleBar {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn share_project(&mut self, cx: &mut Context<Self>) {
         let active_call = ActiveCall::global(cx);
         let project = self.project.clone();
@@ -1139,6 +1162,7 @@ impl TitleBar {
             .detach_and_log_err(cx);
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn unshare_project(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         let active_call = ActiveCall::global(cx);
         let project = self.project.clone();
@@ -1164,6 +1188,11 @@ impl TitleBar {
                     .tooltip(Tooltip::text("Disconnected"))
                     .into_any_element(),
             ),
+            // A browser tab's build is pinned by the shell page, so "update Zed" is
+            // meaningless there; the desktop arm offers the updater.
+            #[cfg(target_family = "wasm")]
+            client::Status::UpgradeRequired => None,
+            #[cfg(not(target_family = "wasm"))]
             client::Status::UpgradeRequired => {
                 let auto_updater = auto_update::AutoUpdater::get(cx);
                 let label = match auto_updater.map(|auto_update| auto_update.read(cx).status()) {

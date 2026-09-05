@@ -13,6 +13,7 @@ pub use settings::OpenRouterAvailableModel as AvailableModel;
 pub use settings::OpenRouterProvider as Provider;
 use std::{convert::TryFrom, io, time::Duration};
 use thiserror::Error;
+use web_time::{SystemTime, UNIX_EPOCH};
 
 pub const OPEN_ROUTER_API_URL: &str = "https://openrouter.ai/api/v1";
 const OPEN_ROUTER_APP_TITLE: &str = "Zed";
@@ -21,8 +22,8 @@ fn extract_retry_after(headers: &http::HeaderMap) -> Option<std::time::Duration>
     if let Some(reset) = headers.get("X-RateLimit-Reset") {
         if let Ok(s) = reset.to_str() {
             if let Ok(epoch_ms) = s.parse::<u64>() {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64;
                 if epoch_ms > now {

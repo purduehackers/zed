@@ -3,7 +3,7 @@ use async_recursion::async_recursion;
 use collections::HashSet;
 use futures::future::join_all;
 use gpui::{AppContext as _, AsyncWindowContext, Axis, Entity, Task, WeakEntity};
-use project::Project;
+use project::{Project, terminals::RemoteTerminalGone};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use ui::{App, Context, Window};
@@ -337,7 +337,19 @@ fn deserialize_terminal_views(
         deserialized_items
             .await
             .into_iter()
-            .filter_map(|item| item.log_err())
+            .filter_map(|item| match item {
+                Ok(item) => Some(item),
+                Err(error) => {
+                    // A remote terminal the server no longer has is dropped: the
+                    // expected outcome after a sandbox stop, not a failure.
+                    if let Some(gone) = error.downcast_ref::<RemoteTerminalGone>() {
+                        log::info!("dropping restored terminal: {gone}");
+                    } else {
+                        log::error!("failed to deserialize terminal: {error:#}");
+                    }
+                    None
+                }
+            })
             .collect()
     }
 }
@@ -450,6 +462,13 @@ impl Domain for TerminalDb {
         sql! (
             ALTER TABLE terminals ADD COLUMN custom_title TEXT;
         ),
+        // Terminals whose PTY lives in a remote server outlive the client, so a
+        // restored tab reattaches to the terminal it had instead of spawning a
+        // new shell (D4). Null for local, ssh, wsl and docker terminals.
+        sql! (
+            ALTER TABLE terminals ADD COLUMN remote_terminal_id INTEGER;
+            ALTER TABLE terminals ADD COLUMN remote_title TEXT;
+        ),
     ];
 }
 
@@ -540,5 +559,104 @@ impl TerminalDb {
             FROM terminals
             WHERE item_id = ? AND workspace_id = ?
         }
+    }
+
+    /// Records which remote terminal this tab is attached to, so the next
+    /// session can reattach to it rather than spawn a new shell (D4).
+    pub async fn save_remote_terminal(
+        &self,
+        item_id: ItemId,
+        workspace_id: WorkspaceId,
+        remote_terminal_id: Option<u64>,
+        remote_title: Option<String>,
+    ) -> Result<()> {
+        log::debug!(
+            "Saving remote terminal {remote_terminal_id:?} for item {item_id} in workspace {workspace_id:?}"
+        );
+        self.write(move |conn| {
+            let query =
+                "INSERT INTO terminals (item_id, workspace_id, remote_terminal_id, remote_title)
+                VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT (workspace_id, item_id) DO UPDATE SET
+                    remote_terminal_id = excluded.remote_terminal_id,
+                    remote_title = excluded.remote_title";
+            let mut statement = Statement::prepare(conn, query)?;
+            let mut next_index = statement.bind(&item_id, 1)?;
+            next_index = statement.bind(&workspace_id, next_index)?;
+            next_index = statement.bind(&remote_terminal_id, next_index)?;
+            statement.bind(&remote_title, next_index)?;
+            statement.exec()
+        })
+        .await
+    }
+
+    query! {
+        pub fn get_remote_terminal(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<(Option<u64>, Option<String>)>> {
+            SELECT remote_terminal_id, remote_title
+            FROM terminals
+            WHERE item_id = ? AND workspace_id = ?
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    async fn remote_terminal_row_roundtrips_u64(cx: &mut TestAppContext) {
+        let (db, workspace_db) = cx.update(|cx| {
+            cx.set_global(db::AppDatabase::test_new());
+            (TerminalDb::global(cx), WorkspaceDb::global(cx))
+        });
+        // `terminals` rows reference `workspaces`, so mint a real workspace id.
+        let workspace_id = workspace_db.next_id().await.unwrap();
+
+        // Ids above `i64::MAX` survive the bit-cast through SQLite's INTEGER.
+        db.save_remote_terminal(
+            1,
+            workspace_id,
+            Some(u64::MAX - 5),
+            Some("host — Terminal".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_remote_terminal(1, workspace_id).unwrap(),
+            Some((Some(u64::MAX - 5), Some("host — Terminal".to_string())))
+        );
+
+        // Saving `None` clears both columns.
+        db.save_remote_terminal(1, workspace_id, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_remote_terminal(1, workspace_id).unwrap(),
+            Some((None, None))
+        );
+
+        // A row written by the pre-existing queries reads back as "not remote",
+        // and the remote columns leave the existing ones alone.
+        db.save_working_directory(2, workspace_id, PathBuf::from("/tmp"))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_remote_terminal(2, workspace_id).unwrap(),
+            Some((None, None))
+        );
+        db.save_remote_terminal(2, workspace_id, Some(3), Some("t".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_working_directory(2, workspace_id).unwrap(),
+            Some(PathBuf::from("/tmp"))
+        );
+        assert_eq!(
+            db.get_remote_terminal(2, workspace_id).unwrap(),
+            Some((Some(3), Some("t".to_string())))
+        );
+
+        assert_eq!(db.get_remote_terminal(3, workspace_id).unwrap(), None);
     }
 }

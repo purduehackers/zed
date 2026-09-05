@@ -15,9 +15,9 @@ use std::{
     time::Duration,
 };
 use text::LineEnding;
-use util::{
-    ResultExt, get_default_system_shell_preferring_bash, rel_path::RelPath, shell::ShellKind,
-};
+#[cfg(not(target_family = "wasm"))]
+use util::get_default_system_shell_preferring_bash;
+use util::{ResultExt, rel_path::RelPath, shell::ShellKind};
 
 pub const RULES_FILE_NAMES: &[&str] = &[
     ".rules",
@@ -30,6 +30,23 @@ pub const RULES_FILE_NAMES: &[&str] = &[
     "CLAUDE.md",
     "GEMINI.md",
 ];
+
+/// The shell name reported to the model in the project context.
+///
+/// Natively this is the kind of the user's default system shell (preferring bash on
+/// Windows). The browser has no local shell to detect, so it reports the POSIX kind:
+/// the remote server's default shell (`$SHELL` or `/bin/sh`, so `bash` or `sh`) maps to
+/// `ShellKind::Posix` as well.
+fn default_shell_name() -> String {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        ShellKind::new(&get_default_system_shell_preferring_bash(), cfg!(windows)).to_string()
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        ShellKind::Posix.to_string()
+    }
+}
 
 #[derive(Default, Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct ProjectContext {
@@ -58,8 +75,7 @@ impl ProjectContext {
             has_rules,
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
-            shell: ShellKind::new(&get_default_system_shell_preferring_bash(), cfg!(windows))
-                .to_string(),
+            shell: default_shell_name(),
             skills: Vec::new(),
             has_skills: false,
         }

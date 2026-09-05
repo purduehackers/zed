@@ -1,18 +1,24 @@
 use anyhow::{Context as _, Result, anyhow};
+#[cfg(not(target_family = "wasm"))]
 use async_compression::futures::bufread::GzipDecoder;
+#[cfg(not(target_family = "wasm"))]
 use async_tar::Archive;
 use async_trait::async_trait;
 use collections::HashMap;
 pub use dap_types::{StartDebuggingRequestArguments, StartDebuggingRequestArgumentsRequest};
 use fs::Fs;
+#[cfg(not(target_family = "wasm"))]
 use futures::io::BufReader;
 use gpui::{AsyncApp, SharedString};
-pub use http_client::{HttpClient, github::latest_github_release};
+pub use http_client::HttpClient;
+#[cfg(not(target_family = "wasm"))]
+pub use http_client::github::latest_github_release;
 use language::{LanguageName, LanguageToolchainStore};
 use node_runtime::NodeRuntime;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::WorktreeId;
+#[cfg(not(target_family = "wasm"))]
 use smol::fs::File;
 use std::{
     borrow::Borrow,
@@ -24,7 +30,9 @@ use std::{
     sync::Arc,
 };
 use task::{DebugScenario, TcpArgumentsTemplate, ZedDebugConfig};
-use util::{archive::extract_zip, rel_path::RelPath};
+#[cfg(not(target_family = "wasm"))]
+use util::archive::extract_zip;
+use util::rel_path::RelPath;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DapStatus {
@@ -271,6 +279,7 @@ pub struct GithubRepo {
     pub repo_owner: String,
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub async fn download_adapter_from_github(
     adapter_name: DebugAdapterName,
     github_version: AdapterVersion,
@@ -343,6 +352,19 @@ pub async fn download_adapter_from_github(
     .await;
 
     Ok(version_path)
+}
+
+/// The browser has no filesystem to install a debug adapter into (and no `util::archive` to
+/// unpack one with), so this only reports the gap.
+#[cfg(target_family = "wasm")]
+pub async fn download_adapter_from_github(
+    adapter_name: DebugAdapterName,
+    github_version: AdapterVersion,
+    file_type: DownloadedFileType,
+    delegate: &dyn DapDelegate,
+) -> Result<PathBuf> {
+    let _ = (github_version, file_type, delegate);
+    anyhow::bail!("downloading the {adapter_name} debug adapter is not supported in the browser")
 }
 
 #[async_trait(?Send)]

@@ -1,4 +1,11 @@
+pub mod client_state;
+pub mod control;
+pub mod extensions;
 mod headless_project;
+pub mod ports;
+pub mod pty;
+#[cfg(feature = "serve")]
+pub mod serve;
 
 #[cfg(test)]
 mod remote_editing_tests;
@@ -6,7 +13,9 @@ mod remote_editing_tests;
 #[cfg(windows)]
 pub mod windows;
 
-pub use headless_project::{HeadlessAppState, HeadlessProject};
+pub use headless_project::{HeadlessAppState, HeadlessProject, SandboxConfig, SandboxRuntime};
+#[cfg(feature = "serve")]
+pub use serve::ServeArgs;
 
 use anyhow::{Context as _, Result, anyhow};
 use clap::Subcommand;
@@ -72,6 +81,10 @@ pub enum Commands {
         stdout_socket: PathBuf,
         #[arg(long)]
         stderr_socket: PathBuf,
+        /// Override the data and configuration directory (`paths::set_custom_data_dir`).
+        /// The client never passes it; tests and sandboxes with a read-only home do.
+        #[arg(long)]
+        user_data_dir: Option<PathBuf>,
     },
     Proxy {
         #[arg(long)]
@@ -79,6 +92,8 @@ pub enum Commands {
         #[arg(long)]
         identifier: String,
     },
+    #[cfg(feature = "serve")]
+    Serve(serve::ServeArgs),
     Version,
 }
 
@@ -93,17 +108,23 @@ pub fn run(command: Commands) -> anyhow::Result<()> {
             stdin_socket,
             stdout_socket,
             stderr_socket,
+            user_data_dir,
         } => execute_run(
             log_file,
             pid_file,
             stdin_socket,
             stdout_socket,
             stderr_socket,
+            user_data_dir,
         ),
         Commands::Proxy {
             identifier,
             reconnect,
         } => execute_proxy(identifier, reconnect).context("running proxy on the remote server"),
+        #[cfg(feature = "serve")]
+        Commands::Serve(args) => {
+            serve::execute_serve(args).context("running serve on the remote server")
+        }
         Commands::Version => {
             let release_channel = *RELEASE_CHANNEL;
             match release_channel {
@@ -154,14 +175,14 @@ fn init_logging_proxy() {
 
 const REMOTE_SERVER_LOG_MAX_BYTES: u64 = 1024 * 1024;
 
-struct RotatingLogFile {
+pub(crate) struct RotatingLogFile {
     path: PathBuf,
     file: File,
     size_bytes: u64,
 }
 
 impl RotatingLogFile {
-    fn open(path: &Path) -> Result<Self> {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
         if std::fs::metadata(path)
             .map(|metadata| metadata.len() >= REMOTE_SERVER_LOG_MAX_BYTES)
             .unwrap_or(false)
@@ -311,7 +332,7 @@ fn init_logging_server(log_file_path: &Path) -> Result<Receiver<Vec<u8>>> {
 /// `telemetry::event!` calls are silently dropped. The client attributes these
 /// events to the remote host using the platform it already detected during
 /// connection setup, so no OS metadata needs to be sent here.
-fn init_telemetry_forwarding(session: AnyProtoClient, cx: &mut App) {
+pub(crate) fn init_telemetry_forwarding(session: AnyProtoClient, cx: &mut App) {
     let (tx, mut rx) = mpsc::unbounded::<telemetry::Event>();
     telemetry::init(tx);
 
@@ -331,7 +352,10 @@ fn init_telemetry_forwarding(session: AnyProtoClient, cx: &mut App) {
     .detach();
 }
 
-fn handle_crash_files_requests(project: &Entity<HeadlessProject>, client: &AnyProtoClient) {
+pub(crate) fn handle_crash_files_requests(
+    project: &Entity<HeadlessProject>,
+    client: &AnyProtoClient,
+) {
     client.add_request_handler(
         project.downgrade(),
         |_, _: TypedEnvelope<proto::GetCrashFiles>, _cx| async move {
@@ -539,7 +563,20 @@ fn start_server(
     RemoteClient::proto_client_from_channels(incoming_rx, outgoing_tx, cx, "server", is_wsl_interop)
 }
 
-fn init_paths() -> anyhow::Result<()> {
+/// Applies a `--user-data-dir` override before any path is resolved.
+pub(crate) fn set_user_data_dir(dir: Option<&Path>) -> anyhow::Result<()> {
+    let Some(dir) = dir else {
+        return Ok(());
+    };
+    let dir = dir
+        .to_str()
+        .with_context(|| format!("--user-data-dir {dir:?} is not valid UTF-8"))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating data directory {dir:?}"))?;
+    paths::set_custom_data_dir(dir);
+    Ok(())
+}
+
+pub(crate) fn init_paths() -> anyhow::Result<()> {
     for path in [
         paths::config_dir(),
         paths::extensions_dir(),
@@ -563,40 +600,15 @@ pub fn execute_run(
     stdin_socket: PathBuf,
     stdout_socket: PathBuf,
     stderr_socket: PathBuf,
+    user_data_dir: Option<PathBuf>,
 ) -> Result<()> {
+    set_user_data_dir(user_data_dir.as_deref())?;
     init_paths()?;
 
     let startup_time = Instant::now();
     let app = gpui_platform::headless();
     let pid = std::process::id();
-    let id = pid.to_string();
-    let should_install_crash_handler =
-        client::telemetry::should_install_crash_handler(*RELEASE_CHANNEL);
-
-    let crash_handler = if should_install_crash_handler {
-        Some(app.background_executor().spawn(crashes::init(
-            crashes::InitCrashHandler {
-                session_id: id,
-                zed_version: VERSION.to_owned(),
-                binary: "zed-remote-server".to_string(),
-                release_channel: release_channel::RELEASE_CHANNEL_NAME.clone(),
-                commit_sha: option_env!("ZED_COMMIT_SHA").unwrap_or("no_sha").to_owned(),
-            },
-            {
-                let background_executor = app.background_executor();
-                move |task| {
-                    background_executor.spawn(task).detach();
-                }
-            },
-            |pid| paths::temp_dir().join(format!("zed-remote-server-crash-handler-{pid}")),
-            // we are running outside gpui
-            #[allow(clippy::disallowed_methods)]
-            |duration| FutureExt::map(Timer::after(duration), |_| ()),
-        )))
-    } else {
-        crashes::force_backtrace();
-        None
-    };
+    let crash_handler = init_crash_handler(&app, "zed-remote-server");
     let log_rx = init_logging_server(&log_file)?;
     log::info!(
         "starting up with PID {}:\npid_file: {:?}, log_file: {:?}, stdin_socket: {:?}, stdout_socket: {:?}, stderr_socket: {:?}",
@@ -613,12 +625,7 @@ pub fn execute_run(
 
     let listeners = ServerListeners::new(stdin_socket, stdout_socket, stderr_socket)?;
 
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(std::thread::available_parallelism().map_or(1, |n| n.get().div_ceil(2)))
-        .stack_size(10 * 1024 * 1024)
-        .thread_name(|ix| format!("RayonWorker{}", ix))
-        .build_global()
-        .unwrap();
+    init_rayon_pool();
 
     #[cfg(unix)]
     let shell_env_loaded_rx = {
@@ -672,11 +679,88 @@ pub fn execute_run(
         dap_adapters::init(cx);
 
         extension::init(cx);
-        let extension_host_proxy = ExtensionHostProxy::global(cx);
-
         json_schema_store::init(cx);
 
-        let project = cx.new(|cx| {
+        let project = build_headless_project(session.clone(), shell_env_loaded_rx, startup_time, cx);
+
+        handle_crash_files_requests(&project, &session);
+
+        cx.background_spawn(async move {
+            cleanup_old_binaries_wsl();
+            cleanup_old_binaries()
+        })
+        .detach();
+
+        mem::forget(project);
+    };
+    // We do not reuse any of the state after unwinding, so we don't run risk of observing broken invariants.
+    let app = std::panic::AssertUnwindSafe(app);
+    let run = std::panic::AssertUnwindSafe(run);
+    let res = std::panic::catch_unwind(move || { app }.0.run({ run }.0));
+    if let Err(_) = res {
+        log::error!("app panicked. quitting.");
+        Err(anyhow::anyhow!("panicked"))
+    } else {
+        log::info!("gpui app is shut down. quitting.");
+        Ok(())
+    }
+}
+
+/// Spawns the crash handler when telemetry allows it; `binary` names this process in crash
+/// reports. Returns the task that resolves to the handler client.
+pub(crate) fn init_crash_handler(
+    app: &gpui::Application,
+    binary: &'static str,
+) -> Option<gpui::Task<Arc<crashes::Client>>> {
+    let id = std::process::id().to_string();
+    let should_install_crash_handler =
+        client::telemetry::should_install_crash_handler(*RELEASE_CHANNEL);
+    if should_install_crash_handler {
+        Some(app.background_executor().spawn(crashes::init(
+            crashes::InitCrashHandler {
+                session_id: id,
+                zed_version: VERSION.to_owned(),
+                binary: binary.to_string(),
+                release_channel: release_channel::RELEASE_CHANNEL_NAME.clone(),
+                commit_sha: option_env!("ZED_COMMIT_SHA").unwrap_or("no_sha").to_owned(),
+            },
+            {
+                let background_executor = app.background_executor();
+                move |task| {
+                    background_executor.spawn(task).detach();
+                }
+            },
+            |pid| paths::temp_dir().join(format!("zed-remote-server-crash-handler-{pid}")),
+            // we are running outside gpui
+            #[allow(clippy::disallowed_methods)]
+            |duration| FutureExt::map(Timer::after(duration), |_| ()),
+        )))
+    } else {
+        crashes::force_backtrace();
+        None
+    }
+}
+
+/// Installs the global rayon pool used by the language and git machinery.
+pub(crate) fn init_rayon_pool() {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(std::thread::available_parallelism().map_or(1, |n| n.get().div_ceil(2)))
+        .stack_size(10 * 1024 * 1024)
+        .thread_name(|ix| format!("RayonWorker{}", ix))
+        .build_global()
+        .unwrap();
+}
+
+/// Builds the `HeadlessProject` entity with the real filesystem, HTTP client, node runtime
+/// and language registry; shared by `run` and `serve`.
+pub(crate) fn build_headless_project(
+    session: AnyProtoClient,
+    shell_env_loaded_rx: Option<oneshot::Receiver<()>>,
+    startup_time: Instant,
+    cx: &mut App,
+) -> Entity<HeadlessProject> {
+    let extension_host_proxy = ExtensionHostProxy::global(cx);
+    cx.new(|cx| {
             let fs = Arc::new(RealFs::new(None, cx.background_executor().clone()));
             let node_settings_rx = initialize_settings(session.clone(), fs.clone(), cx);
 
@@ -718,29 +802,7 @@ pub fn execute_run(
                 true,
                 cx,
             )
-        });
-
-        handle_crash_files_requests(&project, &session);
-
-        cx.background_spawn(async move {
-            cleanup_old_binaries_wsl();
-            cleanup_old_binaries()
-        })
-        .detach();
-
-        mem::forget(project);
-    };
-    // We do not reuse any of the state after unwinding, so we don't run risk of observing broken invariants.
-    let app = std::panic::AssertUnwindSafe(app);
-    let run = std::panic::AssertUnwindSafe(run);
-    let res = std::panic::catch_unwind(move || { app }.0.run({ run }.0));
-    if let Err(_) = res {
-        log::error!("app panicked. quitting.");
-        Err(anyhow::anyhow!("panicked"))
-    } else {
-        log::info!("gpui app is shut down. quitting.");
-        Ok(())
-    }
+    })
 }
 
 #[derive(Debug, Error)]

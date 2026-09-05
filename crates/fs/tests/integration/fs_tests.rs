@@ -1,4 +1,5 @@
 mod fake_git_repo_tests;
+mod wasm_fs_tests;
 
 use std::{
     collections::BTreeSet,

@@ -7,11 +7,13 @@ use crate::{
 };
 mod filter;
 
+#[cfg(not(target_family = "wasm"))]
 use dev_container::{
     DevContainerConfig, DevContainerContext, find_devcontainer_configs,
     start_dev_container_with_config,
 };
 use editor::Editor;
+#[cfg(not(target_family = "wasm"))]
 use extension_host::ExtensionStore;
 use filter::{FilterData, FilteredServer};
 use futures::{FutureExt, StreamExt as _, channel::oneshot, future::Shared};
@@ -63,6 +65,7 @@ pub struct RemoteServerProjects {
     ssh_config_updates: Task<()>,
     ssh_config_servers: BTreeSet<SharedString>,
     create_new_window: bool,
+    #[cfg(not(target_family = "wasm"))]
     dev_container_picker: Option<Entity<Picker<DevContainerPickerDelegate>>>,
     _subscriptions: Vec<Subscription>,
     allow_dismissal: bool,
@@ -90,6 +93,7 @@ impl CreateRemoteServer {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum DevContainerCreationProgress {
     SelectingConfig,
@@ -97,6 +101,7 @@ enum DevContainerCreationProgress {
     Error(String),
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[derive(Clone)]
 struct CreateRemoteDevContainer {
     view_logs_entry: NavigableEntry,
@@ -104,6 +109,7 @@ struct CreateRemoteDevContainer {
     progress: DevContainerCreationProgress,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl CreateRemoteDevContainer {
     fn new(progress: DevContainerCreationProgress, cx: &mut Context<RemoteServerProjects>) -> Self {
         let view_logs_entry = NavigableEntry::focusable(cx);
@@ -178,12 +184,14 @@ struct EditNicknameState {
     editor: Entity<Editor>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 struct DevContainerPickerDelegate {
     selected_index: usize,
     candidates: Vec<DevContainerConfig>,
     matching_candidates: Vec<DevContainerConfig>,
     parent_modal: WeakEntity<RemoteServerProjects>,
 }
+#[cfg(not(target_family = "wasm"))]
 impl DevContainerPickerDelegate {
     fn new(
         candidates: Vec<DevContainerConfig>,
@@ -198,6 +206,7 @@ impl DevContainerPickerDelegate {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl PickerDelegate for DevContainerPickerDelegate {
     type ListItem = AnyElement;
 
@@ -411,6 +420,12 @@ impl ProjectPicker {
             RemoteConnectionOptions::Docker(_) => ProjectPickerData::Ssh {
                 // Not implemented as a project picker at this time
                 connection_string: "".into(),
+                nickname: None,
+            },
+            RemoteConnectionOptions::WebSocket(options) => ProjectPickerData::Ssh {
+                // Display only: the WebSocket transport allows one session per connection,
+                // so the directory picker's second client cannot attach to it.
+                connection_string: options.display_name().into(),
                 nickname: None,
             },
             #[cfg(any(test, feature = "test-support"))]
@@ -795,6 +810,7 @@ enum Mode {
     EditNickname(EditNicknameState),
     ProjectPicker(Entity<ProjectPicker>),
     CreateRemoteServer(CreateRemoteServer),
+    #[cfg(not(target_family = "wasm"))]
     CreateRemoteDevContainer(CreateRemoteDevContainer),
     #[cfg(target_os = "windows")]
     AddWslDistro(AddWslDistro),
@@ -1153,6 +1169,7 @@ impl PickerDelegate for RemoteServerPickerDelegate {
                     .ok();
             }
             RemoteMatch::AddDevContainer => {
+                #[cfg(not(target_family = "wasm"))]
                 remote_server_projects
                     .update(cx, |this, cx| {
                         this.init_dev_container_mode(window, cx);
@@ -1423,6 +1440,7 @@ impl RemoteServerProjects {
 
     /// Creates a new RemoteServerProjects modal that opens directly in dev container creation mode.
     /// Used when suggesting dev container connection from toast notification.
+    #[cfg(not(target_family = "wasm"))]
     pub fn new_dev_container(
         fs: Arc<dyn Fs>,
         configs: Vec<DevContainerConfig>,
@@ -1540,6 +1558,7 @@ impl RemoteServerProjects {
             ssh_config_updates,
             ssh_config_servers: BTreeSet::new(),
             create_new_window,
+            #[cfg(not(target_family = "wasm"))]
             dev_container_picker: None,
             _subscriptions: vec![settings_subscription, dismiss_subscription],
             allow_dismissal: true,
@@ -1762,6 +1781,7 @@ impl RemoteServerProjects {
         cx.notify();
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn view_in_progress_dev_container(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.allow_dismissal = false;
         self.mode = Mode::CreateRemoteDevContainer(CreateRemoteDevContainer::new(
@@ -1890,6 +1910,7 @@ impl RemoteServerProjects {
 
                 self.create_ssh_server(state.address_editor.clone(), window, cx);
             }
+            #[cfg(not(target_family = "wasm"))]
             Mode::CreateRemoteDevContainer(_) => {}
             Mode::EditNickname(state) => {
                 let text = Some(state.editor.read(cx).text(cx)).filter(|text| !text.is_empty());
@@ -1928,6 +1949,7 @@ impl RemoteServerProjects {
                 self.mode = Mode::CreateRemoteServer(new_state);
                 cx.notify();
             }
+            #[cfg(not(target_family = "wasm"))]
             Mode::CreateRemoteDevContainer(CreateRemoteDevContainer {
                 progress: DevContainerCreationProgress::Error(_),
                 ..
@@ -2138,6 +2160,7 @@ impl RemoteServerProjects {
         });
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn edit_in_dev_container_json(
         &mut self,
         config: Option<DevContainerConfig>,
@@ -2198,6 +2221,7 @@ impl RemoteServerProjects {
         cx.notify();
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn init_dev_container_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let configs = self
             .workspace
@@ -2231,6 +2255,7 @@ impl RemoteServerProjects {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn open_dev_container(
         &self,
         config: Option<DevContainerConfig>,
@@ -2318,6 +2343,7 @@ impl RemoteServerProjects {
         .detach();
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn render_create_dev_container(
         &self,
         state: &CreateRemoteDevContainer,
@@ -2453,6 +2479,7 @@ impl RemoteServerProjects {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn render_config_selection(
         &self,
         window: &mut Window,
@@ -3099,6 +3126,7 @@ impl Render for RemoteServerProjects {
                 Mode::CreateRemoteServer(state) => self
                     .render_create_remote_server(state, window, cx)
                     .into_any_element(),
+                #[cfg(not(target_family = "wasm"))]
                 Mode::CreateRemoteDevContainer(state) => self
                     .render_create_dev_container(state, window, cx)
                     .into_any_element(),

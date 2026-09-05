@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Puts a verified wasi-sdk (the release pinned in script/wasi-sdk-env) at target/wasi-sdk, for
+# script/wasm-cc and script/wasm-ar. Run by script/check-wasm; safe to run on its own.
+#   script/ensure-wasi-sdk
+#
+# The release tarball for this (arch, os) is downloaded to a temporary directory, its SHA-256 is
+# compared with script/wasi-sdk.sha256, and only a matching archive is extracted. The digest is
+# then written to target/wasi-sdk/.zs-sha256, which is how a later run tells a verified tree
+# from one that script/download-wasi-sdk (upstream's unverified fetch for extension builds)
+# left there: such a tree is replaced. With `WASI_SDK_PATH` set nothing is downloaded; the SDK
+# there only has to be the pinned version (script/wasm-cc checks that on every call as well).
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+. script/wasi-sdk-env
+
+if [[ -n "${WASI_SDK_PATH:-}" ]]; then
+    wasi_sdk_check script/ensure-wasi-sdk
+    exit 0
+fi
+
+case "$(uname -m)" in
+    x86_64) arch=x86_64 ;;
+    arm64|aarch64) arch=arm64 ;;
+    *)
+        echo "script/ensure-wasi-sdk: unsupported architecture $(uname -m)" >&2
+        exit 1 ;;
+esac
+case "$(uname -s)" in
+    Darwin) os=macos ;;
+    Linux) os=linux ;;
+    *)
+        echo "script/ensure-wasi-sdk: wasm builds are supported on macOS and Linux only" >&2
+        exit 1 ;;
+esac
+
+release="wasi-sdk-${WASI_SDK_VERSION}-${arch}-${os}"
+asset="${release}.tar.gz"
+expected="$(awk -v asset="$asset" '$2 == asset { print $1 }' script/wasi-sdk.sha256)"
+if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "script/ensure-wasi-sdk: no SHA-256 for $asset in script/wasi-sdk.sha256" >&2
+    exit 1
+fi
+
+sdk="target/wasi-sdk"
+stamp="$sdk/.zs-sha256"
+if [[ -x "$sdk/bin/clang" && -f "$stamp" && "$(cat "$stamp")" == "$expected" ]]; then
+    wasi_sdk_check script/ensure-wasi-sdk
+    exit 0
+fi
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{ print $1 }'
+    else
+        shasum -a 256 "$1" | awk '{ print $1 }'
+    fi
+}
+
+url="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION%%.*}/${asset}"
+mkdir -p target
+tmp="$(mktemp -d "target/wasi-sdk.tmp.XXXXXX")"
+trap 'rm -rf "$tmp"' EXIT
+
+echo "ensure-wasi-sdk: downloading $url"
+curl -fsSL --retry 3 -o "$tmp/$asset" "$url"
+actual="$(sha256_of "$tmp/$asset")"
+if [[ "$actual" != "$expected" ]]; then
+    echo "script/ensure-wasi-sdk: SHA-256 mismatch for $asset (not extracted)" >&2
+    echo "  expected $expected  (script/wasi-sdk.sha256)" >&2
+    echo "  actual   $actual" >&2
+    exit 1
+fi
+
+tar -xzf "$tmp/$asset" -C "$tmp"
+if [[ ! -x "$tmp/$release/bin/clang" ]]; then
+    echo "script/ensure-wasi-sdk: $asset did not contain $release/bin/clang" >&2
+    exit 1
+fi
+printf '%s\n' "$expected" > "$tmp/$release/.zs-sha256"
+# An unverified tree (script/download-wasi-sdk) or one from a different pin is replaced.
+rm -rf "$sdk"
+mv "$tmp/$release" "$sdk"
+wasi_sdk_check script/ensure-wasi-sdk
+echo "ensure-wasi-sdk: wasi-sdk $WASI_SDK_VERSION verified (sha256 $expected) at $sdk"

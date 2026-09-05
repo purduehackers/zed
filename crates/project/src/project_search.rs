@@ -372,23 +372,35 @@ impl Search {
                     let num_cpus = _executor.num_cpus();
 
                     assert!(num_cpus > 0);
+                    let worker_count = (num_cpus - 1).max(1);
+                    let workers = (0..worker_count)
+                        .map(|_| Worker {
+                            query: query.clone(),
+                            open_buffers: open_buffers.clone(),
+                            candidates: candidate_searcher.clone(),
+                            find_all_matches_rx: find_all_matches_rx.clone(),
+                        })
+                        .collect::<Vec<_>>();
+                    drop(find_all_matches_rx);
+                    drop(candidate_searcher);
+
+                    #[cfg(not(target_family = "wasm"))]
                     _executor
                         .scoped(|scope| {
-                            let worker_count = (num_cpus - 1).max(1);
-                            for _ in 0..worker_count {
-                                let worker = Worker {
-                                    query: query.clone(),
-                                    open_buffers: open_buffers.clone(),
-                                    candidates: candidate_searcher.clone(),
-                                    find_all_matches_rx: find_all_matches_rx.clone(),
-                                };
+                            for worker in workers {
                                 scope.spawn(worker.run());
                             }
-
-                            drop(find_all_matches_rx);
-                            drop(candidate_searcher);
                         })
                         .await;
+                    // `BackgroundExecutor::scoped` blocks on drop, which the browser cannot
+                    // do; run the workers as tasks and await them all instead.
+                    #[cfg(target_family = "wasm")]
+                    futures::future::join_all(
+                        workers
+                            .into_iter()
+                            .map(|worker| _executor.spawn(worker.run())),
+                    )
+                    .await;
                 });
 
                 let (sorted_matches_tx, sorted_matches_rx) = unbounded();
@@ -1097,7 +1109,7 @@ impl<T: 'static + Send> AdaptiveBatcher<T> {
             let mut items_produced_so_far = 0_u64;
 
             let mut _schedule_flush_after_delay: Option<Task<()>> = None;
-            let _time_elapsed_since_start_of_search = std::time::Instant::now();
+            let _time_elapsed_since_start_of_search = web_time::Instant::now();
             let mut flush = pin!(flush_batch_rx);
             let mut terminating = false;
             loop {

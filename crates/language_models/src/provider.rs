@@ -5,6 +5,7 @@ use http_client::http::{HeaderName, HeaderValue};
 pub mod anthropic;
 pub mod anthropic_compatible;
 pub mod api_compatible;
+#[cfg(not(target_family = "wasm"))]
 pub mod bedrock;
 pub mod cloud;
 pub mod copilot_chat;
@@ -17,6 +18,9 @@ pub mod ollama;
 pub mod open_ai;
 pub mod open_ai_compatible;
 pub mod open_router;
+// The ChatGPT-subscription provider signs in through a loopback OAuth callback server
+// (`oauth_callback_server`, native-only); the browser build (BUILD-SPEC 3.2) skips it.
+#[cfg(not(target_family = "wasm"))]
 pub mod openai_subscribed;
 pub mod opencode;
 

@@ -48,8 +48,8 @@ use editor::{Editor, SelectionEffects, scroll::Autoscroll};
 use feature_flags::FeatureFlagAppExt as _;
 use fs::Fs;
 use gpui::{
-    Action, App, Context, Entity, ImageSource, ReadGlobal as _, Resource, SharedString, SharedUri,
-    TaskExt, Window, actions,
+    Action, App, Context, Entity, ForegroundExecutor, ImageSource, ReadGlobal as _, Resource,
+    SharedString, SharedUri, TaskExt, Window, actions,
 };
 use language::{
     LanguageRegistry,
@@ -91,6 +91,42 @@ pub use thread_import::{
 };
 use zed_actions;
 pub use zed_actions::{CreateWorktree, NewWorktreeBranchTarget, SwitchWorktree};
+
+/// Runs a [`fuzzy::match_strings`] future to completion on the calling thread.
+///
+/// Natively this parks the thread on `executor` (`ForegroundExecutor::block_on`). The browser's
+/// main thread cannot park, so that method does not exist on wasm; there the future is driven
+/// by [`poll_match_strings_to_completion`] instead.
+pub(crate) fn block_on_match_strings<F: std::future::Future>(
+    executor: &ForegroundExecutor,
+    future: F,
+) -> F::Output {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        executor.block_on(future)
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = executor;
+        poll_match_strings_to_completion(future)
+    }
+}
+
+/// On wasm `fuzzy::match_strings` matches its segments inline on the calling task (it cannot use
+/// `BackgroundExecutor::scoped`, which blocks on drop) and never suspends, so a plain poll loop
+/// drives it to completion without ever parking the thread, which the browser cannot do. This is
+/// the same approach as `editor`'s `block_on_wrap_update`; it must only be handed futures that
+/// resolve without waiting on another task.
+#[cfg(target_family = "wasm")]
+pub(crate) fn poll_match_strings_to_completion<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut poll_cx = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut poll_cx) {
+            return output;
+        }
+    }
+}
 
 pub(crate) fn resolve_agent_image(
     dest_url: &str,

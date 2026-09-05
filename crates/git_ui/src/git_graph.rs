@@ -39,8 +39,10 @@ use std::{
     ops::Range,
     rc::Rc,
     sync::{Arc, OnceLock},
-    time::{Duration, Instant},
+    time::Duration,
 };
+// `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` natively.
+use web_time::Instant;
 use zed_actions::{
     buffer_search,
     search::{SelectNextMatch, SelectPreviousMatch, ToggleCaseSensitive},

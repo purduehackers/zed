@@ -14,6 +14,8 @@ use crate::connection::Connection;
 
 impl Connection {
     fn eager_exec(&self, sql: &str) -> anyhow::Result<()> {
+        #[cfg(target_family = "wasm")]
+        let _guard = crate::wasm_lock::lock();
         let sql_str = CString::new(sql).context("Error creating cstr")?;
         unsafe {
             sqlite3_exec(

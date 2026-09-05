@@ -1,5 +1,7 @@
+use std::sync::Arc;
 use std::time;
-use std::{sync::Arc, time::Instant};
+// `std::time::Instant` natively; on wasm `Instant::now()` panics.
+use web_time::Instant;
 
 use clock::SystemClock;
 

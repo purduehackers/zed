@@ -20,6 +20,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::Engine as _;
 use futures::AsyncReadExt as _;
+#[cfg(not(target_family = "wasm"))]
 use futures::FutureExt as _;
 use futures::channel::mpsc;
 use futures::future::BoxFuture;
@@ -30,8 +31,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use url::Url;
+// `std::time::SystemTime::now()` panics on wasm; `web_time` re-exports `std` on native.
+use web_time::SystemTime;
 
 /// The CIMD URL where Zed's OAuth client metadata document is hosted.
 pub const CIMD_URL: &str = "https://zed.dev/oauth/client-metadata.json";
@@ -1080,6 +1083,7 @@ impl std::fmt::Debug for OAuthCallback {
 impl OAuthCallback {
     /// Parse the query string from a callback URL like
     /// `http://127.0.0.1:<port>/callback?code=...&state=...`.
+    #[cfg(not(target_family = "wasm"))]
     pub fn parse_query(query: &str) -> Result<Self> {
         let params = oauth_callback_server::OAuthCallbackParams::parse_query(query)?;
         Ok(Self {
@@ -1103,6 +1107,7 @@ impl OAuthCallback {
 ///
 /// The callback server shuts down when the returned future is dropped (e.g.
 /// because the authentication task was cancelled), or after a timeout.
+#[cfg(not(target_family = "wasm"))]
 pub fn start_callback_server() -> Result<(String, BoxFuture<'static, Result<OAuthCallback>>)> {
     let (redirect_uri, rx) = oauth_callback_server::start_oauth_callback_server()?;
     let future = async move {
@@ -1119,6 +1124,16 @@ pub fn start_callback_server() -> Result<(String, BoxFuture<'static, Result<OAut
     }
     .boxed();
     Ok((redirect_uri, future))
+}
+
+/// Start a loopback HTTP server to receive the OAuth authorization callback.
+///
+/// The browser cannot bind a loopback listener, so the interactive OAuth flow
+/// cannot complete there and this always fails. The signature matches the
+/// native version so callers need no gates of their own.
+#[cfg(target_family = "wasm")]
+pub fn start_callback_server() -> Result<(String, BoxFuture<'static, Result<OAuthCallback>>)> {
+    bail!("the OAuth callback server is not available in the browser")
 }
 
 // -- JSON fetch helper -------------------------------------------------------

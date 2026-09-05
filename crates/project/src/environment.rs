@@ -1,11 +1,15 @@
-use anyhow::{Context as _, bail};
+#[cfg(not(target_family = "wasm"))]
+use anyhow::Context as _;
+use anyhow::bail;
 use futures::{FutureExt, StreamExt as _, channel::mpsc, future::Shared};
 use language::Buffer;
 use remote::RemoteClient;
 use rpc::proto::{self, REMOTE_SERVER_PROJECT_ID};
 use std::{collections::VecDeque, path::Path, sync::Arc};
 use task::{Shell, shell_to_proto};
-use util::{ResultExt, command::new_command};
+use util::ResultExt;
+#[cfg(not(target_family = "wasm"))]
+use util::command::new_command;
 use worktree::Worktree;
 
 use collections::HashMap;
@@ -310,6 +314,7 @@ impl From<EnvironmentOrigin> for String {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 async fn load_directory_shell_environment(
     shell: Shell,
     abs_path: Arc<Path>,
@@ -387,6 +392,25 @@ async fn load_directory_shell_environment(
     Ok(envs)
 }
 
+/// The browser has no shell to capture an environment from: local projects never exist there,
+/// and the remote server captures directory environments on its side (`util::shell_env` is not
+/// compiled for wasm).
+#[cfg(target_family = "wasm")]
+async fn load_directory_shell_environment(
+    shell: Shell,
+    abs_path: Arc<Path>,
+    _load_direnv: DirenvSettings,
+    tx: mpsc::UnboundedSender<String>,
+) -> anyhow::Result<HashMap<String, String>> {
+    tx.unbounded_send("Failed to load environment variables".into())
+        .ok();
+    bail!(
+        "cannot capture the environment of {shell:?} in {} from the browser",
+        abs_path.display()
+    )
+}
+
+#[cfg(not(target_family = "wasm"))]
 async fn load_direnv_environment(
     env: &HashMap<String, String>,
     dir: &Path,

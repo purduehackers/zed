@@ -1,4 +1,5 @@
-use std::{cmp, path::PathBuf, process::ExitStatus, sync::Arc, time::Duration};
+use std::{cmp, path::PathBuf, sync::Arc, time::Duration};
+use terminal::ExitStatus;
 
 use crate::{
     TerminalView, default_working_directory,
@@ -314,6 +315,16 @@ impl TerminalPanel {
         cx: &mut AsyncWindowContext,
     ) -> Result<bool> {
         let mut restored = false;
+        // Take the server's terminal inventory before any tab is restored: each
+        // restored tab takes its terminal out of it, and whatever is left over is
+        // closed below (D4). A no-op unless the connection hosts PTYs.
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.project().update(cx, |project, cx| {
+                    project.fetch_remote_terminal_inventory(cx)
+                })
+            })?
+            .await;
         if let Some((database_id, serialization_key, kvp)) = workspace
             .read_with(cx, |workspace, cx| {
                 workspace
@@ -333,7 +344,7 @@ impl TerminalPanel {
                 .log_err()
                 .flatten()
         {
-            let started_at = std::time::Instant::now();
+            let started_at = web_time::Instant::now();
             let deserialized = workspace
                 .update_in(cx, |workspace, window, cx| {
                     deserialize_terminal_panel(
@@ -355,6 +366,19 @@ impl TerminalPanel {
                 );
             }
         }
+
+        // Every terminal the restored tabs did not claim - exited shells, tabs
+        // that were closed without the server hearing about it, terminals of a
+        // client that never came back - is closed now. This runs even when there
+        // was no serialized panel at all, which is what keeps the server free of
+        // ghost terminals.
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.project().update(cx, |project, cx| {
+                    project.close_unrestored_remote_terminals(cx)
+                })
+            })
+            .log_err();
 
         // Since panels/docks are loaded outside from the workspace, we cleanup here, instead of through the workspace.
         let cleanup = workspace.update_in(cx, |workspace, window, cx| {
@@ -929,7 +953,7 @@ impl TerminalPanel {
         })
     }
 
-    fn add_terminal_shell(
+    pub fn add_terminal_shell(
         &mut self,
         force_local: bool,
         cwd: Option<PathBuf>,

@@ -18,7 +18,6 @@ test-support = ["remote/test-support"]
 [dependencies]
 anyhow.workspace = true
 askpass.workspace = true
-auto_update.workspace = true
 futures.workspace = true
 gpui.workspace = true
 log.workspace = true
@@ -32,6 +31,11 @@ theme_settings.workspace = true
 ui.workspace = true
 ui_input.workspace = true
 workspace.workspace = true
+
+# The updater (server-binary downloads) is desktop-only; in the browser the sandbox
+# provisions the server (BUILD-SPEC 3.2).
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+auto_update.workspace = true
 
 [dev-dependencies]
 editor.workspace = true

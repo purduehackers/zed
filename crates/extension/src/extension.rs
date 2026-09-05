@@ -1,4 +1,8 @@
 mod capabilities;
+// Compiles extensions with `cargo`/`clang` against the local disk (`std::fs`, `std::env`,
+// `std::time::Instant::now()`); none of that exists in the browser, and nothing in the wasm
+// closure references the builder (its callers are `extension_host` and `extension_cli`).
+#[cfg(not(target_family = "wasm"))]
 pub mod extension_builder;
 mod extension_events;
 mod extension_host_proxy;

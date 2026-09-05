@@ -37,6 +37,8 @@ pub(crate) enum RemoteConnectionKind {
     Ssh,
     Wsl,
     Docker,
+    /// A cloud workspace over the WebSocket transport; identified by `name = workspace_id`.
+    WebSocket,
 }
 
 #[derive(Debug, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
@@ -163,6 +165,7 @@ impl RemoteConnectionKind {
             RemoteConnectionKind::Ssh => "ssh",
             RemoteConnectionKind::Wsl => "wsl",
             RemoteConnectionKind::Docker => "docker",
+            RemoteConnectionKind::WebSocket => "websocket",
         }
     }
 
@@ -171,6 +174,7 @@ impl RemoteConnectionKind {
             "ssh" => Some(Self::Ssh),
             "wsl" => Some(Self::Wsl),
             "docker" => Some(Self::Docker),
+            "websocket" => Some(Self::WebSocket),
             _ => None,
         }
     }

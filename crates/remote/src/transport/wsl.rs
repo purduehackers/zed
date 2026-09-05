@@ -20,7 +20,6 @@ use std::{
     fmt::Write as _,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Instant,
 };
 
 use util::{
@@ -30,6 +29,8 @@ use util::{
     shell::{Shell, ShellKind},
     shell_builder::ShellBuilder,
 };
+// `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` on native.
+use web_time::Instant;
 
 #[derive(
     Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, schemars::JsonSchema,

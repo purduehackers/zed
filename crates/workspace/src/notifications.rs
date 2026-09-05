@@ -466,13 +466,14 @@ pub fn markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
 
 pub mod simple_message_notification {
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use gpui::{
         AnyElement, DismissEvent, EventEmitter, FocusHandle, Focusable, ParentElement, Render,
         ScrollHandle, SharedString, Styled, Task,
     };
     use ui::{CopyButton, Tooltip, WithScrollbar, prelude::*};
+    use web_time::Instant;
 
     use crate::SuppressNotification;
     use crate::workspace_error::{

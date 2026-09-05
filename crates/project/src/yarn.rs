@@ -15,7 +15,9 @@ use anyhow::Result;
 use collections::HashMap;
 use fs::Fs;
 use gpui::{App, AppContext as _, Context, Entity, Task};
-use util::{ResultExt, archive::extract_zip, paths::PathStyle, rel_path::RelPath};
+#[cfg(not(target_family = "wasm"))]
+use util::archive::extract_zip;
+use util::{ResultExt, paths::PathStyle, rel_path::RelPath};
 
 pub(crate) struct YarnPathStore {
     temp_dirs: HashMap<Arc<Path>, tempfile::TempDir>,
@@ -130,9 +132,17 @@ fn zip_path(path: &Path) -> Option<&Path> {
     Some(Path::new(zip_path))
 }
 
+#[cfg(not(target_family = "wasm"))]
 async fn dump_zip(path: Arc<Path>, fs: Arc<dyn Fs>) -> Result<tempfile::TempDir> {
     let dir = tempfile::tempdir()?;
     let contents = fs.load_bytes(&path).await?;
     extract_zip(dir.path(), futures::io::Cursor::new(contents)).await?;
     Ok(dir)
+}
+
+/// Zip paths only ever come from a local language server, which the browser never runs
+/// (`util::archive` is not compiled there).
+#[cfg(target_family = "wasm")]
+async fn dump_zip(path: Arc<Path>, _fs: Arc<dyn Fs>) -> Result<tempfile::TempDir> {
+    anyhow::bail!("cannot unpack {} in the browser", path.display())
 }

@@ -1479,9 +1479,19 @@ impl SettingsObserver {
     ) -> Task<()> {
         let (mut user_tasks_file_rx, watcher_task) =
             watch_config_file(cx.background_executor(), fs, file_path.clone());
-        let user_tasks_content = cx.foreground_executor().block_on(user_tasks_file_rx.next());
+        // Natively the initial document is read synchronously; `block_on` does not exist on
+        // wasm, where the first watcher message (the initial contents) is applied on the
+        // task's first iteration instead.
+        #[cfg(not(target_family = "wasm"))]
+        let initial = Some(cx.foreground_executor().block_on(user_tasks_file_rx.next()));
+        #[cfg(target_family = "wasm")]
+        let initial: Option<Option<String>> = None;
         cx.spawn(async move |settings_observer, cx| {
             let _watcher_task = watcher_task;
+            let user_tasks_content = match initial {
+                Some(content) => content,
+                None => user_tasks_file_rx.next().await,
+            };
             let Ok(task_store) = settings_observer.read_with(cx, |settings_observer, _| {
                 settings_observer.task_store.downgrade()
             }) else {
@@ -1519,9 +1529,19 @@ impl SettingsObserver {
     ) -> Task<()> {
         let (mut user_tasks_file_rx, watcher_task) =
             watch_config_file(cx.background_executor(), fs, file_path.clone());
-        let user_tasks_content = cx.foreground_executor().block_on(user_tasks_file_rx.next());
+        // Natively the initial document is read synchronously; `block_on` does not exist on
+        // wasm, where the first watcher message (the initial contents) is applied on the
+        // task's first iteration instead.
+        #[cfg(not(target_family = "wasm"))]
+        let initial = Some(cx.foreground_executor().block_on(user_tasks_file_rx.next()));
+        #[cfg(target_family = "wasm")]
+        let initial: Option<Option<String>> = None;
         cx.spawn(async move |settings_observer, cx| {
             let _watcher_task = watcher_task;
+            let user_tasks_content = match initial {
+                Some(content) => content,
+                None => user_tasks_file_rx.next().await,
+            };
             let Ok(task_store) = settings_observer.read_with(cx, |settings_observer, _| {
                 settings_observer.task_store.downgrade()
             }) else {
@@ -1630,4 +1650,62 @@ impl From<DapSettingsContent> for DapSettings {
 pub enum DapBinary {
     Default,
     Custom(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::port_store::tests::remote_test_project_with_fs;
+    use crate::task_inventory::TaskSourceKind;
+    use fs::FakeFs;
+    use gpui::TestAppContext;
+    use serde_json::json;
+
+    /// `SettingsObserver::new_remote` reads the global `tasks.json` synchronously on native
+    /// (the `block_on` half of the split that lets the browser read it on the watcher's
+    /// first tick instead) and applies it from the watcher task either way: the tasks are
+    /// in the inventory once the executor has run.
+    #[gpui::test]
+    async fn global_tasks_applied_after_first_tick(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            paths::config_dir(),
+            json!({
+                "tasks.json": r#"[{ "label": "web-global", "command": "echo" }]"#,
+            }),
+        )
+        .await;
+        let (project, _server) = remote_test_project_with_fs(cx, server_cx, fs).await;
+
+        let global_tasks = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                let inventory = project
+                    .read(cx)
+                    .task_store()
+                    .read(cx)
+                    .task_inventory()
+                    .expect("a remote task store has an inventory")
+                    .clone();
+                inventory.read(cx).list_tasks(None, None, None, cx)
+            })
+        };
+        let has_web_global = |tasks: &[(TaskSourceKind, task::TaskTemplate)]| {
+            tasks.iter().any(|(kind, template)| {
+                template.label == "web-global"
+                    && matches!(
+                        kind,
+                        TaskSourceKind::AbsPath { abs_path, .. } if abs_path == paths::tasks_file()
+                    )
+            })
+        };
+
+        cx.run_until_parked();
+        let tasks = global_tasks(cx).await;
+        assert!(
+            has_web_global(&tasks),
+            "not applied after the first tick: {tasks:?}"
+        );
+    }
 }

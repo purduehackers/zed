@@ -2,6 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use askpass::EncryptedPassword;
+#[cfg(not(target_family = "wasm"))]
 use auto_update::AutoUpdater;
 use futures::{FutureExt as _, channel::oneshot, select};
 use gpui::{
@@ -253,6 +254,9 @@ impl RemoteConnectionModal {
                 (options.distro_name.clone(), None, true, false)
             }
             RemoteConnectionOptions::Docker(options) => (options.name.clone(), None, false, true),
+            RemoteConnectionOptions::WebSocket(options) => {
+                (options.display_name(), None, false, false)
+            }
             #[cfg(feature = "test-support")]
             RemoteConnectionOptions::Mock(options) => {
                 (format!("mock-{}", options.id), None, false, false)
@@ -492,29 +496,39 @@ impl remote::RemoteClientDelegate for RemoteClientDelegate {
         version: Option<Version>,
         cx: &mut AsyncApp,
     ) -> Task<anyhow::Result<PathBuf>> {
-        let this = self.clone();
-        cx.spawn(async move |cx| {
-            AutoUpdater::download_remote_server_release(
-                release_channel,
-                version.clone(),
-                platform.os.as_str(),
-                platform.arch.as_str(),
-                move |status, cx| this.set_status(Some(status), cx),
-                cx,
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "Downloading remote server binary (version: {}, os: {}, arch: {})",
-                    version
-                        .as_ref()
-                        .map(|v| format!("{}", v))
-                        .unwrap_or("unknown".to_string()),
-                    platform.os,
-                    platform.arch,
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let this = self.clone();
+            cx.spawn(async move |cx| {
+                AutoUpdater::download_remote_server_release(
+                    release_channel,
+                    version.clone(),
+                    platform.os.as_str(),
+                    platform.arch.as_str(),
+                    move |status, cx| this.set_status(Some(status), cx),
+                    cx,
                 )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Downloading remote server binary (version: {}, os: {}, arch: {})",
+                        version
+                            .as_ref()
+                            .map(|v| format!("{}", v))
+                            .unwrap_or("unknown".to_string()),
+                        platform.os,
+                        platform.arch,
+                    )
+                })
             })
-        })
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = (platform, release_channel, version, cx);
+            Task::ready(Err(anyhow::anyhow!(
+                "the remote server is provisioned by the sandbox; nothing to download"
+            )))
+        }
     }
 
     fn get_download_url(
@@ -524,16 +538,24 @@ impl remote::RemoteClientDelegate for RemoteClientDelegate {
         version: Option<Version>,
         cx: &mut AsyncApp,
     ) -> Task<Result<Option<String>>> {
-        cx.spawn(async move |cx| {
-            AutoUpdater::get_remote_server_release_url(
-                release_channel,
-                version,
-                platform.os.as_str(),
-                platform.arch.as_str(),
-                cx,
-            )
-            .await
-        })
+        #[cfg(not(target_family = "wasm"))]
+        {
+            cx.spawn(async move |cx| {
+                AutoUpdater::get_remote_server_release_url(
+                    release_channel,
+                    version,
+                    platform.os.as_str(),
+                    platform.arch.as_str(),
+                    cx,
+                )
+                .await
+            })
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = (platform, release_channel, version, cx);
+            Task::ready(Ok(None))
+        }
     }
 }
 
@@ -659,28 +681,38 @@ impl remote::RemoteClientDelegate for BackgroundRemoteClientDelegate {
         version: Option<Version>,
         cx: &mut AsyncApp,
     ) -> Task<anyhow::Result<PathBuf>> {
-        cx.spawn(async move |cx| {
-            AutoUpdater::download_remote_server_release(
-                release_channel,
-                version.clone(),
-                platform.os.as_str(),
-                platform.arch.as_str(),
-                |_status, _cx| {},
-                cx,
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "Downloading remote server binary (version: {}, os: {}, arch: {})",
-                    version
-                        .as_ref()
-                        .map(|v| format!("{v}"))
-                        .unwrap_or("unknown".to_string()),
-                    platform.os,
-                    platform.arch,
+        #[cfg(not(target_family = "wasm"))]
+        {
+            cx.spawn(async move |cx| {
+                AutoUpdater::download_remote_server_release(
+                    release_channel,
+                    version.clone(),
+                    platform.os.as_str(),
+                    platform.arch.as_str(),
+                    |_status, _cx| {},
+                    cx,
                 )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Downloading remote server binary (version: {}, os: {}, arch: {})",
+                        version
+                            .as_ref()
+                            .map(|v| format!("{v}"))
+                            .unwrap_or("unknown".to_string()),
+                        platform.os,
+                        platform.arch,
+                    )
+                })
             })
-        })
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = (platform, release_channel, version, cx);
+            Task::ready(Err(anyhow::anyhow!(
+                "the remote server is provisioned by the sandbox; nothing to download"
+            )))
+        }
     }
 
     fn get_download_url(
@@ -690,16 +722,24 @@ impl remote::RemoteClientDelegate for BackgroundRemoteClientDelegate {
         version: Option<Version>,
         cx: &mut AsyncApp,
     ) -> Task<Result<Option<String>>> {
-        cx.spawn(async move |cx| {
-            AutoUpdater::get_remote_server_release_url(
-                release_channel,
-                version,
-                platform.os.as_str(),
-                platform.arch.as_str(),
-                cx,
-            )
-            .await
-        })
+        #[cfg(not(target_family = "wasm"))]
+        {
+            cx.spawn(async move |cx| {
+                AutoUpdater::get_remote_server_release_url(
+                    release_channel,
+                    version,
+                    platform.os.as_str(),
+                    platform.arch.as_str(),
+                    cx,
+                )
+                .await
+            })
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = (platform, release_channel, version, cx);
+            Task::ready(Ok(None))
+        }
     }
 }
 

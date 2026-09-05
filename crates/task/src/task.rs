@@ -32,6 +32,72 @@ pub use vscode_debug_format::VsCodeDebugTaskFile;
 pub use vscode_format::VsCodeTaskFile;
 pub use zed_actions::RevealTarget;
 
+/// The exit status of a task's process.
+///
+/// Natively this is `std::process::ExitStatus` itself, so nothing changes for
+/// local terminals. On `wasm32-unknown-unknown` the std type is a unit stub
+/// whose `code()` is always `Some(0)`, so the browser build carries what the
+/// remote server reported instead.
+#[cfg(not(target_family = "wasm"))]
+pub type ExitStatus = std::process::ExitStatus;
+
+/// The exit status a remote server reported for a task's process: an exit
+/// code, or the signal that terminated it.
+#[cfg(target_family = "wasm")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExitStatus {
+    code: Option<i32>,
+    signal: Option<i32>,
+}
+
+/// Success (exit code 0), like `std::process::ExitStatus::default()` natively, so code
+/// that substitutes `ExitStatus::default()` for a missing status means the same thing on
+/// every target.
+#[cfg(target_family = "wasm")]
+impl Default for ExitStatus {
+    fn default() -> Self {
+        Self {
+            code: Some(0),
+            signal: None,
+        }
+    }
+}
+
+#[cfg(target_family = "wasm")]
+impl ExitStatus {
+    /// Builds a status from what the wire carried; exactly one of `code` and
+    /// `signal` is expected to be set.
+    pub fn from_parts(code: Option<i32>, signal: Option<i32>) -> Self {
+        Self { code, signal }
+    }
+
+    /// The exit code, if the process exited normally.
+    pub fn code(&self) -> Option<i32> {
+        self.code
+    }
+
+    /// The signal that terminated the process, if any.
+    pub fn signal(&self) -> Option<i32> {
+        self.signal
+    }
+
+    /// Whether the process exited with code zero.
+    pub fn success(&self) -> bool {
+        self.code == Some(0)
+    }
+}
+
+#[cfg(target_family = "wasm")]
+impl std::fmt::Display for ExitStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.code, self.signal) {
+            (Some(code), _) => write!(f, "exit code: {code}"),
+            (None, Some(signal)) => write!(f, "signal: {signal}"),
+            (None, None) => write!(f, "unknown"),
+        }
+    }
+}
+
 /// Task identifier, unique within the application.
 /// Based on it, task reruns and terminal tabs are managed.
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]

@@ -11,7 +11,8 @@ use gpui::{
 use itertools::Itertools;
 use language::CursorShape as EditorCursorShape;
 use settings::Settings;
-use std::time::Instant;
+// `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` natively.
+use web_time::Instant;
 use terminal::{
     Cell, Color, Content, CursorShape, IndexedCell, Modes, NamedColor, Point, Range, Terminal,
     TerminalBounds, is_app_chosen_exact_color as terminal_is_app_chosen_exact_color,

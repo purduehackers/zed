@@ -1,4 +1,4 @@
-use std::process::ExitStatus;
+use task::ExitStatus;
 
 use anyhow::Result;
 use collections::HashSet;

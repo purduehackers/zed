@@ -8,9 +8,11 @@ use crate::{
 use editor::Editor;
 use gpui::{App, AppContext, Context, Entity, Subscription, Task};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use text::BufferSnapshot;
 use ui::{SharedString, table_row::TableRow};
+// `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` natively.
+use web_time::Instant;
 
 pub(crate) const REPARSE_DEBOUNCE: Duration = Duration::from_millis(200);
 

@@ -1,4 +1,4 @@
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_family = "wasm")))]
 pub use smol::net::unix::{UnixListener, UnixStream};
 
 #[cfg(target_os = "windows")]

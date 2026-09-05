@@ -97,4 +97,24 @@ impl Tokio {
     pub fn handle(cx: &App) -> tokio::runtime::Handle {
         GlobalTokio::global(cx).handle.clone()
     }
+
+    /// Like [`Tokio::handle`], but returns `None` instead of panicking when neither
+    /// [`init`] nor [`init_from_handle`] has been called.
+    pub fn try_handle(cx: &App) -> Option<tokio::runtime::Handle> {
+        cx.try_global::<GlobalTokio>()
+            .map(|tokio| tokio.handle.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn test_try_handle_is_none_until_init(cx: &mut TestAppContext) {
+        assert!(cx.update(|cx| Tokio::try_handle(cx).is_none()));
+        cx.update(init);
+        assert!(cx.update(|cx| Tokio::try_handle(cx).is_some()));
+    }
 }

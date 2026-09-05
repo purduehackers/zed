@@ -1,0 +1,32 @@
+<!doctype html>
+<!--
+  Development harness for the browser bundle (b7 §3.30). The production shell page in
+  apps/web implements the same loader contract (CONTRACTS.md §8.4); this page reads the
+  settings and keymap documents from localStorage and the connect info from the query string:
+    ?ws=wss://host/rpc&token=<jwt>&session=<sessionId>&workspace=<workspaceId>[&takeover=1][&path=/workspaces/repo][&os=mac|windows|linux][&backend=auto|webgpu|webgl]
+  The token is moved into sessionStorage (`zs.token`) and stripped from the URL on load, so it
+  reaches neither the history nor a Referer; a later load without `token=` reuses it.
+  Serve with COOP same-origin / COEP require-corp (script/build-web --serve does). This page
+  is never part of a served bundle (script/build-web skips it under a public/ directory).
+-->
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="referrer" content="no-referrer" />
+        <meta name="viewport" content="width=device-width, height=device-height, initial-scale=1.0, user-scalable=0" />
+        <title>Zed (web)</title>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            html, body { margin: 0; height: 100%; background: #1e1e1e; color: #ddd; font: 14px system-ui, sans-serif; }
+            canvas { display: block; width: 100%; height: 100%; touch-action: none; outline: none; -webkit-user-select: none; user-select: none; }
+            #boot { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 8px; background: #1e1e1e; z-index: 10; }
+            #boot[hidden] { display: none; }
+            #boot .detail { opacity: 0.7; font-size: 12px; }
+            #boot .error { color: #f88; white-space: pre-wrap; max-width: 60ch; }
+        </style>
+    </head>
+    <body>
+        <div id="boot"><div id="stage">loading…</div><div id="detail" class="detail"></div></div>
+        <script type="module" src="./loader.js"></script>
+    </body>
+</html>

@@ -61,6 +61,10 @@ submitted. **If you'd like your PR to have the best chance of being merged**:
   features and a refactoring on top of that.
 - Keep AI assistance under your judgement and responsibility: it's unlikely
   we'll merge a vibe-coded PR that the author doesn't understand.
+- Do not enable `jsonwebtoken`'s `rust_crypto` feature in any workspace crate: the
+  workspace selects its `aws_lc_rs` backend, and enabling both makes every token
+  verification in `remote_server serve` panic in a unified build (guarded by the
+  `provider_is_available` test).
 
 **A note on open pull requests:** currently we cap them at **three per author**.
 We're lucky to get a lot of contributions, and the pattern we've seen is that landing

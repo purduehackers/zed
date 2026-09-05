@@ -1493,6 +1493,34 @@ pub mod test {
         Edit,
     }
 
+    /// Lets a test register `TestItem` as the item that opens buffers
+    /// (`register_project_item::<TestItem>`), so `Workspace::open_path*` adds a tab whose
+    /// project path is the buffer's file.
+    impl crate::ProjectItem for TestItem {
+        type Item = language::Buffer;
+
+        fn for_project_item(
+            _project: Entity<Project>,
+            _pane: Option<&crate::Pane>,
+            item: Entity<Self::Item>,
+            _window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> Self {
+            let project_item = match item.read(cx).file() {
+                Some(file) => {
+                    let entry_id = project::File::from_dyn(Some(file))
+                        .and_then(|file| file.entry_id)
+                        .map_or(0, |entry_id| entry_id.to_proto());
+                    let path = file.path().as_unix_str().to_owned();
+                    let worktree_id = file.worktree_id(cx);
+                    TestProjectItem::new_in_worktree(entry_id, &path, worktree_id, cx)
+                }
+                None => TestProjectItem::new_untitled(cx),
+            };
+            TestItem::new(cx).with_project_items(&[project_item])
+        }
+    }
+
     impl TestProjectItem {
         pub fn new(id: u64, path: &str, cx: &mut App) -> Entity<Self> {
             Self::new_in_worktree(id, path, WorktreeId::from_usize(0), cx)

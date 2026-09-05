@@ -27,7 +27,6 @@ use std::{
     process::Stdio,
     str::Chars,
     sync::OnceLock,
-    time::Instant,
 };
 use task::{HideStrategy, RevealStrategy, SaveStrategy, Shell, SpawnInTerminal, TaskId};
 use ui::ActiveTheme;
@@ -36,6 +35,8 @@ use util::{
     paths::PathStyle,
     rel_path::{RelPath, RelPathBuf},
 };
+// `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` natively.
+use web_time::Instant;
 use workspace::{Item, SaveIntent, Workspace, notifications::NotifyResultExt};
 use workspace::{SplitDirection, notifications::DetachAndPromptErr};
 use zed_actions::{OpenDocs, RevealTarget};

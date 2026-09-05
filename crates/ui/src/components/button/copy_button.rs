@@ -1,9 +1,10 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use gpui::{
     AnyElement, App, ClipboardItem, Context, ElementId, Entity, IntoElement, ParentElement,
     RenderOnce, Styled, Window,
 };
+use web_time::Instant;
 
 use crate::{Tooltip, prelude::*};
 

@@ -1,23 +1,46 @@
+#[cfg(not(target_family = "wasm"))]
 pub mod fs_watcher;
+#[cfg(any(target_family = "wasm", feature = "test-support"))]
+pub mod wasm_fs;
 
+#[cfg(not(target_family = "wasm"))]
 pub use fs_watcher::requires_poll_watcher;
+#[cfg(any(target_family = "wasm", feature = "test-support"))]
+pub use wasm_fs::{DirtyFile, WasmFs};
 
+/// The browser has no native watcher; worktree scanning never defers to polling.
+#[cfg(target_family = "wasm")]
+pub fn requires_poll_watcher(_path: &Path) -> bool {
+    false
+}
+
+#[cfg(any(not(target_family = "wasm"), feature = "test-support"))]
 use parking_lot::Mutex;
-use slotmap::{KeyData, SlotMap};
+use slotmap::KeyData;
+#[cfg(any(not(target_family = "wasm"), feature = "test-support"))]
+use slotmap::SlotMap;
+#[cfg(not(target_family = "wasm"))]
 use std::ffi::OsString;
+#[cfg(not(target_family = "wasm"))]
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::time::Instant;
+#[cfg(not(target_family = "wasm"))]
 use util::maybe;
+// `std::time::Instant` natively; on wasm `Instant::now()` panics, and `JobInfo::start` is
+// filled in by `RealFs`'s git jobs only.
+use web_time::Instant;
 
 use anyhow::{Context as _, Result};
+#[cfg(not(target_family = "wasm"))]
 use futures::stream::iter;
 use gpui::App;
+#[cfg(any(not(target_family = "wasm"), feature = "test-support"))]
 use gpui::BackgroundExecutor;
 use gpui::Global;
 use gpui::ReadGlobal as _;
 use gpui::SharedString;
 #[cfg(unix)]
 use std::ffi::CString;
+#[cfg(not(target_family = "wasm"))]
 use util::command::new_command;
 
 #[cfg(unix)]
@@ -31,22 +54,30 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use std::mem::MaybeUninit;
 
+#[cfg(not(target_family = "wasm"))]
 use async_tar::Archive;
 use futures::{AsyncRead, Stream, StreamExt, future::BoxFuture};
-use git::repository::{GitRepository, RealGitRepository};
+use git::repository::GitRepository;
+#[cfg(not(target_family = "wasm"))]
+use git::repository::RealGitRepository;
+#[cfg(not(target_family = "wasm"))]
 use is_executable::IsExecutable;
 use rope::Rope;
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_family = "wasm"))]
 use smol::io::AsyncWriteExt;
+#[cfg(not(target_family = "wasm"))]
+use std::io::Write;
 #[cfg(feature = "test-support")]
 use std::path::Component;
 use std::{
-    io::{self, Write},
+    io,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+#[cfg(not(target_family = "wasm"))]
 use tempfile::TempDir;
 use text::LineEnding;
 
@@ -104,6 +135,8 @@ pub trait Fs: Send + Sync {
         path: &Path,
         content: Pin<&mut (dyn AsyncRead + Send)>,
     ) -> Result<()>;
+    /// Not available in the browser: archives are unpacked on the server.
+    #[cfg(not(target_family = "wasm"))]
     async fn extract_tar_file(
         &self,
         path: &Path,
@@ -186,6 +219,7 @@ pub trait Fs: Send + Sync {
 // tests from changes to that crate's API surface.
 /// Represents a file or directory that has been moved to the system trash,
 /// retaining enough information to restore it to its original location.
+#[cfg(not(target_family = "wasm"))]
 #[derive(Clone, PartialEq, Debug)]
 struct TrashedEntry {
     /// Platform-specific identifier for the file/directory in the trash.
@@ -200,6 +234,7 @@ struct TrashedEntry {
     pub original_parent: PathBuf,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl From<trash::TrashItem> for TrashedEntry {
     fn from(item: trash::TrashItem) -> Self {
         Self {
@@ -210,6 +245,7 @@ impl From<trash::TrashItem> for TrashedEntry {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl TrashedEntry {
     fn into_trash_item(self) -> trash::TrashItem {
         trash::TrashItem {
@@ -238,6 +274,7 @@ pub enum TrashRestoreError {
     Unknown { description: String },
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl From<trash::Error> for TrashRestoreError {
     fn from(err: trash::Error) -> Self {
         match err {
@@ -310,6 +347,11 @@ pub struct Metadata {
 /// was. See ["mtime comparison considered harmful" - apenwarr](https://apenwarr.ca/log/20181113).
 ///
 /// Do not derive Ord, PartialOrd, or arithmetic operation traits.
+///
+/// Deliberately a `std::time::SystemTime`, also in the browser build: the value comes from file
+/// metadata (natively) or `UNIX_EPOCH + Duration` (`WasmFs`, `FakeFs`, `proto::Timestamp`) and is
+/// never `SystemTime::now()`, which is the only `std` operation that panics on wasm, and the
+/// consumers (`chrono`, `proto`) convert from the `std` type.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct MTime(SystemTime);
@@ -332,11 +374,13 @@ pub enum JobEvent {
 pub type JobEventSender = futures::channel::mpsc::UnboundedSender<JobEvent>;
 pub type JobEventReceiver = futures::channel::mpsc::UnboundedReceiver<JobEvent>;
 
+#[cfg(not(target_family = "wasm"))]
 struct JobTracker {
     id: JobId,
     subscribers: Arc<Mutex<Vec<JobEventSender>>>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl JobTracker {
     fn new(info: JobInfo, subscribers: Arc<Mutex<Vec<JobEventSender>>>) -> Self {
         let id = info.id;
@@ -352,6 +396,7 @@ impl JobTracker {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Drop for JobTracker {
     fn drop(&mut self) {
         let mut subs = self.subscribers.lock();
@@ -414,6 +459,7 @@ impl TrashId {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub struct RealFs {
     bundled_git_binary_path: Option<PathBuf>,
     executor: BackgroundExecutor,
@@ -427,6 +473,7 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn current_path(&self, fs: &Arc<dyn Fs>) -> Result<PathBuf>;
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl FileHandle for std::fs::File {
     #[cfg(target_os = "macos")]
     fn current_path(&self, _: &Arc<dyn Fs>) -> Result<PathBuf> {
@@ -519,8 +566,10 @@ impl FileHandle for std::fs::File {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub struct RealWatcher {}
 
+#[cfg(not(target_family = "wasm"))]
 impl RealFs {
     pub fn new(git_binary_path: Option<PathBuf>, executor: BackgroundExecutor) -> Self {
         Self {
@@ -643,7 +692,7 @@ fn path_to_c_string(path: &Path) -> io::Result<CString> {
 //
 // To avoid crashing the app in this situation, we use the rustix analogue of
 // ReadDir, which doesn't have this panic in drop.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_family = "wasm")))]
 fn read_dir_entries(path: PathBuf) -> Result<impl Send + Iterator<Item = Result<PathBuf>>> {
     use rustix::fs::{Dir, Mode, OFlags};
     use std::ffi::OsStr;
@@ -674,7 +723,7 @@ fn read_dir_entries(path: PathBuf) -> Result<impl Send + Iterator<Item = Result<
     }))
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, target_family = "wasm")))]
 fn read_dir_entries(path: PathBuf) -> Result<impl Send + Iterator<Item = Result<PathBuf>>> {
     let entries =
         std::fs::read_dir(&path).with_context(|| format!("failed to open directory {path:?}"))?;
@@ -685,6 +734,7 @@ fn read_dir_entries(path: PathBuf) -> Result<impl Send + Iterator<Item = Result<
     }))
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[async_trait::async_trait]
 impl Fs for RealFs {
     async fn create_dir(&self, path: &Path) -> Result<()> {
@@ -1383,7 +1433,7 @@ impl Fs for RealFs {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd", target_family = "wasm")))]
 impl Watcher for RealWatcher {
     fn add(&self, _: &Path) -> Result<()> {
         Ok(())

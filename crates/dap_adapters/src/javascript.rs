@@ -1,10 +1,14 @@
+#[cfg(not(target_family = "wasm"))]
 use adapters::latest_github_release;
 use anyhow::Context as _;
 use collections::HashMap;
 use dap::{StartDebuggingRequestArguments, adapters::DebugTaskDefinition};
 use gpui::AsyncApp;
 use serde_json::Value;
-use std::{path::PathBuf, sync::OnceLock};
+use std::{
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 use task::DebugRequest;
 use util::{ResultExt, maybe, shell::ShellKind};
 
@@ -20,6 +24,7 @@ impl JsDebugAdapter {
     const ADAPTER_NPM_NAME: &'static str = "vscode-js-debug";
     const ADAPTER_PATH: &'static str = "js-debug/src/dapDebugServer.js";
 
+    #[cfg(not(target_family = "wasm"))]
     async fn fetch_latest_adapter_version(
         &self,
         delegate: &Arc<dyn DapDelegate>,
@@ -44,6 +49,21 @@ impl JsDebugAdapter {
                 .browser_download_url
                 .clone(),
         })
+    }
+
+    /// The browser neither queries GitHub (`http_client::github` is native-only) nor installs
+    /// the adapter locally; the remote server does both. `get_binary` logs this and moves on to
+    /// the installed-adapter lookup, exactly as an offline desktop does.
+    #[cfg(target_family = "wasm")]
+    async fn fetch_latest_adapter_version(
+        &self,
+        delegate: &Arc<dyn DapDelegate>,
+    ) -> Result<AdapterVersion> {
+        let _ = delegate;
+        anyhow::bail!(
+            "fetching the latest {} release is not supported in the browser",
+            Self::ADAPTER_NPM_NAME
+        )
     }
 
     async fn get_installed_binary(
@@ -137,12 +157,10 @@ impl JsDebugAdapter {
 
             let file_name_prefix = format!("{}_", self.name());
 
-            util::fs::find_file_name_in_dir(adapter_path.as_path(), |file_name| {
-                file_name.starts_with(&file_name_prefix)
-            })
-            .await
-            .context("Couldn't find JavaScript dap directory")?
-            .join(Self::ADAPTER_PATH)
+            find_installed_adapter_dir(adapter_path.as_path(), &file_name_prefix)
+                .await
+                .context("Couldn't find JavaScript dap directory")?
+                .join(Self::ADAPTER_PATH)
         };
 
         let arguments = if let Some(mut args) = user_args {
@@ -550,6 +568,30 @@ impl DebugAdapter for JsDebugAdapter {
     fn prefer_thread_name(&self) -> bool {
         true
     }
+}
+
+/// Finds the `<adapter name>_<version>` directory `download_adapter_from_github` unpacked the
+/// adapter into.
+#[cfg(not(target_family = "wasm"))]
+async fn find_installed_adapter_dir(
+    adapter_path: &Path,
+    file_name_prefix: &str,
+) -> Option<PathBuf> {
+    util::fs::find_file_name_in_dir(adapter_path, |file_name| {
+        file_name.starts_with(file_name_prefix)
+    })
+    .await
+}
+
+/// `util::fs` is native-only and the browser never unpacks an adapter (the remote server
+/// runs it), so there is nothing to find.
+#[cfg(target_family = "wasm")]
+async fn find_installed_adapter_dir(
+    adapter_path: &Path,
+    file_name_prefix: &str,
+) -> Option<PathBuf> {
+    let _ = (adapter_path, file_name_prefix);
+    None
 }
 
 fn normalize_task_type(task_type: &mut Value) {

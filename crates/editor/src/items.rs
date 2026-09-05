@@ -11,7 +11,9 @@ use anyhow::{Context as _, Result, anyhow};
 use collections::{HashMap, HashSet};
 use file_icons::FileIcons;
 use fs::MTime;
-use futures::{channel::oneshot, future::try_join_all};
+#[cfg(not(target_family = "wasm"))]
+use futures::channel::oneshot;
+use futures::future::try_join_all;
 use git::status::GitSummary;
 use gpui::{
     AnyElement, App, AsyncWindowContext, Context, Entity, EntityId, EventEmitter, Font,
@@ -2029,62 +2031,65 @@ impl SearchableItem for Editor {
                 {
                     let query = query.clone();
 
-                    let mut results = Vec::new();
-                    executor
-                        .scoped(|scope| {
-                            for search_range in chunk_search_range(
-                                search_buffer.text.clone(),
-                                &query,
-                                num_cpus as u32,
-                                search_range,
-                            ) {
-                                let query = query.clone();
-                                let buffer = buffer.clone();
+                    #[cfg(not(target_family = "wasm"))]
+                    {
+                        let mut results = Vec::new();
+                        executor
+                            .scoped(|scope| {
+                                for search_range in chunk_search_range(
+                                    search_buffer.text.clone(),
+                                    &query,
+                                    num_cpus as u32,
+                                    search_range,
+                                ) {
+                                    let query = query.clone();
+                                    let buffer = buffer.clone();
 
-                                let (tx, rx) = oneshot::channel();
-                                results.push(rx);
-                                scope.spawn(async move {
-                                    let chunk_result = query
-                                        .search(
+                                    let (tx, rx) = oneshot::channel();
+                                    results.push(rx);
+                                    scope.spawn(async move {
+                                        let chunk_result = search_chunk(
+                                            &query,
+                                            &buffer,
                                             search_buffer,
-                                            Some(search_range.start..search_range.end),
+                                            search_range,
+                                            deleted_hunk_anchor,
                                         )
-                                        .await
-                                        .into_iter()
-                                        .filter_map(|match_range| {
-                                            if let Some(deleted_hunk_anchor) = deleted_hunk_anchor {
-                                                let start = search_buffer.anchor_after(
-                                                    search_range.start + match_range.start,
-                                                );
-                                                let end = search_buffer.anchor_before(
-                                                    search_range.start + match_range.end,
-                                                );
-                                                Some(
-                                                    deleted_hunk_anchor.with_diff_base_anchor(start)
-                                                        ..deleted_hunk_anchor
-                                                            .with_diff_base_anchor(end),
-                                                )
-                                            } else {
-                                                let start = search_buffer.anchor_after(
-                                                    search_range.start + match_range.start,
-                                                );
-                                                let end = search_buffer.anchor_before(
-                                                    search_range.start + match_range.end,
-                                                );
-                                                buffer.anchor_range_in_buffer(start..end)
-                                            }
-                                        })
-                                        .collect::<Vec<_>>();
-                                    _ = tx.send(chunk_result);
-                                });
-                            }
-                        })
-                        .await;
+                                        .await;
+                                        _ = tx.send(chunk_result);
+                                    });
+                                }
+                            })
+                            .await;
 
-                    for rx in results {
-                        if let Ok(results) = rx.await {
-                            ranges.extend(results);
+                        for rx in results {
+                            if let Ok(results) = rx.await {
+                                ranges.extend(results);
+                            }
                         }
+                    }
+                    // `BackgroundExecutor::scoped` blocks on drop, which the browser cannot
+                    // do; search the chunks one after another on this task instead. The chunk
+                    // iterator is not `Send`, so it is drained before the first await.
+                    #[cfg(target_family = "wasm")]
+                    for search_range in chunk_search_range(
+                        search_buffer.text.clone(),
+                        &query,
+                        num_cpus as u32,
+                        search_range,
+                    )
+                    .collect::<Vec<_>>()
+                    {
+                        ranges.extend(
+                            search_chunk(
+                                &query,
+                                &buffer,
+                                search_buffer,
+                                search_range,
+                                deleted_hunk_anchor,
+                            )
+                            .await,
+                        );
                     }
                 }
             }
@@ -2351,6 +2356,33 @@ fn deserialize_path_key(path_key: proto::PathKey) -> Option<PathKey> {
         sort_prefix: path_key.sort_prefix,
         path: RelPath::from_unix_str(&path_key.path).ok()?.into(),
     })
+}
+
+/// Matches in a deleted hunk are anchored in the diff base rather than in the buffer.
+async fn search_chunk(
+    query: &SearchQuery,
+    buffer: &MultiBufferSnapshot,
+    search_buffer: &language::BufferSnapshot,
+    search_range: Range<usize>,
+    deleted_hunk_anchor: Option<Anchor>,
+) -> Vec<Range<Anchor>> {
+    query
+        .search(search_buffer, Some(search_range.start..search_range.end))
+        .await
+        .into_iter()
+        .filter_map(|match_range| {
+            let start = search_buffer.anchor_after(search_range.start + match_range.start);
+            let end = search_buffer.anchor_before(search_range.start + match_range.end);
+            if let Some(deleted_hunk_anchor) = deleted_hunk_anchor {
+                Some(
+                    deleted_hunk_anchor.with_diff_base_anchor(start)
+                        ..deleted_hunk_anchor.with_diff_base_anchor(end),
+                )
+            } else {
+                buffer.anchor_range_in_buffer(start..end)
+            }
+        })
+        .collect()
 }
 
 fn chunk_search_range(

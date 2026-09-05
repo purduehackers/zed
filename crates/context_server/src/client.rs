@@ -16,9 +16,11 @@ use std::{
         Arc,
         atomic::{AtomicI32, Ordering::SeqCst},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use util::{ResultExt, TryFutureExt};
+// `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` on native.
+use web_time::Instant;
 
 use crate::{
     oauth::WwwAuthenticate,

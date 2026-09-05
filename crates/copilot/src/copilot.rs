@@ -40,7 +40,9 @@ use std::{
     sync::Arc,
 };
 use sum_tree::Dimensions;
-use util::{ResultExt, fs::remove_matching};
+use util::ResultExt;
+#[cfg(not(target_family = "wasm"))]
+use util::fs::remove_matching;
 use workspace::AppState;
 
 pub use crate::copilot_edit_prediction_delegate::CopilotEditPredictionDelegate;
@@ -579,14 +581,12 @@ impl Copilot {
             };
 
             let server_name = LanguageServerName("copilot".into());
-            let server = LanguageServer::new(
+            let server = spawn_language_server_process(
                 Arc::new(Mutex::new(None)),
                 new_server_id,
                 server_name,
                 binary,
                 root_path,
-                None,
-                Default::default(),
                 cx,
             )?;
 
@@ -1340,8 +1340,57 @@ fn notify_did_change_config_to_server(
     Ok(())
 }
 
+#[cfg(not(target_family = "wasm"))]
 async fn clear_copilot_dir() {
     remove_matching(paths::copilot_dir(), |_| true).await
+}
+
+/// The browser never installs the Copilot language server into `paths::copilot_dir()`
+/// (`get_copilot_lsp` fails on the npm lookup before anything is written there), so there
+/// is nothing to clear.
+#[cfg(target_family = "wasm")]
+async fn clear_copilot_dir() {}
+
+/// Starts the Copilot language server process; see [`lsp::LanguageServer::new`].
+#[cfg(not(target_family = "wasm"))]
+fn spawn_language_server_process(
+    stderr_capture: Arc<Mutex<Option<String>>>,
+    server_id: LanguageServerId,
+    server_name: LanguageServerName,
+    binary: LanguageServerBinary,
+    root_path: &Path,
+    cx: &mut AsyncApp,
+) -> Result<LanguageServer> {
+    LanguageServer::new(
+        stderr_capture,
+        server_id,
+        server_name,
+        binary,
+        root_path,
+        None,
+        Default::default(),
+        cx,
+    )
+}
+
+/// The Copilot language server runs inside the sandbox and is reached over the remote
+/// protocol; the browser never spawns it (`lsp::LanguageServer::new` is not compiled there).
+// ZS-TODO(wasm): spawn `copilot-language-server --stdio` in the sandbox over the stdio
+// process relay and hand its pipes to an io-injecting `LanguageServer` constructor
+// (b11 §4.8, §7 item 3) instead of failing here.
+#[cfg(target_family = "wasm")]
+fn spawn_language_server_process(
+    _stderr_capture: Arc<Mutex<Option<String>>>,
+    _server_id: LanguageServerId,
+    server_name: LanguageServerName,
+    binary: LanguageServerBinary,
+    _root_path: &Path,
+    _cx: &mut AsyncApp,
+) -> Result<LanguageServer> {
+    Err(anyhow!(
+        "cannot spawn language server {server_name} ({:?}) in the browser",
+        binary.path
+    ))
 }
 
 async fn get_copilot_lsp(fs: Arc<dyn Fs>, node_runtime: NodeRuntime) -> anyhow::Result<PathBuf> {

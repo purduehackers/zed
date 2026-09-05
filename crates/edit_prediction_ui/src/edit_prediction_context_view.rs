@@ -3,7 +3,7 @@ use std::{
     collections::VecDeque,
     ops::Add,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::Result;
@@ -30,6 +30,8 @@ use edit_prediction::{
     ContextRetrievalFinishedDebugEvent, ContextRetrievalStartedDebugEvent, DebugEvent,
     EditPredictionStore,
 };
+// `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` natively.
+use web_time::Instant;
 use workspace::Item;
 
 pub struct EditPredictionContextView {

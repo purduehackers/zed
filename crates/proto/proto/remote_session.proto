@@ -1,0 +1,134 @@
+syntax = "proto3";
+package zed.messages;
+
+import "worktree.proto";
+
+// Sandbox session protocol (b4-proto-additions): client persistence, lifecycle
+// notices, port forwarding, upload notifications and registry-driven extension
+// management. Every message carries `project_id = REMOTE_SERVER_PROJECT_ID`.
+
+// ---- 5.4 client persistence ----
+message SaveClientState {
+  uint64 project_id = 1;
+  bytes sqlite = 2;                 // sqlite3_serialize image of the client's AppDatabase (gzip-compressed when `gzip`)
+  uint64 version = 3;               // strictly increasing per workspace; server keeps the max it has seen
+  bool gzip = 4;
+  optional string client_build = 5; // build id of the writer, stored in meta.json for skew diagnostics
+  bool stopping = 6;                // set on the flush that answers LifecycleNotice STOPPING (D6); the server's
+                                    // stopping wait ends only on an accepted save carrying it, so a ticker save
+                                    // already in flight when the notice arrived cannot end it early
+}
+message SaveClientStateResponse {
+  bool accepted = 1;                // false: server already holds `version` >= the request's
+  uint64 version = 2;               // server's current version after the call
+}
+message LoadClientState {
+  uint64 project_id = 1;
+  bool metadata_only = 2;           // when true, `sqlite` is left empty
+}
+message LoadClientStateResponse {
+  bytes sqlite = 1;                 // empty when nothing stored or metadata_only
+  uint64 version = 2;               // 0 when nothing stored
+  bool gzip = 3;
+  optional string client_build = 4;
+}
+
+// ---- 5.5 lifecycle notices (server -> client) ----
+// JSON/JS spelling of these values is snake_case ("idle_stop_in", ...): see
+// `project::lifecycle::LifecycleKind::as_str` and the control channel's `LifecycleBody`.
+enum LifecycleKind {
+  IdleStopIn = 0;
+  SessionCapIn = 1;
+  Stopping = 2;
+  Resumed = 3;
+}
+message LifecycleNotice {
+  uint64 project_id = 1;
+  LifecycleKind kind = 2;
+  uint32 seconds = 3;    // countdown for IdleStopIn / SessionCapIn; 0 otherwise
+}
+
+// ---- 5.2 port forwarding ----
+enum PortVisibility {
+  PortPrivate = 0;
+  PortPublic = 1;
+}
+message ListeningPort {
+  uint32 port = 1;
+  uint32 pid = 2;
+  string process_name = 3;
+}
+message PortForward {
+  uint32 port = 1;
+  PortVisibility visibility = 2;
+  optional string label = 3;
+  string url = 4;                      // opaque: the slot URL for public forwards, the control plane /open link for private ones (D8); "" when the supervisor returned null
+}
+message PortsChanged {
+  uint64 project_id = 1;
+  repeated ListeningPort ports = 2;
+  repeated PortForward forwards = 3;   // current forwards, so a fresh session gets the full picture
+}
+message ForwardPort {
+  uint64 project_id = 1;
+  uint32 port = 2;                     // validated to 1..=65535 by the server
+  PortVisibility visibility = 3;
+  optional string label = 4;
+}
+message ForwardPortResponse {
+  string url = 1;                      // same semantics as PortForward.url (D8)
+}
+message UnforwardPort {
+  uint64 project_id = 1;
+  uint32 port = 2;
+}
+
+// ---- 5.3 file transfer ----
+message FilesUploaded {
+  uint64 project_id = 1;
+  repeated ProjectPath paths = 2;
+}
+
+// ---- 5.6 extensions ----
+message InstalledExtension {
+  string id = 1;
+  string version = 2;
+  string name = 3;
+  optional string description = 4;
+  repeated string provides = 5;   // ExtensionProvides kebab-case names
+  bool dev = 6;
+}
+message AvailableExtension {
+  string id = 1;
+  string version = 2;
+  string name = 3;
+  optional string description = 4;
+  repeated string authors = 5;
+  string repository = 6;
+  repeated string provides = 7;
+  uint64 download_count = 8;
+}
+message ListExtensions {
+  uint64 project_id = 1;
+  optional string search = 2;
+  bool include_available = 3;     // when false, `available` is left empty and no registry call is made
+}
+message ListExtensionsResponse {
+  repeated InstalledExtension installed = 1;
+  repeated AvailableExtension available = 2;
+}
+// Named `InstallRegistryExtension` because `InstallExtension` (app.proto) is the
+// existing SSH upload-install message and stays for desktop-over-SSH compatibility.
+message InstallRegistryExtension {
+  uint64 project_id = 1;
+  string id = 2;                  // validated against ^[a-z0-9][a-z0-9_-]{0,63}$ by the server
+  optional string version = 3;    // absent = latest compatible
+}
+message UninstallExtension {
+  uint64 project_id = 1;
+  string id = 2;                  // same validation
+}
+message ExtensionsChanged {
+  uint64 project_id = 1;
+  repeated InstalledExtension installed = 2;
+}

@@ -9,6 +9,8 @@ use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, System, Updat
 
 use crate::{Event, Terminal};
 
+/// `handle` is only read by the unix and windows `pid()` arms.
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 #[derive(Clone, Copy)]
 pub struct ProcessIdGetter {
     handle: i32,
@@ -16,6 +18,7 @@ pub struct ProcessIdGetter {
 }
 
 impl ProcessIdGetter {
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     pub(crate) fn new(handle: i32, fallback_pid: u32) -> ProcessIdGetter {
         ProcessIdGetter {
             handle,
@@ -65,6 +68,15 @@ impl ProcessIdGetter {
     }
 }
 
+/// No local processes exist on other targets (the browser); nothing constructs a
+/// `TerminalType::Pty` there, so this is never reached.
+#[cfg(not(any(unix, windows)))]
+impl ProcessIdGetter {
+    fn pid(&self) -> Option<Pid> {
+        None
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ProcessInfo {
     pub(crate) name: String,
@@ -82,6 +94,7 @@ pub(crate) struct PtyProcessInfo {
     task: Mutex<Option<Task<()>>>,
 }
 
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 impl PtyProcessInfo {
     pub(crate) fn new(pid_getter: ProcessIdGetter) -> PtyProcessInfo {
         // Task enumeration is on by default and would retain a `Process` entry

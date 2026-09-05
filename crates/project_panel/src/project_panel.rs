@@ -56,7 +56,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use theme_settings::ThemeSettings;
 use ui::{
@@ -71,6 +71,8 @@ use util::{
     paths::{PathStyle, compare_paths},
     rel_path::{RelPath, RelPathBuf},
 };
+// `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` natively.
+use web_time::Instant;
 use workspace::{
     DraggedSelection, OpenInTerminal, OpenMode, OpenOptions, OpenVisible, PreviewTabsSettings,
     SelectedEntry, SplitDirection, Workspace, WorkspaceSettings, copy_file_permalink,

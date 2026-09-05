@@ -1,5 +1,7 @@
+#[cfg(not(target_family = "wasm"))]
 use auto_update::DismissMessage;
 use editor::Editor;
+#[cfg(not(target_family = "wasm"))]
 use extension_host::{ExtensionOperation, ExtensionStore};
 use futures::StreamExt;
 use gpui::{
@@ -20,9 +22,22 @@ use std::{
     collections::HashSet,
     fmt::Write,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use ui::{ContextMenu, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
+// `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` natively.
+use web_time::Instant;
+
+// The `auto_update` crate is not compiled for the browser; the action keeps its
+// fully-qualified name (`auto_update::DismissMessage`) so user keymaps still resolve it.
+#[cfg(target_family = "wasm")]
+actions!(
+    auto_update,
+    [
+        /// Dismisses the update error message.
+        DismissMessage
+    ]
+);
 use util::truncate_and_trailoff;
 use workspace::{StatusItemView, Workspace, item::ItemHandle};
 
@@ -673,7 +688,9 @@ impl ActivityIndicator {
             });
         }
 
-        // Show any extension installation info.
+        // Show any extension installation info (desktop only: the browser has no local
+        // extension host, BUILD-SPEC 3.2).
+        #[cfg(not(target_family = "wasm"))]
         if let Some(extension_store) =
             ExtensionStore::try_global(cx).map(|extension_store| extension_store.read(cx))
             && let Some((extension_id, operation)) =

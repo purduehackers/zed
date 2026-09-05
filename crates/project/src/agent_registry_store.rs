@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use collections::HashMap;
@@ -14,6 +14,8 @@ use http_client::{AsyncBody, HttpClient, StatusCode};
 use serde::Deserialize;
 use settings::Settings as _;
 use util::ResultExt;
+// `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` natively.
+use web_time::Instant;
 
 use crate::{AgentId, DisableAiSettings};
 
@@ -206,7 +208,10 @@ impl AgentRegistryStore {
             return;
         }
 
-        if DisableAiSettings::get_global(cx).disable_ai {
+        // The browser build never fetches the registry: the editor's CSP allows no third-party
+        // `connect-src` (the request would only log a violation), and external agents are
+        // launched on the sandbox rather than in the tab.
+        if cfg!(target_family = "wasm") || DisableAiSettings::get_global(cx).disable_ai {
             return;
         }
 

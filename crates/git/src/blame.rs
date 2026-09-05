@@ -294,8 +294,15 @@ impl BlameEntry {
 
             Ok(date_time_utc.to_offset(offset))
         } else {
-            // Directly return current time in UTC if there's no committer time or timezone
-            Ok(time::OffsetDateTime::now_utc())
+            // Directly return current time in UTC if there's no committer time or timezone.
+            // `OffsetDateTime::now_utc()` is `std::time::SystemTime::now()` underneath, which
+            // panics on wasm32-unknown-unknown; `web_time` reads `Date.now()` there and is `std`
+            // natively. The match is the `time` crate's own `From<SystemTime>` conversion.
+            let now = match web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH) {
+                Ok(since_epoch) => OffsetDateTime::UNIX_EPOCH + since_epoch,
+                Err(error) => OffsetDateTime::UNIX_EPOCH - error.duration(),
+            };
+            Ok(now)
         }
     }
 }

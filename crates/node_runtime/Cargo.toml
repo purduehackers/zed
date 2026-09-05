@@ -17,8 +17,6 @@ test-support = []
 
 [dependencies]
 anyhow.workspace = true
-async-compression.workspace = true
-async-tar.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 futures.workspace = true
@@ -32,6 +30,12 @@ smol.workspace = true
 util.workspace = true
 watch.workspace = true
 which.workspace = true
+
+# Only the managed Node.js download (`ManagedNodeRuntime::install_if_needed`) extracts
+# archives, and the browser has no filesystem to extract into.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+async-compression.workspace = true
+async-tar.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 async-std.workspace = true

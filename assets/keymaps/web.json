@@ -1,0 +1,57 @@
+// web.json — loaded only in the browser build, last (after vim and specific-overrides; D12).
+// Browsers own Cmd/Ctrl+W, T, N, Q, Shift+T and Ctrl+Tab (D12). This layer adds reachable
+// alternatives and unbinds actions that have no meaning in a tab. Originals stay bound for
+// keyboard-lock fullscreen. Both chord families live here: on a Windows/Linux host the browser
+// produces `ctrl-` chords and `cmd-` (platform/Super) chords are unreachable; on a macOS host it
+// is the reverse (`cmd-` = platform). The `null` entries of the other family are no-ops on that
+// host because the same chords are not bound in the same context there (default-macos.json binds
+// no ctrl-q at all and no ctrl-shift-n in Workspace; default-linux.json binds no cmd-/super-
+// chords at all, script/check-keymaps). A KeyContext `os ==` predicate cannot do this selection
+// because the key is "unknown" on wasm.
+//
+// A `null` only outranks a binding at the same depth or shallower: gpui sorts the matches of one
+// chord by the depth its context predicate reaches in the dispatch path and only then by load
+// order (`Keymap::bindings_for_input`, `binding_enabled`, and the `test_fail_to_disable` case),
+// and a binding with no context is ranked at the *innermost* node. So a chord the default keymap
+// binds without a context has to be unbound without one too — a "Workspace" null loses to it
+// whenever the focus is deeper than the workspace, which it always is.
+[
+  {
+    // Q, H, M — quit, hide and minimise have no meaning in a tab, and the defaults bind them
+    // with no context. Unbinding them here does not take the key away from the terminal:
+    // `TerminalView::key_down` still sends an unhandled chord to the pty, which is all
+    // `terminal::SendKeystroke` (Terminal context, default-linux/windows.json) would have done.
+    "bindings": {
+      "ctrl-q": null, // zed::Quit (default-linux.json, default-windows.json)
+      "cmd-q": null, // zed::Quit (default-macos.json)
+      "cmd-h": null, // zed::Hide (default-macos.json)
+      "cmd-m": null // zed::Minimize (default-macos.json)
+    }
+  },
+  {
+    "context": "Workspace",
+    "bindings": {
+      // Shift+N — one window per tab
+      "ctrl-shift-n": null, // workspace::NewWindow (default-linux.json)
+      "cmd-shift-n": null, // workspace::NewWindow (default-macos.json)
+      // W, Shift+T, T, N — alternatives reachable on every host
+      "alt-w": ["pane::CloseActiveItem", { "close_pinned": false }],
+      "alt-shift-t": "pane::ReopenClosedItem",
+      "alt-t": "project_symbols::Toggle",
+      "alt-n": "workspace::NewFile",
+      // Ctrl+Tab — tab switcher and pane item navigation
+      "ctrl-alt-tab": "tab_switcher::Toggle",
+      "ctrl-alt-shift-tab": ["tab_switcher::Toggle", { "select_last": true }],
+      "ctrl-pagedown": "pane::ActivateNextItem",
+      "ctrl-pageup": "pane::ActivatePreviousItem",
+      "cmd-shift-]": "pane::ActivateNextItem",
+      "cmd-shift-[": "pane::ActivatePreviousItem"
+    }
+  },
+  {
+    "context": "Terminal",
+    "bindings": {
+      "alt-w": "pane::CloseActiveItem"
+    }
+  }
+]

@@ -1,0 +1,344 @@
+#!/usr/bin/env bash
+# Incremental `cargo check` of Zed crates for wasm32-unknown-unknown.
+#   script/check-wasm                      # default crate list below (the CI layer gate)
+#   script/check-wasm -p util -p fs        # explicit crates; other args pass through to cargo
+#   ZS_WASM_MODE=build script/check-wasm -p zed_web
+#   ZS_WASM_MODE=build ZS_BUILD_ID=<id> script/check-wasm -p zed_web --profile <profile>   # b7 §3.31 step 3;
+#                                          # unknown args (--profile, --features) and the environment pass through
+#   ZS_WASM_TOOLCHAIN=nightly-2026-08-01 script/check-wasm   # use a dated nightly instead of bootstrap
+#   WASI_SDK_PATH=/opt/wasi-sdk-25.0 script/check-wasm       # an already-installed wasi-sdk 25
+#
+# The full cargo output is written to target/wasm-logs/<timestamp>-<mode>.log (and
+# target/wasm-logs/latest.log points at it); on failure a compact summary of the errors is
+# printed after cargo's own output.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+        echo "check-wasm: wasm builds are supported on macOS and Linux only (script/wasm-cc is bash)" >&2
+        exit 2 ;;
+esac
+
+# Any of these outranks `[target.wasm32-unknown-unknown] rustflags` in .cargo/config.toml and
+# would silently replace the atomics/shared-memory flags, so refuse rather than build wrong.
+for var in RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS; do
+    if [[ -n "${!var:-}" ]]; then
+        echo "check-wasm: $var is set and would replace [target.wasm32-unknown-unknown] rustflags in .cargo/config.toml" >&2
+        exit 2
+    fi
+done
+
+# The wasi-sdk clang/llvm-ar behind CC_/AR_wasm32_unknown_unknown (.cargo/config.toml, via
+# script/wasm-cc and script/wasm-ar). With `WASI_SDK_PATH` set those wrappers use that SDK
+# (and refuse any version but the pinned one); otherwise script/ensure-wasi-sdk fetches the
+# pinned release into target/wasi-sdk and verifies it against script/wasi-sdk.sha256.
+./script/ensure-wasi-sdk
+
+mode="${ZS_WASM_MODE:-check}"
+if [[ -n "${ZS_WASM_TOOLCHAIN:-}" ]]; then
+    # This script also builds the shipped bundle, so the toolchain must name one compiler: a
+    # dated nightly (optionally with its host triple), never a moving channel like `nightly`.
+    if [[ ! "$ZS_WASM_TOOLCHAIN" =~ ^nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}(-[A-Za-z0-9_]+)*$ ]]; then
+        echo "check-wasm: ZS_WASM_TOOLCHAIN must be a dated nightly (nightly-YYYY-MM-DD[-<host triple>]), got '$ZS_WASM_TOOLCHAIN'" >&2
+        exit 2
+    fi
+    # `rustup toolchain install` is idempotent and is also what adds a missing rust-src component
+    # or wasm32 target to an already-installed toolchain, so skip it only when both are present
+    # (both queries fail when the toolchain is not installed at all).
+    if ! rustup component list --toolchain "$ZS_WASM_TOOLCHAIN" --installed 2>/dev/null | grep -qx 'rust-src' \
+        || ! rustup target list --toolchain "$ZS_WASM_TOOLCHAIN" --installed 2>/dev/null | grep -qx 'wasm32-unknown-unknown'; then
+        rustup toolchain install "$ZS_WASM_TOOLCHAIN" --profile minimal \
+            --component rust-src --target wasm32-unknown-unknown >/dev/null
+    fi
+    cargo=(rustup run "$ZS_WASM_TOOLCHAIN" cargo)
+else
+    cargo=("${CARGO:-cargo}")
+    export RUSTC_BOOTSTRAP=1   # -Zbuild-std on the pinned stable, as upstream CI does
+fi
+
+# Crates known to pass; append as layers go green (BUILD-SPEC 3.2 ordering). This list is
+# the per-layer CI gate: CI runs this script with no arguments (D33). Sibling briefs append here
+# (b6 §6: sqlez, db, prompt_store, clock, fs, terminal, acp_thread, client; b7 §3.32: util,
+# paths, settings, its leaf crates, zed_web last), never in the xtask job.
+# Round 4 (R4-2): the whole `zed_web` closure checks clean, so every workspace crate in it is
+# listed (b6's `prompt_store`, `client`, `acp_thread` and b7's `project` layer included), in
+# dependency order after the round-3 list, then the vendored path patches. Cargo resolves a
+# non-member `-p` (the vendored path patches, D10) only inside the dependency graph of the
+# members named alongside it, so they come after `zed_web`. Regenerate the order with
+# `cargo tree --target wasm32-unknown-unknown -p zed_web -e normal --prefix none --format '{p}'`.
+default_packages=(
+    gpui_platform
+    cloud_api_client
+    smol
+    paths
+    util
+    task
+    fuzzy
+    http_client
+    language_core
+    lsp
+    lsp-types
+    sqlez
+    db
+    clock
+    proto
+    rpc
+    fs
+    terminal
+    ui
+    assets
+    zed_web_core
+    # Round 4 (R4-2): the rest of the `zed_web` closure, dependencies first, `zed_web` last.
+    gpui_util
+    collections
+    gpui_shared_string
+    refineable
+    scheduler
+    zlog
+    ztracing
+    sum_tree
+    gpui
+    path
+    askpass
+    rope
+    text
+    git
+    telemetry_events
+    telemetry
+    fuzzy_nucleo
+    grammars
+    release_channel
+    zeta_prompt
+    cloud_llm_client
+    language_model_core
+    settings_json
+    settings_content
+    migrator
+    settings
+    zed_actions
+    syntax_theme
+    theme
+    watch
+    language
+    buffer_diff
+    cloud_api_types
+    credentials_provider
+    feature_flags
+    worktree
+    zed_credentials_provider
+    client
+    oauth_callback_server
+    context_server
+    node_runtime
+    dap
+    extension
+    git_hosting_providers
+    mermaid_render
+    theme_settings
+    component
+    icons
+    menu
+    markdown
+    prettier
+    remote
+    snippet
+    snippet_provider
+    project
+    action_log
+    file_icons
+    http_proxy
+    env_var
+    language_model
+    multi_buffer
+    sandbox
+    acp_thread
+    google_ai
+    agent_servers
+    agent_settings
+    agent_skills
+    zed_env_vars
+    html_to_markdown
+    ai_onboarding
+    anthropic
+    copilot_chat
+    session
+    ui_input
+    workspace
+    command_palette_hooks
+    edit_prediction_types
+    copilot
+    copilot_ui
+    deepseek
+    open_ai
+    language_models_cloud
+    llama_cpp
+    lmstudio
+    mistral
+    ollama
+    open_router
+    opencode
+    x_ai
+    language_models
+    prompt_store
+    shell_command_parser
+    streaming_diff
+    web_search
+    agent
+    breadcrumbs
+    language_detection
+    vim_mode_setting
+    editor
+    channel
+    notifications
+    picker
+    remote_connection
+    git_ui_core
+    platform_title_bar
+    picker_preview
+    search
+    terminal_view
+    agent_ui
+    acp_tools
+    activity_indicator
+    call_hierarchy
+    edit_prediction_context
+    edit_prediction_metrics
+    edit_prediction
+    codestral
+    command_palette
+    dap_adapters
+    debug_adapter_extension
+    debugger_tools
+    tasks_ui
+    debugger_ui
+    diagnostics
+    edit_prediction_ui
+    encoding_selector
+    open_path_prompt
+    file_finder
+    panel
+    time_format
+    git_ui
+    go_to_line
+    gpui_wgpu
+    gpui_web
+    image_viewer
+    json_schema_store
+    keymap_editor
+    language_extension
+    language_onboarding
+    language_selector
+    language_tools
+    languages
+    line_ending_selector
+    lsp_locations
+    markdown_preview
+    outline
+    outline_panel
+    project_panel
+    project_symbols
+    recent_projects
+    settings_profile_selector
+    settings_ui
+    sidebar
+    snippets_ui
+    svg_preview
+    tab_switcher
+    tabular_data_preview
+    theme_extension
+    theme_selector
+    title_bar
+    toolchain_selector
+    ui_prompt
+    vim
+    web_search_providers
+    which_key
+    perf
+    zed_web
+    # The vendored path patches in the closure (D10); non-members, resolved through `zed_web` above.
+    wasm_thread
+    async-tar
+    tree-sitter-bash
+    tree-sitter-cpp
+    tree-sitter-python
+    tree-sitter-rust
+    tree-sitter-yaml
+    tree-sitter-md
+    yawc
+    alacritty_terminal
+    agent-client-protocol
+    pet-fs
+    pet-conda
+    pet-env-var-path
+    pet-hatch
+    pet-pyenv
+    pet-uv
+    pet-venv
+    pet-virtualenvwrapper
+    pet
+)
+
+packages=()
+passthrough=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -p|--package)
+            case "$2" in
+                # The shim's package name is `smol` (a [patch] replaces by name); accept its
+                # directory name as an alias.
+                zs_smol_shim) packages+=(-p smol) ;;
+                *) packages+=(-p "$2") ;;
+            esac
+            shift 2 ;;
+        *) passthrough+=("$1"); shift ;;
+    esac
+done
+if [[ ${#packages[@]} -eq 0 ]]; then
+    for p in "${default_packages[@]}"; do packages+=(-p "$p"); done
+fi
+
+log_dir="target/wasm-logs"
+mkdir -p "$log_dir"
+log="$log_dir/$(date +%Y%m%d-%H%M%S)-${mode}.log"
+{
+    echo "# check-wasm: ${cargo[*]} -Zbuild-std=std,panic_abort $mode --target wasm32-unknown-unknown ${packages[*]} ${passthrough[*]-}"
+    echo "# $(date)"
+} > "$log"
+ln -sf "$(basename "$log")" "$log_dir/latest.log"
+
+# (`${arr[@]+"${arr[@]}"}` keeps macOS bash 3.2 happy under `set -u`.)
+set +e
+"${cargo[@]}" -Zbuild-std=std,panic_abort "$mode" --target wasm32-unknown-unknown \
+    "${packages[@]}" ${passthrough[@]+"${passthrough[@]}"} 2>&1 | tee -a "$log"
+status=${PIPESTATUS[0]}
+set -e
+
+if [[ $status -eq 0 ]]; then
+    echo "check-wasm: OK (${packages[*]}); log: $log"
+    exit 0
+fi
+
+# Compact summary: every `error…:` line with its `-->` location, the crates that failed, and
+# the totals; the full output stays in the log.
+echo
+echo "check-wasm: FAILED (exit $status); full log: $log"
+echo "check-wasm: error summary:"
+awk '
+    /^error(\[E[0-9]+\])?: / {
+        if (pending != "") { print "  " pending; pending = "" }
+        if ($0 ~ /^error: could not compile/ || $0 ~ /^error: aborting due to/) { next }
+        pending = $0; next
+    }
+    pending != "" && /^ *--> / { sub(/^ *--> /, "", $0); print "  " pending "  [" $0 "]"; pending = ""; next }
+    pending != "" && /^ *$/ { print "  " pending; pending = "" }
+    END { if (pending != "") print "  " pending }
+' "$log" | sort | uniq -c | sort -rn | head -60 || true
+# `|| true`: with `pipefail` a log without a `could not compile` line (a build script or a bad
+# `-p` failed) would otherwise kill the script here and lose cargo's exit status.
+failed="$(grep -E '^error: could not compile' "$log" | sed -E 's/^error: could not compile `([^`]+)`.*/\1/' | sort -u | tr '\n' ' ' || true)"
+if [[ -n "$failed" ]]; then
+    echo "check-wasm: crates that failed to compile: $failed"
+fi
+echo "check-wasm: $(grep -cE '^error(\[E[0-9]+\])?: ' "$log" || true) error lines in the log"
+exit "$status"

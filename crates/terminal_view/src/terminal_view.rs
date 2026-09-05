@@ -239,6 +239,7 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) -> Self {
         let workspace_handle = workspace.clone();
+        let terminal_is_remote = terminal.read(cx).is_remote_pty();
         let terminal_subscriptions =
             subscribe_for_terminal_events(&terminal, workspace, window, cx);
 
@@ -296,7 +297,9 @@ impl TerminalView {
             block_below_cursor: None,
             scroll_top: Pixels::ZERO,
             scroll_handle,
-            needs_serialize: false,
+            // A remote terminal's row must be written once even though its
+            // client-side working directory never changes (D4).
+            needs_serialize: terminal_is_remote,
             custom_title: None,
             ime_state: None,
             self_handle: cx.entity().downgrade(),
@@ -1139,6 +1142,12 @@ fn subscribe_for_terminal_events(
                     cx.emit(Event::Wakeup);
                     cx.emit(ItemEvent::UpdateTab);
                     cx.emit(SearchEvent::MatchesInvalidated);
+                    if terminal_view.needs_serialize && terminal.read(cx).is_remote_pty() {
+                        // A remote terminal's row is otherwise never written: its
+                        // working directory never changes on this side, so the
+                        // first output (the prompt) is what schedules the write.
+                        cx.emit(ItemEvent::UpdateTab);
+                    }
                 }
 
                 Event::Bell => {
@@ -1878,7 +1887,13 @@ impl SerializableItem for TerminalView {
         }
 
         let workspace_id = self.workspace_id?;
-        let cwd = terminal.working_directory();
+        // A remote terminal has no client-side working directory; its server-side
+        // one is what a restored tab needs (D4/D28).
+        let cwd = terminal
+            .working_directory()
+            .or_else(|| terminal.remote_working_directory().map(Path::to_path_buf));
+        let remote_terminal_id = terminal.remote_terminal_id();
+        let remote_title = terminal.title_override().map(str::to_owned);
         let custom_title = self.custom_title.clone();
         self.needs_serialize = false;
 
@@ -1889,6 +1904,8 @@ impl SerializableItem for TerminalView {
                     .await?;
             }
             db.save_custom_title(item_id, workspace_id, custom_title)
+                .await?;
+            db.save_remote_terminal(item_id, workspace_id, remote_terminal_id, remote_title)
                 .await?;
             Ok(())
         }))
@@ -1907,7 +1924,7 @@ impl SerializableItem for TerminalView {
         cx: &mut App,
     ) -> Task<anyhow::Result<Entity<Self>>> {
         window.spawn(cx, async move |cx| {
-            let (cwd, custom_title) = cx
+            let (cwd, custom_title, remote) = cx
                 .update(|_window, cx| {
                     let db = TerminalDb::global(cx);
                     let from_db = db
@@ -1929,14 +1946,65 @@ impl SerializableItem for TerminalView {
                         .log_err()
                         .flatten()
                         .filter(|title| !title.trim().is_empty());
-                    (cwd, custom_title)
+                    let remote = db
+                        .get_remote_terminal(item_id, workspace_id)
+                        .log_err()
+                        .flatten()
+                        .filter(|_| project.read(cx).supports_remote_pty(cx))
+                        .and_then(|(remote_terminal_id, remote_title)| {
+                            Some((remote_terminal_id?, remote_title))
+                        });
+                    (cwd, custom_title, remote)
                 })
                 .ok()
-                .unwrap_or((None, None));
+                .unwrap_or((None, None, None));
 
-            let terminal = project
-                .update(cx, |project, cx| project.create_terminal_shell(cwd, cx))
-                .await?;
+            let terminal = match remote {
+                Some((remote_terminal_id, remote_title)) => {
+                    // A center-pane `TerminalView` can deserialize before
+                    // `TerminalPanel::load` has fetched the server's inventory,
+                    // so make sure it has been fetched before consulting it
+                    // (the fetch is shared and idempotent).
+                    project
+                        .update(cx, |project, cx| {
+                            project.fetch_remote_terminal_inventory(cx)
+                        })
+                        .await;
+                    let restored = project.update(cx, |project, cx| {
+                        project.restore_remote_terminal(
+                            remote_terminal_id,
+                            cwd.clone(),
+                            remote_title,
+                            cx,
+                        )
+                    });
+                    match restored {
+                        Ok(terminal) => terminal,
+                        // D28: a sandbox stop discards every PTY, so on the next
+                        // open a persisted tab whose terminal the server no
+                        // longer has is recreated as a fresh shell in its
+                        // persisted working directory, not dropped.
+                        Err(error)
+                            if error
+                                .downcast_ref::<project::terminals::RemoteTerminalGone>()
+                                .is_some() =>
+                        {
+                            log::info!(
+                                "recreating dropped remote terminal {remote_terminal_id} as a fresh shell: {error:#}"
+                            );
+                            project
+                                .update(cx, |project, cx| project.create_terminal_shell(cwd, cx))
+                                .await?
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                None => {
+                    project
+                        .update(cx, |project, cx| project.create_terminal_shell(cwd, cx))
+                        .await?
+                }
+            };
             cx.update(|window, cx| {
                 cx.new(|cx| {
                     let mut view = TerminalView::new(
@@ -3275,5 +3343,415 @@ mod tests {
                 text
             );
         });
+    }
+
+    // Terminal restore across sessions (D4), against a fake terminal server.
+
+    /// The server half of the remote terminal protocol, as far as restore is
+    /// concerned: hands out ids, answers `ListTerminals` from `inventory`, and
+    /// records attaches and closes. No PTY, no `HeadlessProject`.
+    #[derive(Default)]
+    struct FakeTerminalServer {
+        spawns: usize,
+        /// The working directory each `SpawnTerminal` asked for, in order.
+        spawn_working_directories: Vec<Option<String>>,
+        attaches: Vec<(u64, u64)>,
+        closes: Vec<u64>,
+        inventory: Vec<rpc::proto::TerminalInfo>,
+    }
+
+    impl FakeTerminalServer {
+        fn install(
+            server_session: &rpc::AnyProtoClient,
+            server_cx: &mut TestAppContext,
+        ) -> Entity<Self> {
+            use rpc::proto::{self, REMOTE_SERVER_PROJECT_ID};
+
+            let fake = server_cx.new(|_| Self::default());
+            server_session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &fake);
+            server_session
+                .add_request_handler::<proto::Ping, _, _, _>(fake.downgrade(), |_, _, _| async {
+                    Ok(proto::Ack {})
+                });
+            server_session.add_entity_request_handler::<proto::SpawnTerminal, Self, _, _>(
+                |this, envelope, mut cx| async move {
+                    this.update(&mut cx, |this, _| {
+                        this.spawns += 1;
+                        this.spawn_working_directories
+                            .push(envelope.payload.working_directory);
+                        Ok(proto::SpawnTerminalResponse { terminal_id: 7 })
+                    })
+                },
+            );
+            server_session.add_entity_request_handler::<proto::AttachTerminal, Self, _, _>(
+                |this, envelope, mut cx| async move {
+                    this.update(&mut cx, |this, _| {
+                        let request = envelope.payload;
+                        this.attaches
+                            .push((request.terminal_id, request.from_offset));
+                        Ok(proto::AttachTerminalResponse {
+                            replayed_from: request.from_offset,
+                            end_offset: request.from_offset,
+                            exit: None,
+                        })
+                    })
+                },
+            );
+            server_session.add_entity_request_handler::<proto::ListTerminals, Self, _, _>(
+                |this, _envelope, mut cx| async move {
+                    this.update(&mut cx, |this, _| {
+                        Ok(proto::ListTerminalsResponse {
+                            terminals: this.inventory.clone(),
+                        })
+                    })
+                },
+            );
+            server_session.add_entity_message_handler::<proto::CloseTerminal, Self, _, _>(
+                |this, envelope, mut cx| async move {
+                    this.update(&mut cx, |this, _| {
+                        this.closes.push(envelope.payload.terminal_id)
+                    });
+                    Ok(())
+                },
+            );
+            server_session.add_entity_message_handler::<proto::TerminalInput, Self, _, _>(
+                |_, _, _| async { Ok(()) },
+            );
+            server_session.add_entity_message_handler::<proto::AckTerminalOutput, Self, _, _>(
+                |_, _, _| async { Ok(()) },
+            );
+            server_session.add_entity_message_handler::<proto::ResizeTerminal, Self, _, _>(
+                |_, _, _| async { Ok(()) },
+            );
+            fake
+        }
+    }
+
+    /// Runs both sides until every queued message and task has been processed.
+    ///
+    /// The empty updates flush effects, which is when GPUI releases dropped
+    /// entities (and so runs `Drop for Terminal`); the clock advance fires the
+    /// terminal's output-batching timer.
+    fn settle(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
+        for _ in 0..4 {
+            cx.update(|_| {});
+            server_cx.update(|_| {});
+            cx.run_until_parked();
+            server_cx.run_until_parked();
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(5));
+            cx.run_until_parked();
+            server_cx.run_until_parked();
+        }
+    }
+
+    /// A remote project whose mock transport hosts PTYs (the WebSocket
+    /// transport's shape), backed by a [`FakeTerminalServer`].
+    async fn init_remote_pty_test(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) -> (
+        Entity<Project>,
+        gpui::WindowHandle<MultiWorkspace>,
+        Entity<FakeTerminalServer>,
+    ) {
+        cx.update(|cx| {
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+        });
+        server_cx.update(|cx| {
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+        });
+
+        let params = cx.update(AppState::test);
+        cx.update(|cx| {
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            // A database of this test's own: the shared fallback is racy across
+            // tests running in parallel.
+            cx.set_global(db::AppDatabase::test_new());
+        });
+        let (opts, server_session, connect_guard) =
+            RemoteClient::fake_server_with_remote_pty(cx, server_cx);
+        let fake = FakeTerminalServer::install(&server_session, server_cx);
+        drop(connect_guard);
+
+        let remote_client = RemoteClient::connect_mock(opts, cx).await;
+        let project = cx.update(|cx| {
+            Project::remote(
+                remote_client,
+                params.client.clone(),
+                params.node_runtime.clone(),
+                params.user_store.clone(),
+                params.languages.clone(),
+                params.fs.clone(),
+                false,
+                cx,
+            )
+        });
+
+        let window_handle = cx.add_window({
+            let params = params.clone();
+            let project_for_workspace = project.clone();
+            move |window, cx| {
+                window.activate_window();
+                let workspace = cx.new(|cx| {
+                    Workspace::new(
+                        None,
+                        project_for_workspace.clone(),
+                        params.clone(),
+                        window,
+                        cx,
+                    )
+                });
+                MultiWorkspace::new(workspace, window, cx)
+            }
+        });
+
+        (project, window_handle, fake)
+    }
+
+    /// Opens a remote shell, wraps it in a `TerminalView` bound to `workspace_id`
+    /// and serializes it, returning the view's item id and the persisted title.
+    async fn open_and_persist_remote_terminal(
+        project: &Entity<Project>,
+        window_handle: gpui::WindowHandle<MultiWorkspace>,
+        workspace_id: WorkspaceId,
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) -> (
+        Entity<Terminal>,
+        Entity<TerminalView>,
+        workspace::ItemId,
+        String,
+    ) {
+        let terminal = project
+            .update(cx, |project, cx| {
+                project.create_terminal_shell(Some(PathBuf::from("/workspaces/app")), cx)
+            })
+            .await
+            .expect("remote shell spawns");
+        settle(cx, server_cx);
+        let (remote_terminal_id, remote_title) = terminal.read_with(cx, |terminal, _| {
+            (
+                terminal.remote_terminal_id(),
+                terminal.title_override().map(str::to_owned),
+            )
+        });
+        assert_eq!(remote_terminal_id, Some(7));
+        let remote_title = remote_title.expect("project names remote shells");
+
+        let view = window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                cx.new(|cx| {
+                    TerminalView::new(
+                        terminal.clone(),
+                        workspace.downgrade(),
+                        Some(workspace_id),
+                        project.downgrade(),
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .unwrap();
+        let item_id = view.entity_id().as_u64();
+
+        // A remote terminal must be written once even though its client-side
+        // working directory never changes.
+        assert!(view.read_with(cx, |view, _| view.needs_serialize));
+        let serialize = window_handle
+            .update(cx, |multi_workspace, _window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                workspace.update(cx, |workspace, cx| {
+                    view.update(cx, |view, cx| view.serialize(workspace, item_id, false, cx))
+                })
+            })
+            .unwrap();
+        serialize
+            .expect("a remote terminal serializes")
+            .await
+            .unwrap();
+        assert!(!view.read_with(cx, |view, _| view.needs_serialize));
+
+        let db = cx.update(|cx| TerminalDb::global(cx));
+        assert_eq!(
+            db.get_remote_terminal(item_id, workspace_id).unwrap(),
+            Some((Some(7), Some(remote_title.clone())))
+        );
+        assert_eq!(
+            db.get_working_directory(item_id, workspace_id).unwrap(),
+            Some(PathBuf::from("/workspaces/app"))
+        );
+
+        (terminal, view, item_id, remote_title)
+    }
+
+    fn deserialize_terminal(
+        project: &Entity<Project>,
+        window_handle: gpui::WindowHandle<MultiWorkspace>,
+        workspace_id: WorkspaceId,
+        item_id: workspace::ItemId,
+        cx: &mut TestAppContext,
+    ) -> Task<anyhow::Result<Entity<TerminalView>>> {
+        window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                TerminalView::deserialize(
+                    project.clone(),
+                    multi_workspace.workspace().downgrade(),
+                    workspace_id,
+                    item_id,
+                    window,
+                    cx,
+                )
+            })
+            .unwrap()
+    }
+
+    #[gpui::test]
+    async fn test_remote_terminal_restore_roundtrip(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let (project, window_handle, fake) = init_remote_pty_test(cx, server_cx).await;
+        let workspace_id = cx
+            .update(|cx| workspace::WorkspaceDb::global(cx))
+            .next_id()
+            .await
+            .unwrap();
+
+        let (terminal, view, item_id, remote_title) =
+            open_and_persist_remote_terminal(&project, window_handle, workspace_id, cx, server_cx)
+                .await;
+
+        // The client vanishes without closing its tab (a page reload): the
+        // server keeps the terminal and hears no CloseTerminal.
+        terminal.update(cx, |terminal, _| terminal.forget_remote_transport());
+        drop(view);
+        drop(terminal);
+        settle(cx, server_cx);
+        fake.read_with(server_cx, |fake, _| assert!(fake.closes.is_empty()));
+        project.read_with(cx, |project, _| {
+            assert!(project.local_terminal_handles().is_empty());
+        });
+
+        // A fresh session: the server still lists the terminal.
+        fake.update(server_cx, |fake, _| {
+            fake.inventory = vec![rpc::proto::TerminalInfo {
+                terminal_id: 7,
+                title: "t".to_string(),
+                ..Default::default()
+            }];
+        });
+        project
+            .update(cx, |project, cx| {
+                project.fetch_remote_terminal_inventory(cx)
+            })
+            .await;
+        settle(cx, server_cx);
+
+        let restored = deserialize_terminal(&project, window_handle, workspace_id, item_id, cx)
+            .await
+            .expect("the persisted terminal is restored");
+        settle(cx, server_cx);
+
+        restored.read_with(cx, |view, cx| {
+            let terminal = view.terminal().read(cx);
+            assert!(terminal.is_remote_pty());
+            assert_eq!(terminal.remote_terminal_id(), Some(7));
+            // The persisted title wins over the server's.
+            assert_eq!(terminal.title(true), remote_title);
+            assert_eq!(
+                terminal.remote_working_directory(),
+                Some(Path::new("/workspaces/app"))
+            );
+            assert!(terminal.has_active_pty_resources());
+        });
+        fake.read_with(server_cx, |fake, _| {
+            assert_eq!(
+                fake.spawns, 1,
+                "a restored tab is reattached, not respawned"
+            );
+            assert_eq!(fake.attaches, vec![(7, 0), (7, 0)]);
+            assert!(fake.closes.is_empty());
+        });
+
+        // The restored terminal is not reaped as unrestored.
+        project.update(cx, |project, cx| {
+            project.close_unrestored_remote_terminals(cx)
+        });
+        settle(cx, server_cx);
+        fake.read_with(server_cx, |fake, _| assert!(fake.closes.is_empty()));
+    }
+
+    #[gpui::test]
+    async fn test_dropped_remote_terminal_recreated_as_fresh_shell(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let (project, window_handle, fake) = init_remote_pty_test(cx, server_cx).await;
+        let workspace_id = cx
+            .update(|cx| workspace::WorkspaceDb::global(cx))
+            .next_id()
+            .await
+            .unwrap();
+
+        let (terminal, view, item_id, _remote_title) =
+            open_and_persist_remote_terminal(&project, window_handle, workspace_id, cx, server_cx)
+                .await;
+        terminal.update(cx, |terminal, _| terminal.forget_remote_transport());
+        drop(view);
+        drop(terminal);
+        settle(cx, server_cx);
+
+        // The server lost terminal 7 (sandbox stop/resume) and lists only a
+        // stranger.
+        fake.update(server_cx, |fake, _| {
+            fake.inventory = vec![rpc::proto::TerminalInfo {
+                terminal_id: 9,
+                title: "nine".to_string(),
+                ..Default::default()
+            }];
+        });
+        project
+            .update(cx, |project, cx| {
+                project.fetch_remote_terminal_inventory(cx)
+            })
+            .await;
+        settle(cx, server_cx);
+
+        // D28: the persisted tab is recreated as a fresh shell in its persisted
+        // working directory, not dropped.
+        let restored = deserialize_terminal(&project, window_handle, workspace_id, item_id, cx)
+            .await
+            .expect("a dropped remote terminal is recreated as a fresh shell");
+        settle(cx, server_cx);
+        restored.read_with(cx, |view, cx| {
+            let terminal = view.terminal().read(cx);
+            assert!(terminal.is_remote_pty());
+            assert!(terminal.has_active_pty_resources());
+        });
+        fake.read_with(server_cx, |fake, _| {
+            assert_eq!(
+                fake.spawns, 2,
+                "the original shell plus the recreated one"
+            );
+            assert_eq!(
+                fake.spawn_working_directories.last(),
+                Some(&Some("/workspaces/app".to_string())),
+                "the recreated shell keeps the persisted working directory (D28)"
+            );
+        });
+
+        // The stranger nobody restored is reaped; the recreated shell (id 7) is
+        // not, because it is now in `terminals.remote`.
+        project.update(cx, |project, cx| {
+            project.close_unrestored_remote_terminals(cx)
+        });
+        settle(cx, server_cx);
+        fake.read_with(server_cx, |fake, _| assert_eq!(fake.closes, vec![9]));
+        project.read_with(cx, |project, _| {
+            assert_eq!(project.local_terminal_handles().len(), 1);
+        });
+        drop(restored);
     }
 }

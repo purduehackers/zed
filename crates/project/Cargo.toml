@@ -101,6 +101,7 @@ url.workspace = true
 util.workspace = true
 watch.workspace = true
 wax.workspace = true
+web-time.workspace = true
 which.workspace = true
 worktree.workspace = true
 zed_credentials_provider.workspace = true

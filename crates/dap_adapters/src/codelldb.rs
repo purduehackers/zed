@@ -3,11 +3,14 @@ use std::{env::consts, path::PathBuf, sync::OnceLock};
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use collections::HashMap;
-use dap::adapters::{DebugTaskDefinition, latest_github_release};
+use dap::adapters::DebugTaskDefinition;
+#[cfg(not(target_family = "wasm"))]
+use dap::adapters::latest_github_release;
 use futures::StreamExt;
 use gpui::AsyncApp;
 use serde_json::Value;
 use task::{DebugRequest, DebugScenario, ZedDebugConfig};
+#[cfg(not(target_family = "wasm"))]
 use util::fs::remove_matching;
 
 use crate::*;
@@ -45,6 +48,7 @@ impl CodeLldbDebugAdapter {
         })
     }
 
+    #[cfg(not(target_family = "wasm"))]
     async fn fetch_latest_adapter_version(
         &self,
         delegate: &Arc<dyn DapDelegate>,
@@ -80,6 +84,21 @@ impl CodeLldbDebugAdapter {
         };
 
         Ok(ret)
+    }
+
+    /// The browser neither queries GitHub (`http_client::github` is native-only) nor installs
+    /// adapters locally; the remote server does both. Failing here makes `get_binary` fall
+    /// through to its cached-adapter lookup, exactly as an offline desktop does.
+    #[cfg(target_family = "wasm")]
+    async fn fetch_latest_adapter_version(
+        &self,
+        delegate: &Arc<dyn DapDelegate>,
+    ) -> Result<AdapterVersion> {
+        let _ = delegate;
+        anyhow::bail!(
+            "fetching the latest {} release is not supported in the browser",
+            Self::ADAPTER_NAME
+        )
     }
 }
 
@@ -351,6 +370,9 @@ impl DebugAdapter for CodeLldbDebugAdapter {
                     .await?;
                     let version_path =
                         adapter_path.join(format!("{}_{}", Self::ADAPTER_NAME, version.tag_name));
+                    // `util::fs` is native-only; the browser never reaches this arm because
+                    // `fetch_latest_adapter_version` always fails there.
+                    #[cfg(not(target_family = "wasm"))]
                     remove_matching(&adapter_path, |entry| entry != version_path).await;
                     version_path
                 }

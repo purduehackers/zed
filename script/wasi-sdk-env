@@ -1,0 +1,21 @@
+# Sourced (not run) by script/wasm-cc, script/wasm-ar and script/ensure-wasi-sdk: which wasi-sdk
+# release the wasm32-unknown-unknown C toolchain is pinned to and where it lives.
+#   WASI_SDK_VERSION  the pinned release; script/wasi-sdk.sha256 carries its tarball digests
+#   WASI_SDK_DIR      $WASI_SDK_PATH if set, else <repo>/target/wasi-sdk
+#   wasi_sdk_check    `wasi_sdk_check <caller>`: returns 1 (with a message naming <caller>) unless
+#                     $WASI_SDK_DIR holds bin/clang and its VERSION file says $WASI_SDK_VERSION
+WASI_SDK_VERSION="25.0"
+WASI_SDK_DIR="${WASI_SDK_PATH:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/wasi-sdk}"
+
+wasi_sdk_check() {
+    if [[ ! -x "$WASI_SDK_DIR/bin/clang" ]]; then
+        echo "$1: wasi-sdk not found at $WASI_SDK_DIR; run script/ensure-wasi-sdk or set WASI_SDK_PATH" >&2
+        return 1
+    fi
+    local version=""
+    IFS= read -r version < "$WASI_SDK_DIR/VERSION" 2>/dev/null || true
+    if [[ "$version" != "$WASI_SDK_VERSION" ]]; then
+        echo "$1: $WASI_SDK_DIR is not wasi-sdk $WASI_SDK_VERSION (VERSION: ${version:-missing})" >&2
+        return 1
+    fi
+}

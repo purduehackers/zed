@@ -39,10 +39,11 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{self, Poll},
-    time::Instant,
 };
 use streaming_diff::{CharOperation, LineDiff, LineOperation, StreamingDiff};
 use uuid::Uuid;
+// `web_time::Instant` is `std::time::Instant` natively; on wasm `Instant::now()` panics.
+use web_time::Instant;
 
 /// Use this tool when you cannot or should not make a rewrite. This includes:
 /// - The user's request is unclear, ambiguous, or nonsensical

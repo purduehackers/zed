@@ -3,7 +3,6 @@ use async_trait::async_trait;
 use collections::HashMap;
 use futures::StreamExt;
 use gpui::{App, AsyncApp, Entity, Task};
-use http_client::github::latest_github_release;
 pub use language::*;
 use language::{
     LanguageName, LanguageToolchainStore, LspAdapterDelegate, LspInstaller,
@@ -30,7 +29,9 @@ use std::{
     },
 };
 use task::{TaskTemplate, TaskTemplates, TaskVariables, VariableName};
-use util::{ResultExt, fs::remove_matching, maybe, merge_json_value_into};
+use util::{ResultExt, maybe, merge_json_value_into};
+
+use crate::lsp_download::{latest_github_release, remove_matching};
 
 pub(crate) fn semantic_token_rules() -> SemanticTokenRules {
     let content = grammars::get_file("go/semantic_token_rules.json")

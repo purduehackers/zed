@@ -19,6 +19,13 @@ pub struct Statement<'a> {
     connection: &'a Connection,
     ///Indicates that the `Statement` struct is tied to the lifetime of the SQLite statement
     phantom: PhantomData<sqlite3_stmt>,
+    /// Held for the statement's lifetime (statements are used synchronously, never across
+    /// an `.await`), so `bind`/`step`/`column`/`finalize` are serialized without touching
+    /// each method. Last field: `Drop::drop` finalizes the raw statements before it is
+    /// released. Also taken in the host's own unit tests so the cross-thread `write` flag
+    /// test exercises the same ordering.
+    #[cfg(any(target_family = "wasm", test))]
+    _lock: crate::wasm_lock::Guard,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -38,11 +45,17 @@ pub enum SqlType {
 
 impl<'a> Statement<'a> {
     pub fn prepare<T: AsRef<str>>(connection: &'a Connection, query: T) -> Result<Self> {
+        // Before the `can_write()` guard below: the write queue holds the same lock for
+        // the whole closure, so a thread that gets here sees the flag only as its own.
+        #[cfg(any(target_family = "wasm", test))]
+        let _lock = crate::wasm_lock::lock();
         let mut statement = Self {
             raw_statements: Default::default(),
             current_statement: 0,
             connection,
             phantom: PhantomData,
+            #[cfg(any(target_family = "wasm", test))]
+            _lock,
         };
         let sql = CString::new(query.as_ref()).context("Error creating cstr")?;
         let mut remaining_sql = sql.as_c_str();

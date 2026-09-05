@@ -321,7 +321,8 @@ impl log::Log for Logger {
 
 pub struct Timer {
     pub logger: Logger,
-    pub start_time: std::time::Instant,
+    // `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` on native.
+    pub start_time: web_time::Instant,
     pub name: &'static str,
     pub warn_if_longer_than: Option<std::time::Duration>,
     pub done: bool,
@@ -339,7 +340,7 @@ impl Timer {
         Self {
             logger,
             name,
-            start_time: std::time::Instant::now(),
+            start_time: web_time::Instant::now(),
             warn_if_longer_than: None,
             done: false,
         }

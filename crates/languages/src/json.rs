@@ -1,11 +1,8 @@
 use anyhow::{Context as _, Result, bail};
-use async_compression::futures::bufread::GzipDecoder;
-use async_tar::Archive;
 use async_trait::async_trait;
 use collections::HashMap;
 use futures::StreamExt;
 use gpui::{App, AsyncApp, Entity, Task};
-use http_client::github::{GitHubLspBinaryVersion, latest_github_release};
 use language::{
     Buffer, ContextProvider, LanguageName, LanguageRegistry, LocalFile as _, LspAdapter,
     LspAdapterDelegate, LspInstaller, Toolchain,
@@ -16,10 +13,7 @@ use project::lsp_store::language_server_settings;
 use semver::Version;
 use serde_json::{Value, json};
 use settings::SettingsLocation;
-use smol::{
-    fs::{self},
-    io::BufReader,
-};
+use smol::fs;
 use std::{
     borrow::Cow,
     env::consts,
@@ -31,11 +25,14 @@ use std::{
 };
 use task::{TaskTemplate, TaskTemplates, VariableName};
 use util::{
-    ResultExt, archive::extract_zip, fs::remove_matching, maybe, merge_json_value_into,
-    paths::PathStyle, rel_path::RelPath, union_json_value_into,
+    ResultExt, maybe, merge_json_value_into, paths::PathStyle, rel_path::RelPath,
+    union_json_value_into,
 };
 
 use crate::PackageJsonData;
+use crate::lsp_download::{
+    GitHubLspBinaryVersion, extract_tar_gz, extract_zip, latest_github_release, remove_matching,
+};
 
 const SERVER_PATH: &str =
     "node_modules/vscode-langservers-extracted/bin/vscode-json-language-server";
@@ -515,9 +512,7 @@ impl LspInstaller for NodeVersionAdapter {
                 if version.url.ends_with(".zip") {
                     extract_zip(&destination_container_path, response.body_mut()).await?;
                 } else if version.url.ends_with(".tar.gz") {
-                    let decompressed_bytes = GzipDecoder::new(BufReader::new(response.body_mut()));
-                    let archive = Archive::new(decompressed_bytes);
-                    archive.unpack(&destination_container_path).await?;
+                    extract_tar_gz(&destination_container_path, response.body_mut()).await?;
                 }
 
                 fs::copy(

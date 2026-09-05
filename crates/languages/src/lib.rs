@@ -23,6 +23,7 @@ mod css;
 mod eslint;
 mod go;
 mod json;
+mod lsp_download;
 mod package_json;
 mod python;
 mod rust;
@@ -56,8 +57,14 @@ pub static LANGUAGE_GIT_COMMIT: std::sync::LazyLock<Arc<Language>> =
     });
 
 pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime, cx: &mut App) {
-    #[cfg(feature = "load-grammars")]
+    #[cfg(all(feature = "load-grammars", not(target_family = "wasm")))]
     languages.register_native_grammars(grammars::native_grammars());
+    #[cfg(all(feature = "load-grammars", target_family = "wasm"))]
+    languages.register_native_grammars(
+        grammars::native_grammars()
+            .into_iter()
+            .map(|(name, _)| (name, linked_grammar_handle(name))),
+    );
 
     let bash_lsp_adapter = Arc::new(bash::BashLspAdapter::new(node.clone()));
     let c_lsp_adapter = Arc::new(c::CLspAdapter);
@@ -326,6 +333,25 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
     for provider in manifest_providers {
         project::ManifestProvidersStore::global(cx).register(provider);
     }
+}
+
+/// A [`GrammarHandle`] for one of the grammars linked into this module, by name.
+///
+/// `grammars::native_grammars()` hands out `tree_sitter::Language`s, which are `!Send` in the
+/// browser: a grammar linked at runtime lives in the function table of the wasm instance that
+/// linked it, and every worker is its own instance (see [`ParseableLanguage`]). The built-in
+/// grammars are linked statically, so every instance can materialize them: the resolver does so
+/// on whichever thread parses, from the grammar's `LanguageFn` via `native_grammars()` — what
+/// [`GrammarHandle`]'s `From<LanguageFn>` does for a grammar registered by function.
+#[cfg(all(feature = "load-grammars", target_family = "wasm"))]
+fn linked_grammar_handle(name: &'static str) -> GrammarHandle {
+    ParseableLanguage::from_resolver(Arc::new(move || {
+        grammars::native_grammars()
+            .into_iter()
+            .find_map(|(grammar_name, grammar)| (grammar_name == name).then_some(grammar))
+            .ok_or_else(|| anyhow::anyhow!("no built-in grammar named {name:?}"))
+    }))
+    .into()
 }
 
 #[derive(Default)]

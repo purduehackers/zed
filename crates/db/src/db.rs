@@ -1,8 +1,10 @@
+pub mod client_state;
 pub mod kvp;
 pub mod query;
 
 // Re-export
 pub use anyhow;
+#[cfg(not(target_family = "wasm"))]
 use anyhow::Context as _;
 pub use gpui;
 use gpui::{App, AppContext, Global};
@@ -16,14 +18,21 @@ pub use uuid;
 pub use release_channel::RELEASE_CHANNEL;
 use release_channel::ReleaseChannel;
 use sqlez::domain::Migrator;
+pub use sqlez::thread_safe_connection::RestoreOutcome;
 use sqlez::thread_safe_connection::ThreadSafeConnection;
 use sqlez_macros::sql;
+#[cfg(not(target_family = "wasm"))]
 use std::fs::create_dir_all;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::sync::atomic::AtomicBool;
-use std::sync::{LazyLock, atomic::Ordering};
-use util::{ResultExt, maybe};
+#[cfg(not(target_family = "wasm"))]
+use std::sync::atomic::Ordering;
+use util::ResultExt;
+#[cfg(not(target_family = "wasm"))]
+use util::maybe;
+#[cfg(not(target_family = "wasm"))]
 use zed_env_vars::ZED_STATELESS;
 
 /// A migration registered via `static_connection!` and collected at link time.
@@ -35,6 +44,14 @@ pub struct DomainMigration {
 }
 
 inventory::collect!(DomainMigration);
+
+/// How many domain migrations the link-time registry holds. On wasm the registry is
+/// filled by `__wasm_call_ctors`, which the loader must run before `open_with_image`;
+/// a count of zero there means the constructors did not run and the database would
+/// silently open with an empty schema, so the browser boot asserts on this first.
+pub fn registered_migration_count() -> usize {
+    inventory::iter::<DomainMigration>().count()
+}
 
 /// The shared database connection backing all domain-specific DB wrappers.
 /// Set as a GPUI global per-App. Falls back to a shared LazyLock if not set.
@@ -60,19 +77,46 @@ impl Migrator for AppMigrator {
 impl AppDatabase {
     /// Opens the production database and runs all inventory-registered
     /// migrations in dependency order.
+    #[cfg(not(target_family = "wasm"))]
     pub fn new() -> Self {
         let db_dir = database_dir();
         let connection = gpui::block_on(open_db::<AppMigrator>(db_dir, *RELEASE_CHANNEL));
         Self(connection)
     }
 
+    /// Native: like `new`, but restores `image` (a `ThreadSafeConnection::serialize` image
+    /// of an `AppDatabase`, when `Some`) before migrating. An unusable image is reported as
+    /// `RestoreOutcome::Skipped` and the database opens empty.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn new_with_image(image: Option<Vec<u8>>) -> (Self, RestoreOutcome) {
+        gpui::block_on(Self::open_with_image(image))
+    }
+
+    /// Async constructor for targets without `gpui::block_on` (the browser entry point);
+    /// otherwise identical to `new_with_image`. Await it from a background task: the restore
+    /// copies the image on the awaiting thread where the write queue runs inline.
+    pub async fn open_with_image(image: Option<Vec<u8>>) -> (Self, RestoreOutcome) {
+        let db_dir = database_dir();
+        let (connection, outcome) =
+            open_db_with_image::<AppMigrator>(db_dir, *RELEASE_CHANNEL, image).await;
+        (Self(connection), outcome)
+    }
+
     /// Creates a new in-memory database with a unique name and runs all
     /// inventory-registered migrations in dependency order.
     #[cfg(any(test, feature = "test-support"))]
     pub fn test_new() -> Self {
+        Self::test_new_with_image(None).0
+    }
+
+    /// Like `test_new`, but restores `image` first (the in-memory counterpart of
+    /// `new_with_image`, so tests never touch the real database directory).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_new_with_image(image: Option<Vec<u8>>) -> (Self, RestoreOutcome) {
         let name = format!("test-db-{}", uuid::Uuid::new_v4());
-        let connection = gpui::block_on(open_test_db::<AppMigrator>(&name));
-        Self(connection)
+        let (connection, outcome) =
+            gpui::block_on(open_test_db_with_image::<AppMigrator>(&name, image));
+        (Self(connection), outcome)
     }
 
     /// Returns the per-App connection if set, otherwise falls back to
@@ -126,11 +170,22 @@ const CONNECTION_INITIALIZE_QUERY: &str = sql!(
     PRAGMA foreign_keys=TRUE;
 );
 
+#[cfg(not(target_family = "wasm"))]
 const DB_INITIALIZE_QUERY: &str = sql!(
     PRAGMA journal_mode=WAL;
     PRAGMA busy_timeout=500;
     PRAGMA case_sensitive_like=TRUE;
     PRAGMA synchronous=NORMAL;
+);
+
+/// No busy handler in the browser: SQLite's busy wait goes through the VFS `xSleep`,
+/// which is `memory.atomic.wait32` in sqlite-wasm-rs and traps on the main thread.
+/// With a single connection SQLITE_BUSY cannot occur anyway.
+#[cfg(target_family = "wasm")]
+const DB_INITIALIZE_QUERY: &str = sql!(
+    PRAGMA journal_mode=MEMORY;
+    PRAGMA case_sensitive_like=TRUE;
+    PRAGMA synchronous=OFF;
 );
 
 const FALLBACK_DB_NAME: &str = "FALLBACK_MEMORY_DB";
@@ -175,49 +230,121 @@ pub async fn open_db<M: Migrator + 'static>(
     db_dir: &Path,
     scope: impl DbScope,
 ) -> ThreadSafeConnection {
-    if *ZED_STATELESS {
-        return open_fallback_db::<M>().await;
+    open_db_with_image::<M>(db_dir, scope, None).await.0
+}
+
+/// Like [`open_db`], but restores `image` (when `Some`) into whichever database is opened
+/// (the file database, or the in-memory fallback) before its migrations run, and reports
+/// what happened to it. The image is validated on a scratch connection first, so it can
+/// neither make the file database fail to open nor make the fallback panic: an unusable
+/// image yields `RestoreOutcome::Skipped` and an empty database.
+pub async fn open_db_with_image<M: Migrator + 'static>(
+    db_dir: &Path,
+    scope: impl DbScope,
+    image: Option<Vec<u8>>,
+) -> (ThreadSafeConnection, RestoreOutcome) {
+    // The browser has no database directory: the memory VFS would accept a fake path,
+    // but there is nothing to gain, and `ALL_FILE_DB_FAILED` must not be set on a normal
+    // boot. Persistence is the client-state image (`client_state`).
+    #[cfg(target_family = "wasm")]
+    {
+        log::debug!(
+            "browser build: opening the in-memory database in place of {}",
+            db_path(db_dir, scope).display()
+        );
+        return open_fallback_db::<M>(image).await;
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    if *ZED_STATELESS {
+        return open_fallback_db::<M>(image).await;
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     let db_path = db_path(db_dir, scope);
 
+    // The main attempt gets a copy: an image never makes `open_main_db` fail (it is
+    // validated on a scratch connection first), so a failure here is unrelated to it and the
+    // fallback must still receive it, or the client would run an empty database read-write
+    // and overwrite the stored image on its first save.
+    #[cfg(not(target_family = "wasm"))]
     let connection = maybe!(async {
         if let Some(parent) = db_path.parent() {
             create_dir_all(parent)
                 .context("Could not create db directory")
                 .log_err()?;
         }
-        open_main_db::<M>(&db_path).await
+        open_main_db::<M>(&db_path, image.clone()).await
     })
     .await;
 
+    #[cfg(not(target_family = "wasm"))]
     if let Some(connection) = connection {
         return connection;
     }
 
     // Set another static ref so that we can escalate the notification
+    #[cfg(not(target_family = "wasm"))]
     ALL_FILE_DB_FAILED.store(true, Ordering::Release);
 
     // If still failed, create an in memory db with a known name
-    open_fallback_db::<M>().await
+    #[cfg(not(target_family = "wasm"))]
+    open_fallback_db::<M>(image).await
 }
 
-async fn open_main_db<M: Migrator>(db_path: &Path) -> Option<ThreadSafeConnection> {
+#[cfg(not(target_family = "wasm"))]
+async fn open_main_db<M: Migrator>(
+    db_path: &Path,
+    image: Option<Vec<u8>>,
+) -> Option<(ThreadSafeConnection, RestoreOutcome)> {
     log::trace!("Opening database {}", db_path.display());
-    ThreadSafeConnection::builder::<M>(db_path.to_string_lossy().as_ref(), true)
+    let mut builder = ThreadSafeConnection::builder::<M>(db_path.to_string_lossy().as_ref(), true)
         .with_db_initialization_query(DB_INITIALIZE_QUERY)
-        .with_connection_initialize_query(CONNECTION_INITIALIZE_QUERY)
-        .build()
-        .await
-        .log_err()
+        .with_connection_initialize_query(CONNECTION_INITIALIZE_QUERY);
+    if let Some(image) = image {
+        builder = builder.with_restore_image(image);
+    }
+    builder.build_with_outcome().await.log_err()
 }
 
-async fn open_fallback_db<M: Migrator>() -> ThreadSafeConnection {
+async fn open_fallback_db<M: Migrator>(
+    image: Option<Vec<u8>>,
+) -> (ThreadSafeConnection, RestoreOutcome) {
+    open_fallback_db_named::<M>(FALLBACK_DB_NAME, image).await
+}
+
+async fn open_fallback_db_named<M: Migrator>(
+    name: &str,
+    image: Option<Vec<u8>>,
+) -> (ThreadSafeConnection, RestoreOutcome) {
+    open_fallback_db_with_queue::<M>(name, image, None).await
+}
+
+/// `open_fallback_db` with an explicit write queue. The builder's default queue is an
+/// OS thread natively and `sqlez`'s `wasm_lock_queue` in the browser; tests pass the
+/// wasm queue to run the browser's path on the host without spawning a thread.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn open_fallback_db_with_queue<M: Migrator>(
+    name: &str,
+    image: Option<Vec<u8>>,
+    write_queue_constructor: Option<sqlez::thread_safe_connection::WriteQueueConstructor>,
+) -> (ThreadSafeConnection, RestoreOutcome) {
+    // The in-memory database is the browser's normal path, not a fallback.
+    #[cfg(target_family = "wasm")]
+    log::debug!("Opening in-memory database {name}");
+    #[cfg(not(target_family = "wasm"))]
     log::warn!("Opening fallback in-memory database");
-    ThreadSafeConnection::builder::<M>(FALLBACK_DB_NAME, false)
+    let mut builder = ThreadSafeConnection::builder::<M>(name, false)
         .with_db_initialization_query(DB_INITIALIZE_QUERY)
-        .with_connection_initialize_query(CONNECTION_INITIALIZE_QUERY)
-        .build()
+        .with_connection_initialize_query(CONNECTION_INITIALIZE_QUERY);
+    if let Some(image) = image {
+        builder = builder.with_restore_image(image);
+    }
+    if let Some(write_queue_constructor) = write_queue_constructor {
+        builder = builder.with_write_queue_constructor(write_queue_constructor);
+    }
+    builder
+        .build_with_outcome()
         .await
         .expect(
             "Fallback in memory database failed. Likely initialization queries or migrations have fundamental errors",
@@ -226,16 +353,27 @@ async fn open_fallback_db<M: Migrator>() -> ThreadSafeConnection {
 
 #[cfg(any(test, feature = "test-support"))]
 pub async fn open_test_db<M: Migrator>(db_name: &str) -> ThreadSafeConnection {
+    open_test_db_with_image::<M>(db_name, None).await.0
+}
+
+/// Test counterpart of [`open_db_with_image`]: a uniquely named in-memory database whose
+/// writes run inline on a mutex.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn open_test_db_with_image<M: Migrator>(
+    db_name: &str,
+    image: Option<Vec<u8>>,
+) -> (ThreadSafeConnection, RestoreOutcome) {
     use sqlez::thread_safe_connection::locking_queue;
 
-    ThreadSafeConnection::builder::<M>(db_name, false)
+    let mut builder = ThreadSafeConnection::builder::<M>(db_name, false)
         .with_db_initialization_query(DB_INITIALIZE_QUERY)
         .with_connection_initialize_query(CONNECTION_INITIALIZE_QUERY)
         // Serialize queued writes via a mutex and run them synchronously
-        .with_write_queue_constructor(locking_queue())
-        .build()
-        .await
-        .unwrap()
+        .with_write_queue_constructor(locking_queue());
+    if let Some(image) = image {
+        builder = builder.with_restore_image(image);
+    }
+    builder.build_with_outcome().await.unwrap()
 }
 
 /// Implements a basic DB wrapper for a given domain
@@ -299,7 +437,236 @@ mod tests {
     use sqlez::domain::Domain;
     use sqlez_macros::sql;
 
-    use crate::open_db;
+    use crate::{
+        AppMigrator, RestoreOutcome, open_db, open_db_with_image, open_fallback_db_named,
+        open_fallback_db_with_queue, registered_migration_count,
+    };
+
+    /// The browser boot awaits `open_with_image` on the background executor, which needs
+    /// the future to be `Send`; checked here, natively, so the contract cannot silently
+    /// break in `sqlez`.
+    #[test]
+    fn open_with_image_future_is_send() {
+        fn assert_send<T: Send>(_: &T) {}
+        let future = crate::AppDatabase::open_with_image(None);
+        assert_send(&future);
+        // Never polled: it would open the real database directory.
+        drop(future);
+    }
+
+    /// The browser's path: no OS thread for the write queue (the test dispatcher would
+    /// panic on parking), the migrations run inline under `wasm_lock`, and the
+    /// link-time migration registry is populated.
+    #[gpui::test]
+    async fn open_fallback_db_with_wasm_lock_queue_needs_no_parking(cx: &mut gpui::TestAppContext) {
+        assert!(registered_migration_count() > 0);
+
+        let (connection, outcome) = open_fallback_db_with_queue::<AppMigrator>(
+            "open_fallback_db_with_wasm_lock_queue_needs_no_parking",
+            None,
+            Some(sqlez::thread_safe_connection::wasm_lock_queue()),
+        )
+        .await;
+        cx.run_until_parked();
+        assert_eq!(outcome, RestoreOutcome::NoImage);
+        connection
+            .write(|connection| {
+                connection
+                    .exec("INSERT INTO kv_store(key, value) VALUES ('k', 'v')")
+                    .unwrap()()
+                .unwrap();
+            })
+            .await;
+        assert_eq!(
+            connection
+                .select_row::<String>("SELECT value FROM kv_store WHERE key = 'k'")
+                .unwrap()()
+            .unwrap(),
+            Some("v".to_string())
+        );
+        let image = connection.serialize().await.unwrap();
+        let (restored, outcome) = open_fallback_db_with_queue::<AppMigrator>(
+            "open_fallback_db_with_wasm_lock_queue_needs_no_parking_restored",
+            Some(image),
+            Some(sqlez::thread_safe_connection::wasm_lock_queue()),
+        )
+        .await;
+        assert_eq!(outcome, RestoreOutcome::Restored);
+        assert_eq!(
+            restored
+                .select_row::<String>("SELECT value FROM kv_store WHERE key = 'k'")
+                .unwrap()()
+            .unwrap(),
+            Some("v".to_string())
+        );
+    }
+
+    /// Test that an image produced under an older migration list is upgraded on restore.
+    #[gpui::test]
+    async fn open_db_with_image_runs_missing_migrations(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+
+        enum OlderDB {}
+        impl Domain for OlderDB {
+            const NAME: &str = "image_skew";
+            const MIGRATIONS: &[&str] = &[sql!(CREATE TABLE a(value INTEGER);)];
+        }
+
+        enum NewerDB {}
+        impl Domain for NewerDB {
+            const NAME: &str = "image_skew";
+            const MIGRATIONS: &[&str] = &[
+                sql!(CREATE TABLE a(value INTEGER);),
+                sql!(CREATE TABLE b(value INTEGER);),
+            ];
+        }
+
+        let source_dir = tempfile::Builder::new()
+            .prefix("DbTests")
+            .tempdir()
+            .unwrap();
+        let older =
+            open_db::<OlderDB>(source_dir.path(), release_channel::ReleaseChannel::Dev).await;
+        older
+            .write(|connection| {
+                connection.exec("INSERT INTO a(value) VALUES (5)").unwrap()().unwrap();
+            })
+            .await;
+        let image = older.serialize().await.unwrap();
+
+        let target_dir = tempfile::Builder::new()
+            .prefix("DbTests")
+            .tempdir()
+            .unwrap();
+        let (newer, outcome) = open_db_with_image::<NewerDB>(
+            target_dir.path(),
+            release_channel::ReleaseChannel::Dev,
+            Some(image),
+        )
+        .await;
+        assert_eq!(outcome, RestoreOutcome::Restored);
+        assert_eq!(
+            newer.select_row::<i64>("SELECT value FROM a").unwrap()().unwrap(),
+            Some(5),
+            "rows from the image survive"
+        );
+        assert_eq!(
+            newer.select_row::<i64>("SELECT count(*) FROM b").unwrap()().unwrap(),
+            Some(0),
+            "the missing migration was applied"
+        );
+    }
+
+    /// An image with a completed step beyond the code's list opens; a differing step text
+    /// is skipped (the client must never run an image the code cannot migrate).
+    #[gpui::test]
+    async fn open_db_with_image_from_newer_build(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+
+        enum NewerDB {}
+        impl Domain for NewerDB {
+            const NAME: &str = "image_newer";
+            const MIGRATIONS: &[&str] = &[
+                sql!(CREATE TABLE a(value INTEGER);),
+                sql!(CREATE TABLE c(value INTEGER);),
+            ];
+        }
+        enum OlderDB {}
+        impl Domain for OlderDB {
+            const NAME: &str = "image_newer";
+            const MIGRATIONS: &[&str] = &[sql!(CREATE TABLE a(value INTEGER);)];
+        }
+        enum DifferentDB {}
+        impl Domain for DifferentDB {
+            const NAME: &str = "image_newer";
+            const MIGRATIONS: &[&str] = &[sql!(CREATE TABLE a(other INTEGER);)];
+        }
+
+        let source_dir = tempfile::Builder::new()
+            .prefix("DbTests")
+            .tempdir()
+            .unwrap();
+        let newer =
+            open_db::<NewerDB>(source_dir.path(), release_channel::ReleaseChannel::Dev).await;
+        let image = newer.serialize().await.unwrap();
+
+        let older_dir = tempfile::Builder::new()
+            .prefix("DbTests")
+            .tempdir()
+            .unwrap();
+        let (older, outcome) = open_db_with_image::<OlderDB>(
+            older_dir.path(),
+            release_channel::ReleaseChannel::Dev,
+            Some(image.clone()),
+        )
+        .await;
+        assert_eq!(outcome, RestoreOutcome::Restored);
+        assert_eq!(
+            older.select_row::<i64>("SELECT count(*) FROM c").unwrap()().unwrap(),
+            Some(0),
+            "extra completed steps are kept as-is"
+        );
+
+        let different_dir = tempfile::Builder::new()
+            .prefix("DbTests")
+            .tempdir()
+            .unwrap();
+        let (different, outcome) = open_db_with_image::<DifferentDB>(
+            different_dir.path(),
+            release_channel::ReleaseChannel::Dev,
+            Some(image),
+        )
+        .await;
+        assert!(
+            matches!(outcome, RestoreOutcome::Skipped(_)),
+            "a changed migration text must skip the image, got {outcome:?}"
+        );
+        assert_eq!(
+            different
+                .select_row::<i64>("SELECT count(*) FROM a")
+                .unwrap()()
+            .unwrap(),
+            Some(0),
+            "the database opened empty and migrated"
+        );
+    }
+
+    /// The in-memory fallback also applies the image, and a bad image does not panic it.
+    #[gpui::test]
+    async fn open_fallback_db_applies_image(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+
+        enum FallbackDB {}
+        impl Domain for FallbackDB {
+            const NAME: &str = "image_fallback";
+            const MIGRATIONS: &[&str] = &[sql!(CREATE TABLE a(value INTEGER);)];
+        }
+
+        let (source, _) = open_fallback_db_named::<FallbackDB>("fallback_image_source", None).await;
+        source
+            .write(|connection| {
+                connection.exec("INSERT INTO a(value) VALUES (9)").unwrap()().unwrap();
+            })
+            .await;
+        let image = source.serialize().await.unwrap();
+
+        let (restored, outcome) =
+            open_fallback_db_named::<FallbackDB>("fallback_image_target", Some(image)).await;
+        assert_eq!(outcome, RestoreOutcome::Restored);
+        assert_eq!(
+            restored.select_row::<i64>("SELECT value FROM a").unwrap()().unwrap(),
+            Some(9)
+        );
+
+        let (empty, outcome) =
+            open_fallback_db_named::<FallbackDB>("fallback_image_bad", Some(b"garbage".to_vec()))
+                .await;
+        assert!(matches!(outcome, RestoreOutcome::Skipped(_)));
+        assert_eq!(
+            empty.select_row::<i64>("SELECT count(*) FROM a").unwrap()().unwrap(),
+            Some(0)
+        );
+    }
 
     // Test bad migration panics
     #[gpui::test]

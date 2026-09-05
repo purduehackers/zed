@@ -1,8 +1,8 @@
 use std::sync::Arc;
-use std::time::Instant;
 
 use gpui::{App, Global, ReadGlobal, SharedString};
 use parking_lot::RwLock;
+use web_time::Instant;
 
 #[derive(Default)]
 struct FontFamilyCacheState {

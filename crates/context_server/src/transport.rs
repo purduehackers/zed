@@ -1,5 +1,8 @@
 pub mod http;
+#[cfg(not(target_family = "wasm"))]
 mod stdio_transport;
+#[cfg(target_family = "wasm")]
+mod stdio_transport_web;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -9,7 +12,10 @@ use std::pin::Pin;
 use crate::oauth::WwwAuthenticate;
 
 pub use http::*;
+#[cfg(not(target_family = "wasm"))]
 pub use stdio_transport::*;
+#[cfg(target_family = "wasm")]
+pub use stdio_transport_web::*;
 
 #[async_trait]
 pub trait Transport: Send + Sync {

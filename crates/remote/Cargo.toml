@@ -31,6 +31,7 @@ log.workspace = true
 parking_lot.workspace = true
 paths.workspace = true
 prost.workspace = true
+rand.workspace = true
 release_channel.workspace = true
 rpc = { workspace = true, features = ["gpui"] }
 schemars.workspace = true
@@ -42,11 +43,18 @@ smol.workspace = true
 telemetry.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+url.workspace = true
 urlencoding.workspace = true
 util.workspace = true
+web-time.workspace = true
 which.workspace = true
+yawc.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+gpui_tokio.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 fs = { workspace = true, features = ["test-support"] }
 util = { workspace = true, features = ["test-support"] }
+async-tungstenite.workspace = true

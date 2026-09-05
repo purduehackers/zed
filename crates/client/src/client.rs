@@ -2,17 +2,19 @@
 pub mod test;
 
 mod llm_token;
+#[cfg(not(target_family = "wasm"))]
 mod proxy;
 pub mod telemetry;
 pub mod user;
 pub mod zed_urls;
 
 use anyhow::{Context as _, Result, anyhow};
+#[cfg(not(target_family = "wasm"))]
 use async_tungstenite::tungstenite::{
     client::IntoClientRequest,
-    error::Error as WebsocketError,
-    http::{HeaderValue, Request, StatusCode},
+    http::{HeaderValue, Request},
 };
+use async_tungstenite::tungstenite::{error::Error as WebsocketError, http::StatusCode};
 use clock::SystemClock;
 use cloud_api_client::LlmApiToken;
 use cloud_api_client::websocket_protocol::MessageToClient;
@@ -20,8 +22,10 @@ use cloud_api_client::{ClientApiError, CloudApiClient};
 use cloud_api_types::OrganizationId;
 use credentials_provider::CredentialsProvider;
 use feature_flags::FeatureFlagAppExt as _;
+#[cfg(not(target_family = "wasm"))]
+use futures::AsyncReadExt;
 use futures::{
-    AsyncReadExt, FutureExt, SinkExt, Stream, StreamExt, TryFutureExt as _, TryStreamExt,
+    FutureExt, SinkExt, Stream, StreamExt, TryFutureExt as _, TryStreamExt,
     channel::{mpsc, oneshot},
     future::BoxFuture,
     stream::BoxStream,
@@ -30,6 +34,7 @@ use gpui::{App, AsyncApp, Entity, Global, Task, TaskExt, WeakEntity, actions};
 use http_client::{HttpClient, HttpClientWithUrl, http, read_proxy_from_env};
 use parking_lot::{Mutex, RwLock};
 use postage::watch;
+#[cfg(not(target_family = "wasm"))]
 use proxy::{connect_proxy_stream, excluded_from_proxy};
 use rand::prelude::*;
 use release_channel::{AppVersion, ReleaseChannel};
@@ -46,14 +51,17 @@ use std::{
         Arc, LazyLock, Weak,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use std::{cmp, pin::Pin};
 use telemetry::Telemetry;
 use thiserror::Error;
+#[cfg(not(target_family = "wasm"))]
 use tokio::net::TcpStream;
 use url::Url;
+// `std::time::Instant` natively; on wasm `Instant::now()` panics.
 use util::{ConnectionResult, ResultExt};
+use web_time::Instant;
 
 pub use llm_token::*;
 pub use rpc::*;
@@ -589,6 +597,12 @@ impl Client {
             cx.http_client().proxy().cloned(),
         ));
         Self::new(clock, http, cx)
+    }
+
+    /// False in the browser: there is no localhost callback for the zed.dev sign-in
+    /// flow, so `sign_in` always fails there and the sign-in affordance is hidden.
+    pub fn sign_in_supported(&self) -> bool {
+        cfg!(not(target_family = "wasm"))
     }
 
     pub fn id(&self) -> u64 {
@@ -1323,6 +1337,20 @@ impl Client {
         }
     }
 
+    /// Collab is not available in the browser: nothing dials zed.dev, and `sign_in`
+    /// reports `Status::AuthenticationError` before it would get here.
+    #[cfg(target_family = "wasm")]
+    fn establish_websocket_connection(
+        self: &Arc<Self>,
+        _credentials: &Credentials,
+        _cx: &AsyncApp,
+    ) -> Task<Result<Connection, EstablishConnectionError>> {
+        Task::ready(Err(EstablishConnectionError::other(anyhow!(
+            "Zed collaboration is not available in the browser"
+        ))))
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     fn establish_websocket_connection(
         self: &Arc<Self>,
         credentials: &Credentials,
@@ -1427,6 +1455,19 @@ impl Client {
         })
     }
 
+    /// The zed.dev sign-in flow needs a localhost callback server, which the browser
+    /// cannot open; `sign_in` reports `Status::AuthenticationError` with this error.
+    #[cfg(target_family = "wasm")]
+    pub fn authenticate_with_browser(
+        self: &Arc<Self>,
+        _cx: &AsyncApp,
+    ) -> Task<Result<Credentials>> {
+        Task::ready(Err(anyhow!(
+            "Zed account sign-in is not available in the browser"
+        )))
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     pub fn authenticate_with_browser(self: &Arc<Self>, cx: &AsyncApp) -> Task<Result<Credentials>> {
         let http = self.http.clone();
         let this = self.clone();
@@ -1558,6 +1599,7 @@ impl Client {
         })
     }
 
+    #[cfg(not(target_family = "wasm"))]
     async fn authenticate_as_admin(
         self: &Arc<Self>,
         http: Arc<HttpClientWithUrl>,
@@ -2011,6 +2053,19 @@ mod tests {
     use proto::TypedEnvelope;
     use settings::SettingsStore;
     use std::future;
+
+    #[gpui::test]
+    async fn sign_in_supported_is_true_natively(cx: &mut TestAppContext) {
+        init_test(cx);
+        let client = cx.update(|cx| {
+            Client::new(
+                Arc::new(FakeSystemClock::new()),
+                FakeHttpClient::with_404_response(),
+                cx,
+            )
+        });
+        assert!(client.sign_in_supported());
+    }
 
     #[test]
     fn test_proxy_settings_trims_and_ignores_empty_proxy() {

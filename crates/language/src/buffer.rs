@@ -54,7 +54,7 @@ use std::{
     path::PathBuf,
     rc,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
     vec,
 };
 use sum_tree::TreeMap;
@@ -70,6 +70,8 @@ use theme::{ActiveTheme as _, SyntaxTheme};
 #[cfg(any(test, feature = "test-support"))]
 use util::RandomCharIter;
 use util::{RangeExt, debug_panic, maybe, paths::PathStyle, rel_path::RelPath};
+// `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` natively.
+use web_time::Instant;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use {tree_sitter_python, tree_sitter_rust, tree_sitter_typescript};
@@ -2073,6 +2075,7 @@ impl Buffer {
                 }));
                 return;
             };
+            #[cfg(not(target_family = "wasm"))]
             match cx
                 .foreground_executor()
                 .block_with_timeout(block_budget, indent_sizes)
@@ -2087,6 +2090,19 @@ impl Buffer {
                         .ok();
                     }));
                 }
+            }
+            // The browser's foreground thread cannot block, so the budget is ignored there and
+            // the indentation is always applied asynchronously.
+            #[cfg(target_family = "wasm")]
+            {
+                let _ = block_budget;
+                self.pending_autoindent = Some(cx.spawn(async move |this, cx| {
+                    let indent_sizes = indent_sizes.await;
+                    this.update(cx, |this, cx| {
+                        this.apply_autoindents(indent_sizes, cx);
+                    })
+                    .ok();
+                }));
             }
         } else {
             self.autoindent_requests.clear();

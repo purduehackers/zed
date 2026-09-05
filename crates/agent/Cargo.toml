@@ -76,6 +76,8 @@ util.workspace = true
 uuid.workspace = true
 watch.workspace = true
 web_search.workspace = true
+# `std::time::Instant::now()` panics on wasm; `web-time` re-exports `std` on native.
+web-time.workspace = true
 zed_env_vars.workspace = true
 zstd.workspace = true
 

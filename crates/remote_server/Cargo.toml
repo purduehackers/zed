@@ -17,17 +17,32 @@ doctest = false
 name = "remote_server"
 
 [features]
-default = []
+default = ["serve"]
 debug-embed = ["dep:rust-embed"]
 test-support = ["fs/test-support"]
+serve = [
+    "dep:bytes",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:jsonwebtoken",
+    "dep:multer",
+    "dep:percent-encoding",
+    "dep:tokio",
+    "dep:yawc",
+]
 
 [dependencies]
 acp_thread.workspace = true
 anyhow.workspace = true
 async-channel.workspace = true
+async-compression.workspace = true
+async-tar.workspace = true
 askpass.workspace = true
-clap.workspace = true
+bytes = { workspace = true, optional = true }
+clap = { workspace = true, features = ["env"] }
 client.workspace = true
+cloud_api_types.workspace = true
 collections.workspace = true
 crashes.workspace = true
 dap_adapters.workspace = true
@@ -43,16 +58,28 @@ gpui = { workspace = true, features = ["profiler"] }
 gpui_platform.workspace = true
 gpui_tokio.workspace = true
 http_client.workspace = true
+http-body-util = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true, features = ["http1", "server"] }
+hyper-util = { workspace = true, optional = true, features = ["http1", "server", "tokio"] }
 image.workspace = true
 json_schema_store.workspace = true
+# `aws_lc_rs` is the only backend this workspace may enable: jsonwebtoken picks its
+# provider with `aws_lc_rs && !rust_crypto`, so a crate enabling `rust_crypto` anywhere in
+# a unified build makes every verification panic (guarded by the `provider_is_available` test).
+jsonwebtoken = { workspace = true, optional = true, features = ["aws_lc_rs"] }
 language.workspace = true
 language_extension.workspace = true
 languages.workspace = true
+libc.workspace = true
 log.workspace = true
 lsp.workspace = true
+multer = { workspace = true, optional = true }
 net.workspace = true
 node_runtime.workspace = true
+parking_lot.workspace = true
 paths.workspace = true
+percent-encoding = { workspace = true, optional = true }
+portable-pty.workspace = true
 project.workspace = true
 proto.workspace = true
 release_channel.workspace = true
@@ -61,17 +88,21 @@ reqwest_client.workspace = true
 rpc.workspace = true
 rust-embed = { workspace = true, optional = true, features = ["debug-embed"] }
 semver.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
 shellexpand.workspace = true
 smol.workspace = true
+subtle.workspace = true
 sysinfo.workspace = true
 task.workspace = true
 telemetry.workspace = true
 util.workspace = true
 watch.workspace = true
 worktree.workspace = true
+yawc = { workspace = true, optional = true }
 thiserror.workspace = true
+tokio = { workspace = true, optional = true, features = ["fs", "io-util", "macros", "net", "rt", "signal", "sync", "time"] }
 rayon.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 
@@ -85,19 +116,25 @@ agent = { workspace = true, features = ["test-support"] }
 agent-client-protocol.workspace = true
 client = { workspace = true, features = ["test-support"] }
 clock = { workspace = true, features = ["test-support"] }
+db = { workspace = true, features = ["test-support"] }
 editor = { workspace = true, features = ["test-support"] }
 fs = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 http_client = { workspace = true, features = ["test-support"] }
+hyper = { workspace = true, features = ["client", "http1", "server"] }
 language = { workspace = true, features = ["test-support"] }
 language_model = { workspace = true, features = ["test-support"] }
 lsp = { workspace = true, features = ["test-support"] }
 node_runtime = { workspace = true, features = ["test-support"] }
 pretty_assertions.workspace = true
+prost.workspace = true
 project = { workspace = true, features = ["test-support"] }
 remote = { workspace = true, features = ["test-support"] }
 serde_json.workspace = true
 tempfile.workspace = true
+terminal = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+url.workspace = true
 theme = { workspace = true, features = ["test-support"] }
 theme_settings.workspace = true
 unindent.workspace = true

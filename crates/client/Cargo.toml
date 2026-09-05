@@ -18,7 +18,7 @@ test-support = ["clock/test-support", "collections/test-support", "gpui/test-sup
 [dependencies]
 anyhow.workspace = true
 async-channel.workspace = true
-async-tungstenite = { workspace = true, features = ["tokio", "tokio-rustls-manual-roots"] }
+async-tungstenite.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 clock.workspace = true
 cloud_api_client.workspace = true
@@ -31,14 +31,11 @@ feature_flags.workspace = true
 fs.workspace = true
 futures.workspace = true
 gpui.workspace = true
-gpui_tokio.workspace = true
 http_client.workspace = true
-http_client_tls.workspace = true
 log.workspace = true
 parking_lot.workspace = true
 paths.workspace = true
 postage.workspace = true
-proxy_handshake = { workspace = true, features = ["tokio"] }
 rand.workspace = true
 regex.workspace = true
 release_channel.workspace = true
@@ -54,12 +51,19 @@ telemetry_events.workspace = true
 text.workspace = true
 thiserror.workspace = true
 time.workspace = true
-tiny_http.workspace = true
-tokio.workspace = true
 url.workspace = true
 util.workspace = true
+web-time.workspace = true
 worktree.workspace = true
 zed_credentials_provider.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+async-tungstenite = { workspace = true, features = ["tokio", "tokio-rustls-manual-roots"] }
+gpui_tokio.workspace = true
+http_client_tls.workspace = true
+proxy_handshake = { workspace = true, features = ["tokio"] }
+tiny_http.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 clock = { workspace = true, features = ["test-support"] }
@@ -78,9 +82,9 @@ windows.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-foundation.workspace = true
 
-[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+[target.'cfg(all(not(target_family = "wasm"), any(target_os = "windows", target_os = "macos")))'.dependencies]
 tokio-native-tls = "0.3"
 
-[target.'cfg(not(any(target_os = "windows", target_os = "macos")))'.dependencies]
+[target.'cfg(all(not(target_family = "wasm"), not(any(target_os = "windows", target_os = "macos"))))'.dependencies]
 rustls-pki-types = "1.12"
 tokio-rustls = { version = "0.26", features = ["tls12", "ring"], default-features = false }

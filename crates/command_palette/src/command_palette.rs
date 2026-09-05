@@ -577,6 +577,7 @@ impl PickerDelegate for CommandPaletteDelegate {
             return true;
         };
 
+        #[cfg(not(target_family = "wasm"))]
         match cx
             .foreground_executor()
             .block_with_timeout(duration, rx.clone().recv())
@@ -588,6 +589,24 @@ impl PickerDelegate for CommandPaletteDelegate {
             _ => {
                 self.updating_matches = Some((task, rx));
                 false
+            }
+        }
+        // The browser's foreground thread cannot block, so the budget is ignored there: the
+        // update is applied only if it has already arrived; otherwise the picker keeps waiting
+        // for the task spawned in `update_matches` to deliver it.
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = duration;
+            let mut rx = rx;
+            match rx.try_recv() {
+                Ok((commands, matches, interceptor_result)) => {
+                    self.matches_updated(query, commands, matches, interceptor_result, cx);
+                    true
+                }
+                Err(_) => {
+                    self.updating_matches = Some((task, rx));
+                    false
+                }
             }
         }
     }

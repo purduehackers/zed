@@ -15,14 +15,18 @@ path = "src/askpass.rs"
 anyhow.workspace = true
 futures.workspace = true
 gpui.workspace = true
-net.workspace = true
 smol.workspace = true
 log.workspace = true
-tempfile.workspace = true
 util.workspace = true
 zeroize.workspace = true
 
-[target.'cfg(not(target_os = "windows"))'.dependencies]
+# The socket proxy and the askpass scripts do not exist in the browser (see
+# `PasswordProxy` in askpass.rs).
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+net.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(not(any(target_os = "windows", target_family = "wasm")))'.dependencies]
 which.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]

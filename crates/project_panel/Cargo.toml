@@ -40,6 +40,7 @@ rayon.workspace = true
 ui.workspace = true
 util.workspace = true
 client.workspace = true
+web-time.workspace = true
 worktree.workspace = true
 workspace.workspace = true
 language.workspace = true

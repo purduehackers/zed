@@ -7,10 +7,10 @@ use std::{
     },
 };
 
-use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
-use gpui::{
-    BackgroundExecutor, DismissEvent, ElementId, Entity, Focusable, ForegroundExecutor, Task,
-};
+use fuzzy::{StringMatchCandidate, match_strings};
+#[cfg(not(target_family = "wasm"))]
+use gpui::ForegroundExecutor;
+use gpui::{BackgroundExecutor, DismissEvent, ElementId, Entity, Focusable, Task};
 use picker::{Picker, PickerDelegate};
 use ui::{
     Color, GradientFade, HighlightedLabel, Icon, IconButton, IconName, IconSize, Label, LabelSize,
@@ -59,6 +59,10 @@ struct ColumnFilterDelegate {
     filtered: Vec<ColumnFilterListEntry>,
     selected_index: usize,
     query: String,
+    /// Re-runs the fuzzy match synchronously when the rows are refreshed. The
+    /// wasm executor cannot block, so `matches_for_query` reuses the matches
+    /// already in `filtered` there instead.
+    #[cfg(not(target_family = "wasm"))]
     foreground: ForegroundExecutor,
     background: BackgroundExecutor,
     cancel: Option<Arc<AtomicBool>>,
@@ -147,6 +151,7 @@ impl ColumnFilterDelegate {
             filtered,
             selected_index: 0,
             query: String::new(),
+            #[cfg(not(target_family = "wasm"))]
             foreground: cx.foreground_executor().clone(),
             background: cx.background_executor().clone(),
             cancel: None,
@@ -205,21 +210,43 @@ impl ColumnFilterDelegate {
                 .collect();
         }
 
-        let cancel_flag = AtomicBool::new(false);
-        let mut matches: Vec<StringMatch> = self.foreground.block_on(match_strings(
-            self.string_candidates.as_ref(),
-            query,
-            false,
-            true,
-            usize::MAX,
-            &cancel_flag,
-            self.background.clone(),
-        ));
-        matches.sort_by_key(|m| m.candidate_id);
-        matches
-            .into_iter()
-            .map(|m| (m.candidate_id, m.positions))
-            .collect()
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let cancel_flag = AtomicBool::new(false);
+            let mut matches = self.foreground.block_on(match_strings(
+                self.string_candidates.as_ref(),
+                query,
+                false,
+                true,
+                usize::MAX,
+                &cancel_flag,
+                self.background.clone(),
+            ));
+            matches.sort_by_key(|m| m.candidate_id);
+            matches
+                .into_iter()
+                .map(|m| (m.candidate_id, m.positions))
+                .collect()
+        }
+
+        // The foreground executor cannot block on wasm. Match positions depend
+        // only on the candidate strings and the query, and `rows` is frozen for
+        // the life of the picker, so the matches already in `filtered` are
+        // still valid; if an `update_matches` task for this query is still in
+        // flight, it overwrites `filtered` with the same matches when it lands.
+        #[cfg(target_family = "wasm")]
+        {
+            self.filtered
+                .iter()
+                .filter_map(|entry| match entry {
+                    ColumnFilterListEntry::Row {
+                        row_index,
+                        positions,
+                    } => Some((*row_index, positions.clone())),
+                    ColumnFilterListEntry::Header(_) => None,
+                })
+                .collect()
+        }
     }
 
     /// Re-fetches this column's filter entries from the engine (e.g. after a

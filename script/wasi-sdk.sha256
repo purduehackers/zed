@@ -1,0 +1,10 @@
+# SHA-256 of the wasi-sdk release tarballs that script/ensure-wasi-sdk may extract into
+# target/wasi-sdk (`<sha256>  <asset>`, one line per (arch, os) the wasm build supports).
+# Release: https://github.com/WebAssembly/wasi-sdk/releases/tag/wasi-sdk-25 (version 25.0,
+# WASI_SDK_VERSION in script/wasi-sdk-env; bump both together). Digests computed 2026-09-03
+# from the release assets; sizes 115160800, 104133504, 114450290 and 105882293 bytes match the
+# GitHub release listing. The CI cache key for target/wasi-sdk includes this file's hash.
+47fccad8b2498f2239e05e1115c3ffc652bf37e7de2f88fb64b2d663c976ce2d  wasi-sdk-25.0-arm64-linux.tar.gz
+e1e529ea226b1db0b430327809deae9246b580fa3cae32d31c82dfe770233587  wasi-sdk-25.0-arm64-macos.tar.gz
+52640dde13599bf127a95499e61d6d640256119456d1af8897ab6725bcf3d89c  wasi-sdk-25.0-x86_64-linux.tar.gz
+55e3ff3fee1a15678a16eeccba0129276c9f6be481bc9c283e7f9f65bf055c11  wasi-sdk-25.0-x86_64-macos.tar.gz

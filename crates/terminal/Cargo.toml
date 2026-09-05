@@ -28,7 +28,6 @@ futures.workspace = true
 futures-lite.workspace = true
 gpui.workspace = true
 itertools.workspace = true
-libc.workspace = true
 log.workspace = true
 regex.workspace = true
 release_channel.workspace = true
@@ -44,8 +43,12 @@ url.workspace = true
 util.workspace = true
 urlencoding.workspace = true
 vte.workspace = true
+web-time.workspace = true
 parking_lot.workspace = true
 percent-encoding.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true

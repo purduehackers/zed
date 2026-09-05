@@ -10,6 +10,7 @@ use json_dotpath::DotPaths;
 use language::{LanguageName, Toolchain};
 use paths::debug_adapters_dir;
 use serde_json::Value;
+#[cfg(not(target_family = "wasm"))]
 use smol::fs::File;
 use smol::io::AsyncReadExt;
 use smol::lock::OnceCell;
@@ -149,13 +150,28 @@ impl PythonDebugAdapter {
             })
             .with_context(|| format!("Did not find a .whl in {download_dir:?}"))?;
 
-        util::archive::extract_zip(
-            &debug_adapters_dir().join(Self::ADAPTER_NAME),
-            File::open(&wheel_path.path()).await?,
-        )
-        .await?;
+        Self::unpack_wheel(&wheel_path.path()).await?;
 
         Ok(Arc::from(wheel_path.path()))
+    }
+
+    /// Unpacks the downloaded debugpy wheel into the adapter directory.
+    #[cfg(not(target_family = "wasm"))]
+    async fn unpack_wheel(wheel_path: &Path) -> Result<()> {
+        util::archive::extract_zip(
+            &debug_adapters_dir().join(Self::ADAPTER_NAME),
+            File::open(wheel_path).await?,
+        )
+        .await
+    }
+
+    /// `util::archive` is native-only, and the browser never gets a wheel to unpack anyway:
+    /// `fetch_wheel` fails earlier because it cannot spawn `pip` or create the download
+    /// directory (the remote server installs debugpy instead). This only reports the gap.
+    #[cfg(target_family = "wasm")]
+    async fn unpack_wheel(wheel_path: &Path) -> Result<()> {
+        let _ = wheel_path;
+        anyhow::bail!("unpacking the debugpy wheel is not supported in the browser")
     }
 
     async fn maybe_fetch_new_wheel(

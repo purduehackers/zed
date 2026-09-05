@@ -1,10 +1,11 @@
 use anyhow::{Context as _, bail};
 use collections::HashMap;
+#[cfg(not(target_family = "wasm"))]
+use dap::adapters::latest_github_release;
 use dap::{
     StartDebuggingRequestArguments,
     adapters::{
         DebugTaskDefinition, DownloadedFileType, TcpArguments, download_adapter_from_github,
-        latest_github_release,
     },
 };
 use fs::Fs;
@@ -33,6 +34,7 @@ pub(crate) struct GoDebugAdapter {
 
 impl GoDebugAdapter {
     const ADAPTER_NAME: &'static str = "Delve";
+    #[cfg(not(target_family = "wasm"))]
     async fn fetch_latest_adapter_version(
         delegate: &Arc<dyn DapDelegate>,
     ) -> Result<AdapterVersion> {
@@ -66,6 +68,16 @@ impl GoDebugAdapter {
             tag_name: release.tag_name,
             url: asset.browser_download_url.clone(),
         })
+    }
+    /// The browser neither queries GitHub (`http_client::github` is native-only) nor installs
+    /// the shim locally; the remote server does both. Failing here makes `install_shim` fall
+    /// through to its cached-shim lookup, exactly as an offline desktop does.
+    #[cfg(target_family = "wasm")]
+    async fn fetch_latest_adapter_version(
+        delegate: &Arc<dyn DapDelegate>,
+    ) -> Result<AdapterVersion> {
+        let _ = delegate;
+        anyhow::bail!("fetching the latest delve-shim-dap release is not supported in the browser")
     }
     async fn install_shim(&self, delegate: &Arc<dyn DapDelegate>) -> anyhow::Result<PathBuf> {
         if let Some(path) = self.shim_path.get().cloned() {

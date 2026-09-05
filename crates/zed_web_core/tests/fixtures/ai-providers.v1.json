@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "placeholderKey": "zs-proxy-v1",
+  "proxyPrefix": "/api/ai/",
+  "providers": [
+    {
+      "id": "anthropic",
+      "kind": "anthropic",
+      "upstream": "https://api.anthropic.com",
+      "envName": "ANTHROPIC_API_KEY",
+      "settingsPath": "language_models.anthropic.api_url"
+    },
+    {
+      "id": "openai",
+      "kind": "openai",
+      "upstream": "https://api.openai.com/v1",
+      "envName": "OPENAI_API_KEY",
+      "settingsPath": "language_models.openai.api_url"
+    },
+    {
+      "id": "google",
+      "kind": "google",
+      "upstream": "https://generativelanguage.googleapis.com",
+      "envName": "GEMINI_API_KEY",
+      "settingsPath": "language_models.google.api_url"
+    },
+    {
+      "id": "mistral",
+      "kind": "openai",
+      "upstream": "https://api.mistral.ai/v1",
+      "envName": "MISTRAL_API_KEY",
+      "settingsPath": "language_models.mistral.api_url"
+    },
+    {
+      "id": "deepseek",
+      "kind": "openai",
+      "upstream": "https://api.deepseek.com/v1",
+      "envName": "DEEPSEEK_API_KEY",
+      "settingsPath": "language_models.deepseek.api_url"
+    },
+    {
+      "id": "open_router",
+      "kind": "openai",
+      "upstream": "https://openrouter.ai/api/v1",
+      "envName": "OPENROUTER_API_KEY",
+      "settingsPath": "language_models.open_router.api_url"
+    },
+    {
+      "id": "x_ai",
+      "kind": "openai",
+      "upstream": "https://api.x.ai/v1",
+      "envName": "XAI_API_KEY",
+      "settingsPath": "language_models.x_ai.api_url"
+    },
+    {
+      "id": "opencode",
+      "kind": "opencode",
+      "upstream": "https://opencode.ai/zen",
+      "envName": "OPENCODE_API_KEY",
+      "settingsPath": "language_models.opencode.api_url"
+    },
+    {
+      "id": "vercel_ai_gateway",
+      "kind": "openai",
+      "upstream": "https://ai-gateway.vercel.sh/v1",
+      "envName": "AI_GATEWAY_API_KEY",
+      "settingsPath": "language_models.vercel_ai_gateway.api_url"
+    },
+    {
+      "id": "codestral",
+      "kind": "mistral_fim",
+      "upstream": "https://codestral.mistral.ai",
+      "envName": "CODESTRAL_API_KEY",
+      "settingsPath": "edit_predictions.codestral.api_url"
+    }
+  ]
+}

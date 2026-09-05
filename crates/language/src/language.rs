@@ -54,8 +54,8 @@ pub use language_core::{
     DecreaseIndentConfig, Grammar, GrammarId, HighlightsConfig, IndentConfig, InjectionConfig,
     InjectionPatternConfig, JsxTagAutoCloseConfig, LanguageConfig, LanguageConfigOverride,
     LanguageId, LanguageMatcher, OrderedListConfig, OutlineConfig, Override, OverrideConfig,
-    OverrideEntry, RedactionConfig, RunnableCapture, RunnableConfig, SoftWrap, Symbol,
-    TaskListConfig, TextObject, TextObjectConfig, WrapCharactersConfig, default_true,
+    OverrideEntry, ParseableLanguage, RedactionConfig, RunnableCapture, RunnableConfig, SoftWrap,
+    Symbol, TaskListConfig, TextObject, TextObjectConfig, WrapCharactersConfig, default_true,
     deserialize_regex, deserialize_regex_vec, regex_json_schema, regex_vec_json_schema,
     serialize_regex,
 };
@@ -96,7 +96,9 @@ pub use toolchain::{
     LanguageToolchainStore, LocalLanguageToolchainStore, Toolchain, ToolchainList, ToolchainLister,
     ToolchainMetadata, ToolchainScope,
 };
-use tree_sitter::{self, QueryCursor, WasmStore, wasmtime};
+use tree_sitter::{self, QueryCursor};
+#[cfg(not(target_family = "wasm"))]
+use tree_sitter::{WasmStore, wasmtime};
 use util::rel_path::RelPath;
 
 pub use available_languages::AvailableLanguage;
@@ -131,20 +133,35 @@ pub(crate) fn to_settings_soft_wrap(value: language_core::SoftWrap) -> settings:
 }
 
 static QUERY_CURSORS: Mutex<Vec<QueryCursor>> = Mutex::new(vec![]);
+#[cfg(not(target_family = "wasm"))]
 static PARSERS: Mutex<Vec<Parser>> = Mutex::new(vec![]);
+// In the browser a `Parser` is only valid on the thread that created it (it is `!Send` there,
+// like the `Language` it is bound to), so the pool is per thread.
+#[cfg(target_family = "wasm")]
+thread_local! {
+    static PARSERS: std::cell::RefCell<Vec<Parser>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 #[ztracing::instrument(skip_all)]
 pub fn with_parser<F, R>(func: F) -> R
 where
     F: FnOnce(&mut Parser) -> R,
 {
-    let mut parser = PARSERS.lock().pop().unwrap_or_else(|| {
+    let new_parser = || {
+        #[allow(unused_mut)]
         let mut parser = Parser::new();
+        #[cfg(not(target_family = "wasm"))]
         parser
             .set_wasm_store(WasmStore::new(&WASM_ENGINE).unwrap())
             .unwrap();
         parser
-    });
+    };
+    #[cfg(not(target_family = "wasm"))]
+    let mut parser = PARSERS.lock().pop().unwrap_or_else(new_parser);
+    #[cfg(target_family = "wasm")]
+    let mut parser = PARSERS
+        .with_borrow_mut(|parsers| parsers.pop())
+        .unwrap_or_else(new_parser);
     // Tree-sitter auto-resets the parser at the end of a successful parse,
     // but the cancellation paths (progress callback returning `Break`,
     // cancelled balancing) leave outstanding state on the parser. The next
@@ -153,7 +170,10 @@ where
     parser.reset();
     parser.set_included_ranges(&[]).unwrap();
     let result = func(&mut parser);
+    #[cfg(not(target_family = "wasm"))]
     PARSERS.lock().push(parser);
+    #[cfg(target_family = "wasm")]
+    PARSERS.with_borrow_mut(|parsers| parsers.push(parser));
     result
 }
 
@@ -165,6 +185,7 @@ where
     func(cursor.deref_mut())
 }
 
+#[cfg(not(target_family = "wasm"))]
 static WASM_ENGINE: LazyLock<wasmtime::Engine> = LazyLock::new(|| {
     wasmtime::Engine::new(&wasmtime::Config::new()).expect("Failed to create Wasmtime engine")
 });
@@ -937,6 +958,58 @@ pub struct FakeLspAdapter {
     >,
 }
 
+/// The grammar a [`Language`] is built from: what [`Language::new`] and
+/// [`LanguageRegistry::register_native_grammars`] accept, and what the registry hands back when
+/// it loads a grammar by name.
+///
+/// Natively this is the [`tree_sitter::Language`] itself. In the browser a `tree_sitter::Language`
+/// is only valid on the thread that produced it (it is `!Send` there; see [`ParseableLanguage`]),
+/// so the handle wraps the thread-safe resolver instead: a statically linked grammar converts
+/// from its `LanguageFn` (`tree_sitter_rust::LANGUAGE.into()`, the form grammar registration
+/// already uses on every target) and a grammar linked at runtime from
+/// `ParseableLanguage::from_resolver`.
+#[cfg(not(target_family = "wasm"))]
+pub type GrammarHandle = tree_sitter::Language;
+
+/// The grammar a [`Language`] is built from: what [`Language::new`] and
+/// [`LanguageRegistry::register_native_grammars`] accept, and what the registry hands back when
+/// it loads a grammar by name.
+///
+/// Natively this is the [`tree_sitter::Language`] itself. In the browser a `tree_sitter::Language`
+/// is only valid on the thread that produced it (it is `!Send` there; see [`ParseableLanguage`]),
+/// so the handle wraps the thread-safe resolver instead: a statically linked grammar converts
+/// from its `LanguageFn` (`tree_sitter_rust::LANGUAGE.into()`, the form grammar registration
+/// already uses on every target) and a grammar linked at runtime from
+/// `ParseableLanguage::from_resolver`.
+#[cfg(target_family = "wasm")]
+#[derive(Clone, Debug)]
+pub struct GrammarHandle(ParseableLanguage);
+
+#[cfg(target_family = "wasm")]
+impl From<tree_sitter_language::LanguageFn> for GrammarHandle {
+    fn from(language_fn: tree_sitter_language::LanguageFn) -> Self {
+        // Every worker instantiates the same module, so a statically linked grammar's function is
+        // valid in all of them; the resolver just materializes the language on the calling thread.
+        Self(ParseableLanguage::from_resolver(Arc::new(move || {
+            Ok(tree_sitter::Language::new(language_fn))
+        })))
+    }
+}
+
+#[cfg(target_family = "wasm")]
+impl From<ParseableLanguage> for GrammarHandle {
+    fn from(language: ParseableLanguage) -> Self {
+        Self(language)
+    }
+}
+
+#[cfg(target_family = "wasm")]
+impl From<GrammarHandle> for ParseableLanguage {
+    fn from(handle: GrammarHandle) -> Self {
+        handle.0
+    }
+}
+
 pub struct Language {
     pub(crate) id: LanguageId,
     pub(crate) config: LanguageConfig,
@@ -947,7 +1020,7 @@ pub struct Language {
 }
 
 impl Language {
-    pub fn new(config: LanguageConfig, ts_language: Option<tree_sitter::Language>) -> Self {
+    pub fn new(config: LanguageConfig, ts_language: Option<GrammarHandle>) -> Self {
         Self::new_with_id(LanguageId::new(), config, ts_language)
     }
 
@@ -958,7 +1031,7 @@ impl Language {
     fn new_with_id(
         id: LanguageId,
         config: LanguageConfig,
-        ts_language: Option<tree_sitter::Language>,
+        ts_language: Option<GrammarHandle>,
     ) -> Self {
         Self {
             id,
@@ -1381,8 +1454,17 @@ impl Debug for Language {
 
 pub(crate) fn parse_text(grammar: &Grammar, text: &Rope, old_tree: Option<Tree>) -> Tree {
     with_parser(|parser| {
+        #[cfg(not(target_family = "wasm"))]
         parser
             .set_language(&grammar.ts_language)
+            .expect("incompatible grammar");
+        #[cfg(target_family = "wasm")]
+        parser
+            .set_language(
+                &grammar
+                    .parseable_language()
+                    .expect("grammar is not linked on this thread"),
+            )
             .expect("incompatible grammar");
         let mut chunks = text.chunks_in_range(0..text.len());
         parser

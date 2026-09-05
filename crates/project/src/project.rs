@@ -9,12 +9,15 @@ pub mod debounced_delay;
 pub mod debugger;
 pub mod git_store;
 pub mod image_store;
+pub mod lifecycle;
 pub mod lsp_command;
 pub mod lsp_store;
 pub mod manifest_tree;
+pub mod port_store;
 pub mod prettier_store;
 pub mod project_search;
 pub mod project_settings;
+pub mod remote_extension_store;
 pub mod search;
 pub mod task_inventory;
 pub mod task_store;
@@ -228,6 +231,10 @@ pub struct Project {
     user_store: Entity<UserStore>,
     fs: Arc<dyn Fs>,
     remote_client: Option<Entity<RemoteClient>>,
+    /// Sandbox port forwarding; `Some` only for projects over the remote server.
+    port_store: Option<Entity<port_store::PortStore>>,
+    /// Sandbox extension management; `Some` only for projects over the remote server.
+    remote_extension_store: Option<Entity<remote_extension_store::RemoteExtensionStore>>,
     // todo lw explain the client_state x remote_client matrix, its super confusing
     client_state: ProjectClientState,
     git_store: Entity<GitStore>,
@@ -360,6 +367,14 @@ pub enum Event {
     HideToast {
         notification_id: SharedString,
     },
+    /// A lifecycle notice from the sandbox (BUILD-SPEC 5.5); `seconds` is a countdown for
+    /// `IdleStopIn` / `SessionCapIn` and 0 otherwise.
+    LifecycleNotice {
+        kind: lifecycle::LifecycleKind,
+        seconds: u32,
+    },
+    /// Files landed in the workspace through the server's upload route.
+    FilesUploaded(Vec<ProjectPath>),
     LanguageServerPrompt(LanguageServerPromptRequest),
     LanguageNotFound(Entity<Buffer>),
     ActiveEntryChanged(Option<ProjectEntryId>),
@@ -1383,6 +1398,8 @@ impl Project {
                 settings_observer,
                 fs,
                 remote_client: None,
+                port_store: None,
+                remote_extension_store: None,
                 bookmark_store,
                 breakpoint_store,
                 dap_store,
@@ -1392,6 +1409,9 @@ impl Project {
                 git_diff_debouncer: DebouncedDelay::new(),
                 terminals: Terminals {
                     local_handles: Vec::new(),
+                    remote: HashMap::default(),
+                    restorable: HashMap::default(),
+                    inventory_fetch: None,
                 },
                 node: Some(node),
                 search_history: Self::new_search_history(),
@@ -1588,6 +1608,16 @@ impl Project {
 
             cx.subscribe(&remote, Self::on_remote_client_event).detach();
 
+            let port_store = cx.new(|_| {
+                port_store::PortStore::remote(remote_proto.clone(), REMOTE_SERVER_PROJECT_ID)
+            });
+            let remote_extension_store = cx.new(|_| {
+                remote_extension_store::RemoteExtensionStore::remote(
+                    remote_proto.clone(),
+                    REMOTE_SERVER_PROJECT_ID,
+                )
+            });
+
             let this = Self {
                 buffer_ordered_messages_tx: tx,
                 collaborators: Default::default(),
@@ -1632,10 +1662,15 @@ impl Project {
                 settings_observer,
                 fs,
                 remote_client: Some(remote.clone()),
+                port_store: Some(port_store.clone()),
+                remote_extension_store: Some(remote_extension_store.clone()),
                 buffers_needing_diff: Default::default(),
                 git_diff_debouncer: DebouncedDelay::new(),
                 terminals: Terminals {
                     local_handles: Vec::new(),
+                    remote: HashMap::default(),
+                    restorable: HashMap::default(),
+                    inventory_fetch: None,
                 },
                 node: Some(node),
                 search_history: Self::new_search_history(),
@@ -1661,6 +1696,8 @@ impl Project {
             remote_proto.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &this.settings_observer);
             remote_proto.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &this.git_store);
             remote_proto.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &this.agent_server_store);
+            remote_proto.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &port_store);
+            remote_proto.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &remote_extension_store);
 
             remote_proto.add_entity_message_handler(Self::handle_create_buffer_for_peer);
             remote_proto.add_entity_message_handler(Self::handle_create_image_for_peer);
@@ -1668,9 +1705,13 @@ impl Project {
             remote_proto.add_entity_message_handler(Self::handle_update_worktree);
             remote_proto.add_entity_message_handler(Self::handle_update_project);
             remote_proto.add_entity_message_handler(Self::handle_toast);
+            remote_proto.add_entity_message_handler(Self::handle_terminal_output);
+            remote_proto.add_entity_message_handler(Self::handle_terminal_exited);
             remote_proto.add_entity_message_handler(Self::handle_telemetry_event);
             remote_proto.add_entity_request_handler(Self::handle_language_server_prompt_request);
             remote_proto.add_entity_message_handler(Self::handle_hide_toast);
+            remote_proto.add_entity_message_handler(Self::handle_lifecycle_notice);
+            remote_proto.add_entity_message_handler(Self::handle_files_uploaded);
             remote_proto.add_entity_request_handler(Self::handle_update_buffer_from_remote_server);
             remote_proto.add_entity_request_handler(Self::handle_trust_worktrees);
             remote_proto.add_entity_request_handler(Self::handle_restrict_worktrees);
@@ -1687,6 +1728,8 @@ impl Project {
             BreakpointStore::init(&remote_proto);
             GitStore::init(&remote_proto);
             AgentServerStore::init_remote(&remote_proto);
+            port_store::PortStore::init(&remote_proto);
+            remote_extension_store::RemoteExtensionStore::init(&remote_proto);
 
             this
         })
@@ -1908,6 +1951,8 @@ impl Project {
                 snippets,
                 fs,
                 remote_client: None,
+                port_store: None,
+                remote_extension_store: None,
                 settings_observer: settings_observer.clone(),
                 client_subscriptions: Default::default(),
                 _subscriptions: vec![cx.on_release(Self::release)],
@@ -1927,6 +1972,9 @@ impl Project {
                 git_diff_debouncer: DebouncedDelay::new(),
                 terminals: Terminals {
                     local_handles: Vec::new(),
+                    remote: HashMap::default(),
+                    restorable: HashMap::default(),
+                    inventory_fetch: None,
                 },
                 node: None,
                 search_history: Self::new_search_history(),
@@ -2258,6 +2306,19 @@ impl Project {
     #[inline]
     pub fn remote_client(&self) -> Option<Entity<RemoteClient>> {
         self.remote_client.clone()
+    }
+
+    /// Sandbox port forwarding; `None` unless the project is served by the remote server.
+    pub fn port_store(&self) -> Option<&Entity<port_store::PortStore>> {
+        self.port_store.as_ref()
+    }
+
+    /// Sandbox extension management; `None` unless the project is served by the remote
+    /// server.
+    pub fn remote_extension_store(
+        &self,
+    ) -> Option<&Entity<remote_extension_store::RemoteExtensionStore>> {
+        self.remote_extension_store.as_ref()
     }
 
     #[inline]
@@ -3863,9 +3924,19 @@ impl Project {
                 self.lsp_store.update(cx, |lsp_store, _cx| {
                     lsp_store.disconnected_from_ssh_remote()
                 });
+                if let Some(store) = &self.remote_extension_store {
+                    store.update(cx, |store, cx| store.fail_pending(cx));
+                }
                 cx.emit(Event::DisconnectedFromRemote { server_not_running });
             }
-            &remote::RemoteClientEvent::Reconnected => {}
+            &remote::RemoteClientEvent::Reconnected => {
+                self.reattach_remote_terminals(cx);
+                if let Some(store) = &self.remote_extension_store {
+                    store
+                        .update(cx, |store, cx| store.refresh(cx))
+                        .detach_and_log_err(cx);
+                }
+            }
         }
     }
 
@@ -5507,6 +5578,42 @@ impl Project {
             });
             Ok(())
         })
+    }
+
+    async fn handle_lifecycle_notice(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::LifecycleNotice>,
+        mut cx: AsyncApp,
+    ) -> Result<()> {
+        let Some(kind) = lifecycle::LifecycleKind::from_proto(envelope.payload.kind) else {
+            log::warn!(
+                "ignoring lifecycle notice of unknown kind {}",
+                envelope.payload.kind
+            );
+            return Ok(());
+        };
+        this.update(&mut cx, |_, cx| {
+            cx.emit(Event::LifecycleNotice {
+                kind,
+                seconds: envelope.payload.seconds,
+            });
+        });
+        Ok(())
+    }
+
+    async fn handle_files_uploaded(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::FilesUploaded>,
+        mut cx: AsyncApp,
+    ) -> Result<()> {
+        let paths: Vec<ProjectPath> = envelope
+            .payload
+            .paths
+            .into_iter()
+            .filter_map(ProjectPath::from_proto)
+            .collect();
+        this.update(&mut cx, |_, cx| cx.emit(Event::FilesUploaded(paths)));
+        Ok(())
     }
 
     async fn handle_telemetry_event(

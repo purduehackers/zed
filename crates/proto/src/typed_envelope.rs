@@ -6,7 +6,9 @@ use std::{
     cmp,
     fmt::{self, Debug},
 };
-use std::{marker::PhantomData, time::Instant};
+use std::marker::PhantomData;
+// `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` natively.
+use web_time::Instant;
 
 pub trait EnvelopedMessage: Clone + Debug + Serialize + Sized + Send + Sync + 'static {
     const NAME: &'static str;

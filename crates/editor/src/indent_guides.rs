@@ -1,4 +1,6 @@
-use std::{cmp::Ordering, ops::Range, time::Duration};
+#[cfg(not(target_family = "wasm"))]
+use std::time::Duration;
+use std::{cmp::Ordering, ops::Range};
 
 use collections::HashSet;
 use gpui::{App, AppContext as _, Context, Task, Window};
@@ -101,6 +103,7 @@ impl Editor {
             let task = cx.background_spawn(resolve_indented_range(snapshot, cursor_row));
 
             // Try to resolve the indent in a short amount of time, otherwise move it to a background task.
+            #[cfg(not(target_family = "wasm"))]
             match cx
                 .foreground_executor()
                 .block_with_timeout(Duration::from_micros(200), task)
@@ -118,6 +121,21 @@ impl Editor {
                     }));
                     return None;
                 }
+            }
+            // The browser's foreground thread cannot block, so the range is always resolved
+            // asynchronously and the guides render without an active one until then.
+            #[cfg(target_family = "wasm")]
+            {
+                state.pending_refresh = Some(cx.spawn_in(window, async move |editor, cx| {
+                    let result = task.await;
+                    editor
+                        .update(cx, |editor, _| {
+                            editor.active_indent_guides_state.active_indent_range = result;
+                            editor.active_indent_guides_state.pending_refresh = None;
+                        })
+                        .log_err();
+                }));
+                return None;
             }
         }
 

@@ -12,7 +12,9 @@ mod util;
 pub use listener::*;
 #[cfg(target_os = "windows")]
 pub use socket::*;
-#[cfg(not(target_os = "windows"))]
+// The browser has no sockets of any kind; the crate compiles empty there so dependents
+// only have to gate their own uses.
+#[cfg(not(any(target_os = "windows", target_family = "wasm")))]
 pub use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(target_os = "windows")]
 pub use stream::*;

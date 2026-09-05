@@ -3,6 +3,7 @@ use std::sync::Arc;
 use collections::HashMap;
 use context_server::ContextServerId;
 use editor::Editor;
+#[cfg(not(target_family = "wasm"))]
 use extension_host::ExtensionStore;
 use gpui::{Action as _, Entity, Focusable as _, ScrollHandle, WeakEntity, prelude::*};
 use project::context_server_store::{
@@ -251,6 +252,13 @@ fn map_server_status(status: &ContextServerStatus) -> AiSettingItemStatus {
     }
 }
 
+/// The browser has no local extension host (BUILD-SPEC 3.2): no extension names to resolve.
+#[cfg(target_family = "wasm")]
+fn resolve_extension_display_name(_: &ContextServerId, _: &App) -> Option<SharedString> {
+    None
+}
+
+#[cfg(not(target_family = "wasm"))]
 fn resolve_extension_display_name(id: &ContextServerId, cx: &App) -> Option<SharedString> {
     ExtensionStore::global(cx)
         .read(cx)
@@ -635,9 +643,12 @@ fn uninstall_server(
             resolve_extension_for_context_server(context_server_id, cx)
         {
             if extension_only_provides_context_server(&manifest) {
+                #[cfg(not(target_family = "wasm"))]
                 ExtensionStore::global(cx)
                     .update(cx, |store, cx| store.uninstall_extension(ext_id, cx))
                     .detach_and_log_err(cx);
+                #[cfg(target_family = "wasm")]
+                let _ = &ext_id;
             }
         }
     }
@@ -652,6 +663,16 @@ fn uninstall_server(
     });
 }
 
+/// The browser has no local extension host (BUILD-SPEC 3.2): no extension provides servers.
+#[cfg(target_family = "wasm")]
+fn resolve_extension_for_context_server(
+    _: &ContextServerId,
+    _: &App,
+) -> Option<(Arc<str>, Arc<extension::ExtensionManifest>)> {
+    None
+}
+
+#[cfg(not(target_family = "wasm"))]
 fn resolve_extension_for_context_server(
     id: &ContextServerId,
     cx: &App,

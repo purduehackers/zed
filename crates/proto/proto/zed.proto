@@ -13,7 +13,9 @@ import "git.proto";
 import "image.proto";
 import "lsp.proto";
 import "notification.proto";
+import "remote_session.proto";
 import "task.proto";
+import "terminal.proto";
 import "toolchain.proto";
 import "worktree.proto";
 
@@ -516,7 +518,36 @@ message Envelope {
     GetIncomingCalls get_incoming_calls = 484;
     GetIncomingCallsResponse get_incoming_calls_response = 485;
     GetOutgoingCalls get_outgoing_calls = 486;
-    GetOutgoingCallsResponse get_outgoing_calls_response = 487; // current max
+    GetOutgoingCallsResponse get_outgoing_calls_response = 487;
+
+    SpawnTerminal spawn_terminal = 488;
+    SpawnTerminalResponse spawn_terminal_response = 489;
+    TerminalInput terminal_input = 490;
+    TerminalOutput terminal_output = 491;
+    AckTerminalOutput ack_terminal_output = 492;
+    ResizeTerminal resize_terminal = 493;
+    CloseTerminal close_terminal = 494;
+    TerminalExited terminal_exited = 495;
+    ListTerminals list_terminals = 496;
+    ListTerminalsResponse list_terminals_response = 497;
+    AttachTerminal attach_terminal = 498;
+    AttachTerminalResponse attach_terminal_response = 499;
+
+    SaveClientState save_client_state = 500;
+    SaveClientStateResponse save_client_state_response = 501;
+    LoadClientState load_client_state = 502;
+    LoadClientStateResponse load_client_state_response = 503;
+    LifecycleNotice lifecycle_notice = 504;
+    PortsChanged ports_changed = 505;
+    ForwardPort forward_port = 506;
+    ForwardPortResponse forward_port_response = 507;
+    UnforwardPort unforward_port = 508;
+    FilesUploaded files_uploaded = 509;
+    ListExtensions list_extensions = 510;
+    ListExtensionsResponse list_extensions_response = 511;
+    InstallRegistryExtension install_registry_extension = 512;
+    UninstallExtension uninstall_extension = 513;
+    ExtensionsChanged extensions_changed = 514; // current max
   }
 
   reserved 87 to 88;

@@ -1,0 +1,175 @@
+[package]
+name = "zed_web"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+# Every dependency but `zed_web_core` lives in the wasm target table and the crate root is
+# `#![cfg(target_family = "wasm")]` (the `gpui_web` pattern), so native workspace commands
+# see an empty crate. Build with `script/build-web`; check with `script/check-wasm -p zed_web`.
+[lib]
+path = "src/zed_web.rs"
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[features]
+default = ["multithreaded"]
+multithreaded = ["gpui_web/multithreaded"]
+# `window.__zs_test`: async browser test hooks over the real workspace, editor and terminal
+# entities (src/test_hooks.rs), for the Playwright suite in apps/web/tests/e2e-browser.
+# Never part of a production bundle: `script/build-web --test-hooks` is the only thing that
+# enables it and it emits to a separate `<build>-test` directory.
+test-hooks = ["dep:parking_lot_core", "parking_lot_core/wasm-test-hooks"]
+
+[dependencies]
+zed_web_core.workspace = true
+
+[build-dependencies]
+cargo_toml.workspace = true
+toml.workspace = true
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+# chrono without `wasmbind` implements `Utc::now()` with `std::time::SystemTime::now()`, which panics
+# on wasm32-unknown-unknown ("time not implemented"); the feature routes it through js-sys instead.
+# Declared here so feature unification enables it for browser builds only.
+chrono = { workspace = true, features = ["wasmbind"] }
+# platform
+anyhow.workspace = true
+futures.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+gpui.workspace = true
+gpui_platform.workspace = true
+gpui_web.workspace = true
+smol.workspace = true
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+js-sys.workspace = true
+web-sys = { version = "0.3", features = ["Window", "Navigator", "Location", "Document", "console"] }
+web-time.workspace = true
+time = { workspace = true, features = ["wasm-bindgen"] }
+# R3-5: both getrandom lines are declared here so the bundle never depends on a transitive
+# edge (the feature is what selects the browser backend; the cfg in .cargo/config.toml is parity).
+getrandom = { version = "0.3.4", features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+util = { workspace = true, features = ["debug-embed"] }
+uuid.workspace = true
+# foundation
+assets.workspace = true
+client.workspace = true
+clock.workspace = true
+collections.workspace = true
+credentials_provider.workspace = true
+db.workspace = true
+extension.workspace = true
+feature_flags.workspace = true
+fs.workspace = true
+git.workspace = true
+http_client.workspace = true
+language.workspace = true
+languages = { workspace = true, features = ["load-grammars"] }
+menu.workspace = true
+node_runtime.workspace = true
+parking_lot.workspace = true
+parking_lot_core = { workspace = true, optional = true }
+paths.workspace = true
+project.workspace = true
+release_channel.workspace = true
+remote.workspace = true
+session.workspace = true
+settings.workspace = true
+theme.workspace = true
+theme_settings.workspace = true
+theme_extension.workspace = true
+language_extension.workspace = true
+debug_adapter_extension.workspace = true
+ui.workspace = true
+ui_prompt.workspace = true
+workspace.workspace = true
+zed_actions.workspace = true
+zed_credentials_provider.workspace = true
+# editor and panels
+agent_settings.workspace = true
+agent_ui.workspace = true
+acp_tools.workspace = true
+activity_indicator.workspace = true
+breadcrumbs.workspace = true
+call_hierarchy.workspace = true
+channel.workspace = true
+# The Codestral edit-prediction delegate for the browser registry (b11 §3.19); already in the
+# closure through `edit_prediction_ui` and `settings_ui`.
+codestral.workspace = true
+command_palette.workspace = true
+copilot_chat.workspace = true
+copilot_ui.workspace = true
+dap_adapters.workspace = true
+debugger_tools.workspace = true
+debugger_ui.workspace = true
+diagnostics.workspace = true
+edit_prediction.workspace = true
+edit_prediction_ui.workspace = true
+editor.workspace = true
+encoding_selector.workspace = true
+file_finder.workspace = true
+git_hosting_providers.workspace = true
+git_ui.workspace = true
+go_to_line.workspace = true
+image_viewer.workspace = true
+json_schema_store.workspace = true
+keymap_editor.workspace = true
+language_model.workspace = true
+language_models.workspace = true
+language_onboarding.workspace = true
+language_selector.workspace = true
+language_tools.workspace = true
+line_ending_selector.workspace = true
+lsp_locations.workspace = true
+markdown_preview.workspace = true
+migrator.workspace = true
+notifications.workspace = true
+outline.workspace = true
+outline_panel.workspace = true
+project_panel.workspace = true
+project_symbols.workspace = true
+prompt_store.workspace = true
+recent_projects.workspace = true
+# ZS-TODO(b7): `repl` joins once its `jupyter-websocket-client` (tokio) and `runtimelib`
+# (aws-lc-rs) edges are gated for wasm; today they pull forbidden crates into the closure.
+search.workspace = true
+settings_profile_selector.workspace = true
+settings_ui.workspace = true
+sidebar.workspace = true
+snippet_provider.workspace = true
+snippets_ui.workspace = true
+svg_preview.workspace = true
+tab_switcher.workspace = true
+tabular_data_preview.workspace = true
+tasks_ui.workspace = true
+# `task::RevealStrategy` for the test hooks' direct `TerminalPanel::add_terminal_shell` call.
+task.workspace = true
+terminal.workspace = true
+terminal_view.workspace = true
+theme_selector.workspace = true
+title_bar.workspace = true
+toolchain_selector.workspace = true
+vim.workspace = true
+vim_mode_setting.workspace = true
+web_search.workspace = true
+web_search_providers.workspace = true
+which_key.workspace = true
+
+# `tests/*.rs` are `#![cfg(target_family = "wasm")]` browser tests (`wasm_bindgen_test`,
+# `run_in_browser`), driven by `wasm-bindgen-test-runner` with `script/check-wasm`'s flags.
+# Each `wasm-bindgen-test` 0.3.x requires exactly one `wasm-bindgen-test-shared` (=
+# `wasm-bindgen`) version; 0.3.77 is the one for the 0.2.127 the lockfile and
+# `script/build-web`'s CLI pin.
+[target.'cfg(target_family = "wasm")'.dev-dependencies]
+wasm-bindgen-test = "=0.3.77"
+
+[package.metadata.cargo-shear]
+ignored = ["web-time", "time", "util", "getrandom", "getrandom_02", "smol"]

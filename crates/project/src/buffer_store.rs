@@ -25,9 +25,10 @@ use rpc::{
 };
 
 use settings::Settings;
-use std::{io, sync::Arc, time::Instant};
+use std::{io, sync::Arc};
 use text::{BufferId, ReplicaId};
 use util::{ResultExt as _, TryFutureExt, debug_panic, maybe, rel_path::RelPath};
+use web_time::Instant;
 use worktree::{File, PathChange, ProjectEntryId, Worktree, WorktreeId, WorktreeSettings};
 
 /// A set of open buffers.

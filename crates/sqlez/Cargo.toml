@@ -8,16 +8,32 @@ license = "GPL-3.0-or-later"
 [lints]
 workspace = true
 
+[features]
+# Exposes `wasm_lock` and `wasm_lock_queue` to dependents' tests (db).
+test-support = []
+
 [dependencies]
 anyhow.workspace = true
 collections.workspace = true
 futures.workspace = true
 indoc.workspace = true
-libsqlite3-sys.workspace = true
 log.workspace = true
 parking_lot.workspace = true
 pollster.workspace = true
 sqlformat.workspace = true
-thread_local = "1.1.4"
 util.workspace = true
 uuid.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+libsqlite3-sys.workspace = true
+thread_local = "1.1.4"
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+# libsqlite3-sys-compatible C API for wasm32-unknown-unknown: builds the amalgamation
+# with `cc` against a vendored libc shim, memory VFS by default, SQLITE_THREADSAFE=0
+# (see sqlez::wasm_lock) and SQLITE_OMIT_SHARED_CACHE.
+libsqlite3-sys = { package = "sqlite-wasm-rs", version = "0.5.5" }
+# Same two lines as crates/gpui/Cargo.toml's wasm table, so `-p sqlez` resolves
+# uuid -> getrandom with the wasm_js backend without gpui in the graph.
+getrandom = { version = "0.3.4", features = ["wasm_js"] }
+uuid = { workspace = true, features = ["js"] }

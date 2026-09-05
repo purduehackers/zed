@@ -7,6 +7,7 @@ use gpui::{App, AssetSource, Result, SharedString};
 // runtime so edits show up on the next launch without a rebuild and no
 // build-time path is baked in (which corgi's sandbox rejects). See
 // `util::fs_embed!`.
+#[cfg(not(target_family = "wasm"))]
 util::fs_embed! {
     pub struct Assets,
     crate_relative = "../../assets",
@@ -21,6 +22,18 @@ util::fs_embed! {
         "*.md",
     ],
     exclude = ["themes/src/*", "*.DS_Store"],
+}
+
+// The browser bundle ships fonts, icons, images, themes and sounds in a separate asset
+// pack fetched next to the wasm (BUILD-SPEC 3.5); only what that pack does not carry is
+// embedded, and the entry crate layers the pack over this source.
+#[cfg(target_family = "wasm")]
+util::fs_embed! {
+    pub struct Assets,
+    crate_relative = "../../assets",
+    root_relative = "assets",
+    include = ["prompts/**/*", "*.md"],
+    exclude = ["*.DS_Store"],
 }
 
 impl AssetSource for Assets {

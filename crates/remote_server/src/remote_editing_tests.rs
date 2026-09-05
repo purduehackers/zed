@@ -25,8 +25,8 @@ use git::{
     repository::{CommitData, GitCommitTemplate, RepoPath, Worktree as GitWorktree},
 };
 use gpui::{
-    AppContext as _, Entity, ImageSource, IntoElement as _, SharedString, TestAppContext,
-    UpdateGlobal, VisualContext, img, px, size,
+    AppContext as _, Entity, ImageSource, IntoElement as _, SharedString, TaskExt as _,
+    TestAppContext, UpdateGlobal, VisualContext, img, px, size,
 };
 use http_client::{BlockedHttpClient, FakeHttpClient};
 use language::{
@@ -46,7 +46,7 @@ use project::{
     search::{SearchQuery, SearchResult},
 };
 use remote::{ConnectionState, RemoteClient, RemoteClientEvent};
-use rpc::proto;
+use rpc::{AnyProtoClient, proto};
 use serde_json::json;
 use settings::{
     Settings, SettingsLocation, SettingsStore, SplicingVec, initial_server_settings_content,
@@ -4697,6 +4697,17 @@ pub async fn init_test(
     cx: &mut TestAppContext,
     server_cx: &mut TestAppContext,
 ) -> (Entity<Project>, Entity<HeadlessProject>) {
+    let (project, headless, _) = init_test_with_session(server_fs, cx, server_cx).await;
+    (project, headless)
+}
+
+/// Like [`init_test`], but also returns the server side of the session so a test can
+/// drive server-initiated messages.
+pub async fn init_test_with_session(
+    server_fs: &Arc<FakeFs>,
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) -> (Entity<Project>, Entity<HeadlessProject>, AnyProtoClient) {
     let server_fs = server_fs.clone();
     cx.update(|cx| {
         release_channel::init(semver::Version::new(0, 0, 0), cx);
@@ -4715,7 +4726,7 @@ pub async fn init_test(
     let headless = server_cx.new(|cx| {
         HeadlessProject::new(
             crate::HeadlessAppState {
-                session: ssh_server_client,
+                session: ssh_server_client.clone(),
                 fs: server_fs.clone(),
                 http_client,
                 node_runtime,
@@ -4736,7 +4747,434 @@ pub async fn init_test(
             |_, cx| cx.on_release(|_, _| drop(headless))
         })
         .detach();
+    (project, headless, ssh_server_client)
+}
+
+/// Like [`init_test`], but the mock connection reports that it hosts PTYs
+/// itself, so terminals run through the remote terminal protocol against the
+/// real process-level [`crate::pty::PtyManager`] the `HeadlessProject`
+/// installs. Parking is allowed because the PTYs run on real OS threads.
+#[cfg(unix)]
+pub async fn init_test_with_remote_pty(
+    server_fs: &Arc<FakeFs>,
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) -> (Entity<Project>, Entity<HeadlessProject>) {
+    let server_fs = server_fs.clone();
+    cx.update(|cx| {
+        release_channel::init(semver::Version::new(0, 0, 0), cx);
+    });
+    server_cx.update(|cx| {
+        release_channel::init(semver::Version::new(0, 0, 0), cx);
+    });
+    init_logger();
+    cx.executor().allow_parking();
+    server_cx.executor().allow_parking();
+
+    let (opts, server_client, _) = RemoteClient::fake_server_with_remote_pty(cx, server_cx);
+    let http_client = Arc::new(BlockedHttpClient);
+    let node_runtime = NodeRuntime::unavailable();
+    let languages = Arc::new(LanguageRegistry::new(cx.executor()));
+    let proxy = Arc::new(ExtensionHostProxy::new());
+    server_cx.update(HeadlessProject::init);
+    let headless = server_cx.new(|cx| {
+        HeadlessProject::new(
+            crate::HeadlessAppState {
+                session: server_client,
+                fs: server_fs.clone(),
+                http_client,
+                node_runtime,
+                languages,
+                extension_host_proxy: proxy,
+                startup_time: std::time::Instant::now(),
+            },
+            false,
+            cx,
+        )
+    });
+
+    let remote = RemoteClient::connect_mock(opts, cx).await;
+    let project = build_project(remote, cx);
+    project
+        .update(cx, {
+            let headless = headless.clone();
+            |_, cx| cx.on_release(|_, _| drop(headless))
+        })
+        .detach();
     (project, headless)
+}
+
+/// Pumps both the client and the server until `condition` holds or the timeout
+/// elapses. Real PTYs run on OS threads, so the loop sleeps between probes and
+/// keys off wall-clock time rather than the fake executor clock.
+#[cfg(unix)]
+fn pump_until(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+    timeout: std::time::Duration,
+    mut condition: impl FnMut(&mut TestAppContext, &mut TestAppContext) -> bool,
+) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        cx.run_until_parked();
+        server_cx.run_until_parked();
+        if condition(cx, server_cx) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "condition was not met within {timeout:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn remote_pty_terminal_count(
+    headless: &Entity<HeadlessProject>,
+    server_cx: &mut TestAppContext,
+) -> usize {
+    headless.read_with(server_cx, |headless, _| headless.pty_manager.list().len())
+}
+
+/// Integration test 1: a remote shell spawns as a real PTY, its output streams
+/// back, and — the regression the exited-entry leak fix pins — the server frees
+/// the entry once the tab is dropped, so nothing accumulates within a session.
+#[cfg(unix)]
+#[gpui::test]
+async fn test_remote_terminal_roundtrip(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
+    let fs = FakeFs::new(server_cx.executor());
+    let (project, headless) = init_test_with_remote_pty(&fs, cx, server_cx).await;
+
+    let terminal = project
+        .update(cx, |project, cx| {
+            project.create_terminal_shell(Some(PathBuf::from("/")), cx)
+        })
+        .await
+        .unwrap();
+    assert!(terminal.read_with(cx, |terminal, _| terminal.is_remote_pty()));
+
+    terminal.update(cx, |terminal, _| {
+        terminal.input(b"echo marker-done\r".to_vec())
+    });
+    pump_until(
+        cx,
+        server_cx,
+        std::time::Duration::from_secs(10),
+        |cx, _| {
+            terminal.read_with(cx, |terminal, _| {
+                terminal.get_content().contains("marker-done")
+            })
+        },
+    );
+    assert_eq!(remote_pty_terminal_count(&headless, server_cx), 1);
+
+    // The shell exits on its own. The server keeps the exited entry (its
+    // scrollback is still replayable) until the client closes it.
+    terminal.update(cx, |terminal, _| terminal.input(b"exit\r".to_vec()));
+    pump_until(
+        cx,
+        server_cx,
+        std::time::Duration::from_secs(10),
+        |cx, _| terminal.read_with(cx, |terminal, _| !terminal.has_active_pty_resources()),
+    );
+    assert_eq!(
+        remote_pty_terminal_count(&headless, server_cx),
+        1,
+        "an exited-but-open terminal is retained for replay"
+    );
+
+    // Dropping the tab sends CloseTerminal, and the server frees the entry: the
+    // manager does not leak exited terminals for the life of the session.
+    drop(terminal);
+    pump_until(
+        cx,
+        server_cx,
+        std::time::Duration::from_secs(10),
+        |cx, server_cx| {
+            cx.update(|_| {});
+            remote_pty_terminal_count(&headless, server_cx) == 0
+        },
+    );
+}
+
+/// Integration test 3: a task terminal reports the child's real exit code and
+/// carries its task id and label to the server.
+#[cfg(unix)]
+#[gpui::test]
+async fn test_remote_task_terminal_reports_exit_code(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    let (project, headless) = init_test_with_remote_pty(&fs, cx, server_cx).await;
+
+    let terminal = project
+        .update(cx, |project, cx| {
+            project.create_terminal_task(
+                task::SpawnInTerminal {
+                    id: task::TaskId("task-1".to_string()),
+                    label: "t".to_string(),
+                    full_label: "t".to_string(),
+                    command: Some("sh".to_string()),
+                    args: vec!["-c".to_string(), "exit 4".to_string()],
+                    show_summary: true,
+                    ..task::SpawnInTerminal::default()
+                },
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+    pump_until(
+        cx,
+        server_cx,
+        std::time::Duration::from_secs(10),
+        |cx, _| {
+            terminal.read_with(cx, |terminal, _| {
+                terminal.get_content().contains("exit code: 4")
+            })
+        },
+    );
+
+    let status = terminal
+        .update(cx, |terminal, cx| terminal.wait_for_completed_task(cx))
+        .await;
+    assert_eq!(status.and_then(|status| status.code()), Some(4));
+
+    // Before the exit is observed the entry carried the task id and label.
+    let infos = headless.read_with(server_cx, |headless, _| headless.pty_manager.list());
+    let info = infos.iter().find(|info| info.task_id.is_some());
+    if let Some(info) = info {
+        assert_eq!(info.task_id.as_deref(), Some("task-1"));
+        assert_eq!(info.title, "t");
+    }
+}
+
+/// Integration test 15 (D4): a fresh client with an empty terminal map lists the
+/// server's terminals, reattaches one from offset 0 and replays its scrollback.
+#[cfg(unix)]
+#[gpui::test]
+async fn test_fresh_client_restores_terminal_with_scrollback(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    let (project, headless) = init_test_with_remote_pty(&fs, cx, server_cx).await;
+
+    let terminal = project
+        .update(cx, |project, cx| {
+            project.create_terminal_shell(Some(PathBuf::from("/")), cx)
+        })
+        .await
+        .unwrap();
+    terminal.update(cx, |terminal, _| {
+        terminal.input(b"echo marker-done\r".to_vec())
+    });
+    pump_until(
+        cx,
+        server_cx,
+        std::time::Duration::from_secs(10),
+        |cx, _| {
+            terminal.read_with(cx, |terminal, _| {
+                terminal.get_content().contains("marker-done")
+            })
+        },
+    );
+    let terminal_id = terminal
+        .read_with(cx, |terminal, _| terminal.remote_terminal_id())
+        .unwrap();
+
+    // The client vanishes without closing its tab (a page reload).
+    terminal.update(cx, |terminal, _| terminal.forget_remote_transport());
+    drop(terminal);
+    pump_until(cx, server_cx, std::time::Duration::from_secs(5), |cx, _| {
+        cx.update(|_| {});
+        true
+    });
+    assert_eq!(remote_pty_terminal_count(&headless, server_cx), 1);
+
+    // A fresh session restores it from the server's inventory, replaying the
+    // scrollback into the new grid.
+    project
+        .update(cx, |project, cx| {
+            project.fetch_remote_terminal_inventory(cx)
+        })
+        .await;
+    let restored = project
+        .update(cx, |project, cx| {
+            project.restore_remote_terminal(terminal_id, Some(PathBuf::from("/")), None, cx)
+        })
+        .unwrap();
+    pump_until(
+        cx,
+        server_cx,
+        std::time::Duration::from_secs(10),
+        |cx, _| {
+            restored.read_with(cx, |terminal, _| {
+                terminal.get_content().contains("marker-done")
+            })
+        },
+    );
+    restored.read_with(cx, |terminal, _| {
+        assert_eq!(terminal.remote_terminal_id(), Some(terminal_id));
+        assert!(terminal.has_active_pty_resources());
+    });
+
+    // Nothing is reaped: the terminal was restored.
+    project.update(cx, |project, cx| {
+        project.close_unrestored_remote_terminals(cx)
+    });
+    pump_until(cx, server_cx, std::time::Duration::from_secs(2), |cx, _| {
+        cx.update(|_| {});
+        true
+    });
+    assert_eq!(remote_pty_terminal_count(&headless, server_cx), 1);
+    drop(restored);
+}
+
+/// Integration test 16 (D4): a fresh session reattaches the terminals it
+/// recognises and closes the rest, killing the abandoned processes.
+#[cfg(unix)]
+#[gpui::test]
+async fn test_unrestored_terminals_are_closed(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    let (project, headless) = init_test_with_remote_pty(&fs, cx, server_cx).await;
+
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let terminal = project
+            .update(cx, |project, cx| {
+                project.create_terminal_shell(Some(PathBuf::from("/")), cx)
+            })
+            .await
+            .unwrap();
+        pump_until(
+            cx,
+            server_cx,
+            std::time::Duration::from_secs(10),
+            |cx, _| terminal.read_with(cx, |terminal, _| terminal.remote_terminal_id().is_some()),
+        );
+        let id = terminal
+            .read_with(cx, |terminal, _| terminal.remote_terminal_id())
+            .unwrap();
+        ids.push(id);
+        terminal.update(cx, |terminal, _| terminal.forget_remote_transport());
+        drop(terminal);
+    }
+    pump_until(
+        cx,
+        server_cx,
+        std::time::Duration::from_secs(5),
+        |cx, server_cx| {
+            cx.update(|_| {});
+            remote_pty_terminal_count(&headless, server_cx) == 2
+        },
+    );
+
+    project
+        .update(cx, |project, cx| {
+            project.fetch_remote_terminal_inventory(cx)
+        })
+        .await;
+    let restored = project
+        .update(cx, |project, cx| {
+            project.restore_remote_terminal(ids[0], Some(PathBuf::from("/")), None, cx)
+        })
+        .unwrap();
+    project.update(cx, |project, cx| {
+        project.close_unrestored_remote_terminals(cx)
+    });
+
+    pump_until(
+        cx,
+        server_cx,
+        std::time::Duration::from_secs(10),
+        |cx, server_cx| {
+            cx.update(|_| {});
+            let list = headless.read_with(server_cx, |headless, _| headless.pty_manager.list());
+            list.len() == 1 && list[0].terminal_id == ids[0]
+        },
+    );
+    restored.read_with(cx, |terminal, _| {
+        assert!(terminal.has_active_pty_resources())
+    });
+    drop(restored);
+}
+
+/// Integration test 17 (D4): an exited terminal is not restored; consulting it
+/// closes it and it disappears from the server.
+#[cfg(unix)]
+#[gpui::test]
+async fn test_exited_terminal_is_not_restored(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    let (project, headless) = init_test_with_remote_pty(&fs, cx, server_cx).await;
+
+    let terminal = project
+        .update(cx, |project, cx| {
+            project.create_terminal_shell(Some(PathBuf::from("/")), cx)
+        })
+        .await
+        .unwrap();
+    pump_until(
+        cx,
+        server_cx,
+        std::time::Duration::from_secs(10),
+        |cx, _| terminal.read_with(cx, |terminal, _| terminal.remote_terminal_id().is_some()),
+    );
+    let terminal_id = terminal
+        .read_with(cx, |terminal, _| terminal.remote_terminal_id())
+        .unwrap();
+
+    terminal.update(cx, |terminal, _| terminal.input(b"exit\r".to_vec()));
+    pump_until(
+        cx,
+        server_cx,
+        std::time::Duration::from_secs(10),
+        |cx, _| terminal.read_with(cx, |terminal, _| !terminal.has_active_pty_resources()),
+    );
+    terminal.update(cx, |terminal, _| terminal.forget_remote_transport());
+    drop(terminal);
+    pump_until(
+        cx,
+        server_cx,
+        std::time::Duration::from_secs(5),
+        |cx, server_cx| {
+            cx.update(|_| {});
+            remote_pty_terminal_count(&headless, server_cx) == 1
+        },
+    );
+
+    project
+        .update(cx, |project, cx| {
+            project.fetch_remote_terminal_inventory(cx)
+        })
+        .await;
+    let restored = project.update(cx, |project, cx| {
+        project.restore_remote_terminal(terminal_id, Some(PathBuf::from("/")), None, cx)
+    });
+    assert!(
+        restored.is_err(),
+        "an exited terminal is not restored, it is closed"
+    );
+
+    // Consulting an exited terminal closes it, so it disappears from the server.
+    pump_until(
+        cx,
+        server_cx,
+        std::time::Duration::from_secs(10),
+        |cx, server_cx| {
+            cx.update(|_| {});
+            remote_pty_terminal_count(&headless, server_cx) == 0
+        },
+    );
 }
 
 fn init_logger() {
@@ -4769,4 +5207,1133 @@ fn build_project(ssh: Entity<RemoteClient>, cx: &mut TestAppContext) -> Entity<P
     });
 
     cx.update(|cx| Project::remote(ssh, client, node, user_store, languages, fs, false, cx))
+}
+
+// ---- b4: sandbox harness and integration tests ----
+
+/// A supervisor request captured by [`SandboxHarness`]'s fake supervisor.
+#[derive(Clone, Debug)]
+pub(crate) struct SupervisorRequest {
+    pub method: String,
+    pub path: String,
+    pub body: String,
+}
+
+/// Where the harness stores client-state images on the server's `FakeFs`.
+pub(crate) fn test_client_state_dir() -> PathBuf {
+    PathBuf::from(path!("/data/server_state/client_state"))
+}
+
+/// A `HeadlessProject` with `enable_sandbox` over a fake supervisor and registry, plus the
+/// connected client project.
+pub(crate) struct SandboxHarness {
+    pub project: Entity<Project>,
+    pub headless: Entity<HeadlessProject>,
+    pub control: Arc<crate::control::ControlChannel>,
+    pub supervisor_requests: Arc<std::sync::Mutex<Vec<SupervisorRequest>>>,
+}
+
+/// A supervisor that records every request, answers forwards with a fixed URL and
+/// acknowledges everything else.
+pub(crate) fn recording_supervisor() -> (
+    Arc<http_client::HttpClientWithUrl>,
+    Arc<std::sync::Mutex<Vec<SupervisorRequest>>>,
+) {
+    use futures::AsyncReadExt as _;
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let client = FakeHttpClient::create({
+        let requests = requests.clone();
+        move |request| {
+            let requests = requests.clone();
+            async move {
+                let method = request.method().to_string();
+                let path = request.uri().path().to_owned();
+                let mut body = Vec::new();
+                request.into_body().read_to_end(&mut body).await?;
+                requests.lock().unwrap().push(SupervisorRequest {
+                    method: method.clone(),
+                    path: path.clone(),
+                    body: String::from_utf8_lossy(&body).into_owned(),
+                });
+                let (status, body) = if method == "POST" && path == "/ports" {
+                    (200, r#"{"url":"https://forwarded.example"}"#)
+                } else {
+                    (204, "")
+                };
+                Ok(http_client::Response::builder()
+                    .status(status)
+                    .body(http_client::AsyncBody::from(body))?)
+            }
+        }
+    });
+    (client, requests)
+}
+
+impl SandboxHarness {
+    /// Enables the sandbox with a recording supervisor and a registry that 404s.
+    pub fn enable(
+        project: Entity<Project>,
+        headless: Entity<HeadlessProject>,
+        secret: &str,
+        server_cx: &mut TestAppContext,
+    ) -> Self {
+        let (supervisor, requests) = recording_supervisor();
+        Self::enable_with(
+            project,
+            headless,
+            secret,
+            supervisor,
+            requests,
+            FakeHttpClient::with_404_response(),
+            server_cx,
+        )
+    }
+
+    /// Enables the sandbox over the given supervisor client (nothing is recorded here).
+    pub fn enable_with_supervisor(
+        project: Entity<Project>,
+        headless: Entity<HeadlessProject>,
+        secret: &str,
+        supervisor: Arc<http_client::HttpClientWithUrl>,
+        server_cx: &mut TestAppContext,
+    ) -> Self {
+        Self::enable_with(
+            project,
+            headless,
+            secret,
+            supervisor,
+            Arc::default(),
+            FakeHttpClient::with_404_response(),
+            server_cx,
+        )
+    }
+
+    /// Enables the sandbox with a recording supervisor and the given registry client.
+    pub fn enable_with_registry(
+        project: Entity<Project>,
+        headless: Entity<HeadlessProject>,
+        secret: &str,
+        registry: Arc<http_client::HttpClientWithUrl>,
+        server_cx: &mut TestAppContext,
+    ) -> Self {
+        let (supervisor, requests) = recording_supervisor();
+        Self::enable_with(
+            project, headless, secret, supervisor, requests, registry, server_cx,
+        )
+    }
+
+    fn enable_with(
+        project: Entity<Project>,
+        headless: Entity<HeadlessProject>,
+        secret: &str,
+        supervisor: Arc<http_client::HttpClientWithUrl>,
+        supervisor_requests: Arc<std::sync::Mutex<Vec<SupervisorRequest>>>,
+        registry: Arc<http_client::HttpClientWithUrl>,
+        server_cx: &mut TestAppContext,
+    ) -> Self {
+        server_cx.update(|cx| {
+            if extension::ExtensionEvents::try_global(cx).is_none() {
+                extension::init(cx);
+            }
+        });
+        let control = headless.update(server_cx, |headless, cx| {
+            headless.enable_sandbox(
+                crate::SandboxConfig {
+                    control_secret: secret.as_bytes().to_vec(),
+                    supervisor_url: crate::ports::DEFAULT_SUPERVISOR_URL.to_owned(),
+                    supervisor_http: supervisor,
+                    registry: crate::extensions::RegistryConfig {
+                        http: registry,
+                        release_channel: release_channel::ReleaseChannel::Dev,
+                    },
+                    client_state_dir: test_client_state_dir(),
+                },
+                cx,
+            )
+        });
+        Self {
+            project,
+            headless,
+            control,
+            supervisor_requests,
+        }
+    }
+
+    /// The client's proto client.
+    pub fn client(&self, cx: &TestAppContext) -> AnyProtoClient {
+        self.project.read_with(cx, |project, cx| {
+            project
+                .remote_client()
+                .expect("a remote project")
+                .read(cx)
+                .proto_client()
+        })
+    }
+
+    /// Records every `LifecycleNotice` the client project emits from now on.
+    pub fn lifecycle_notices(
+        &self,
+        cx: &mut TestAppContext,
+    ) -> Arc<std::sync::Mutex<Vec<(project::lifecycle::LifecycleKind, u32)>>> {
+        let notices = Arc::new(std::sync::Mutex::new(Vec::new()));
+        cx.update({
+            let notices = notices.clone();
+            let project = self.project.clone();
+            move |cx| {
+                cx.subscribe(&project, move |_, event, _| {
+                    if let project::Event::LifecycleNotice { kind, seconds } = event {
+                        notices.lock().unwrap().push((*kind, *seconds));
+                    }
+                })
+                .detach();
+            }
+        });
+        notices
+    }
+
+    /// The client's port store.
+    pub fn port_store(&self, cx: &TestAppContext) -> Entity<project::port_store::PortStore> {
+        self.project
+            .read_with(cx, |project, _| project.port_store().cloned())
+            .expect("a remote project has a port store")
+    }
+
+    /// The client's extension store.
+    pub fn extension_store(
+        &self,
+        cx: &TestAppContext,
+    ) -> Entity<project::remote_extension_store::RemoteExtensionStore> {
+        self.project
+            .read_with(cx, |project, _| project.remote_extension_store().cloned())
+            .expect("a remote project has an extension store")
+    }
+
+    /// Sends one raw `SaveClientState` over the session; `stopping` tags it as the flush
+    /// that answers a `Stopping` notice.
+    pub async fn save_client_state(
+        &self,
+        version: u64,
+        stopping: bool,
+        cx: &TestAppContext,
+    ) -> proto::SaveClientStateResponse {
+        self.client(cx)
+            .request(proto::SaveClientState {
+                project_id: proto::REMOTE_SERVER_PROJECT_ID,
+                sqlite: vec![1, 2, 3],
+                version,
+                gzip: false,
+                client_build: None,
+                stopping,
+            })
+            .await
+            .expect("SaveClientState answers")
+    }
+}
+
+const SANDBOX_SECRET: &str = "sandbox-secret";
+
+#[gpui::test]
+async fn test_client_state_round_trip_over_session(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    use db::{AppDatabase, RestoreOutcome, client_state::SaveOutcome, kvp::KeyValueStore};
+    use workspace::client_state::{RemoteClientStateSink, load_client_state};
+
+    let fs = FakeFs::new(server_cx.executor());
+    let (project, headless) = init_test(&fs, cx, server_cx).await;
+    let harness = SandboxHarness::enable(project, headless, SANDBOX_SECRET, server_cx);
+    let client = harness.client(cx);
+
+    let db = AppDatabase::test_new();
+    KeyValueStore::from_app_db(&db)
+        .write_kvp("k".into(), "v".into())
+        .await
+        .unwrap();
+    let image = db.0.serialize().await.unwrap();
+
+    let sink = RemoteClientStateSink::new(client.clone(), "test-build".into());
+    let outcome = db::client_state::ClientStateSink::save(sink.as_ref(), image.clone(), 1, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        SaveOutcome {
+            accepted: true,
+            version: 1
+        }
+    );
+    let meta = fs
+        .load(test_client_state_dir().join("meta.json").as_path())
+        .await
+        .unwrap();
+    assert!(meta.contains("\"gzip\": true"), "{meta}");
+    assert!(meta.contains("test-build"), "{meta}");
+
+    let (loaded, version) = load_client_state(&client).await.unwrap();
+    assert_eq!(version, 1);
+    assert_eq!(loaded.as_deref(), Some(image.as_slice()));
+    let (restored, outcome) = AppDatabase::test_new_with_image(loaded);
+    assert_eq!(outcome, RestoreOutcome::Restored);
+    assert_eq!(
+        KeyValueStore::from_app_db(&restored).read_kvp("k").unwrap(),
+        Some("v".to_string())
+    );
+    assert_eq!(
+        db::client_state::ClientStateSink::current_version(sink.as_ref())
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[gpui::test]
+async fn test_save_survives_lost_response(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
+    use db::{AppDatabase, RestoreOutcome, client_state::ClientStateStore};
+    use workspace::client_state::RemoteClientStateSink;
+
+    let fs = FakeFs::new(server_cx.executor());
+    let (project, headless) = init_test(&fs, cx, server_cx).await;
+    let harness = SandboxHarness::enable(project.clone(), headless, SANDBOX_SECRET, server_cx);
+    let client = harness.client(cx);
+
+    let db = AppDatabase::test_new();
+    let sink = RemoteClientStateSink::new(client.clone(), "test-build".into());
+    let store = cx.new(|cx| ClientStateStore::new(&db, sink, 0, RestoreOutcome::NoImage, cx));
+    store
+        .update(cx, |store, cx| store.flush_now(cx))
+        .await
+        .unwrap();
+    assert_eq!(store.read_with(cx, |store, _| store.version()), 1);
+
+    // The server accepted version 1; the same envelope replayed after a lost response is
+    // answered with the current version, not an error.
+    let replay = client
+        .request(proto::SaveClientState {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            sqlite: vec![9],
+            version: 1,
+            gzip: false,
+            client_build: None,
+            stopping: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        replay,
+        proto::SaveClientStateResponse {
+            accepted: false,
+            version: 1
+        }
+    );
+
+    let remote = project.read_with(cx, |project, _| project.remote_client().unwrap());
+    remote
+        .update(cx, |remote, cx| remote.simulate_disconnect(cx))
+        .detach();
+    store
+        .update(cx, |store, cx| store.resync(cx))
+        .await
+        .unwrap();
+    assert_eq!(store.read_with(cx, |store, _| store.version()), 1);
+    assert!(store.read_with(cx, |store, _| store.is_dirty()));
+    store
+        .update(cx, |store, cx| store.flush_now(cx))
+        .await
+        .unwrap();
+    assert_eq!(store.read_with(cx, |store, _| store.version()), 2);
+}
+
+#[gpui::test]
+async fn test_lifecycle_notice_emits_project_event(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    use project::lifecycle::LifecycleKind;
+
+    let fs = FakeFs::new(server_cx.executor());
+    let (project, _headless, server_session) = init_test_with_session(&fs, cx, server_cx).await;
+    let notices = Arc::new(std::sync::Mutex::new(Vec::new()));
+    cx.update({
+        let notices = notices.clone();
+        let project = project.clone();
+        move |cx| {
+            cx.subscribe(&project, move |_, event, _| {
+                if let project::Event::LifecycleNotice { kind, seconds } = event {
+                    notices.lock().unwrap().push((*kind, *seconds));
+                }
+            })
+            .detach();
+        }
+    });
+
+    server_session
+        .send(proto::LifecycleNotice {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            kind: proto::LifecycleKind::Stopping as i32,
+            seconds: 0,
+        })
+        .unwrap();
+    server_session
+        .send(proto::LifecycleNotice {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            kind: 42,
+            seconds: 1,
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        notices.lock().unwrap().as_slice(),
+        &[(LifecycleKind::Stopping, 0)],
+        "known kinds are emitted, unknown ones dropped"
+    );
+}
+
+#[gpui::test]
+async fn test_files_uploaded_refreshes_worktree(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(
+        path!("/code/project1"),
+        json!({ "README.md": "# project 1" }),
+    )
+    .await;
+    let (project, headless) = init_test(&fs, cx, server_cx).await;
+    let (worktree, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/code/project1"), true, cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    let uploaded = Arc::new(std::sync::Mutex::new(Vec::new()));
+    cx.update({
+        let uploaded = uploaded.clone();
+        let project = project.clone();
+        move |cx| {
+            cx.subscribe(&project, move |_, event, _| {
+                if let project::Event::FilesUploaded(paths) = event {
+                    uploaded.lock().unwrap().push(paths.clone());
+                }
+            })
+            .detach();
+        }
+    });
+
+    fs.insert_file(path!("/code/project1/uploaded.txt"), b"hello".to_vec())
+        .await;
+    let notify = server_cx.update(|cx| {
+        HeadlessProject::notify_files_uploaded(
+            headless.downgrade(),
+            vec![
+                PathBuf::from(path!("/code/project1/uploaded.txt")),
+                PathBuf::from(path!("/elsewhere/ignored.txt")),
+            ],
+            &mut cx.to_async(),
+        )
+    });
+    notify.await.unwrap();
+    cx.run_until_parked();
+
+    worktree.read_with(cx, |worktree, _| {
+        assert!(
+            worktree.entry_for_path(rel_path("uploaded.txt")).is_some(),
+            "the client snapshot has the uploaded entry"
+        );
+    });
+    let uploaded = uploaded.lock().unwrap();
+    assert_eq!(uploaded.len(), 1);
+    assert_eq!(uploaded[0].len(), 1);
+    assert_eq!(uploaded[0][0].path.as_ref(), rel_path("uploaded.txt"));
+    assert_eq!(
+        uploaded[0][0].worktree_id,
+        worktree.read_with(cx, |worktree, _| worktree.id())
+    );
+}
+
+const FOO_MANIFEST: &str = r#"
+id = "foo"
+name = "Foo"
+version = "1.0.0"
+schema_version = 1
+languages = ["languages/foo"]
+"#;
+
+const FOO_LANGUAGE_CONFIG: &str = r#"
+name = "Foo"
+grammar = "foo"
+path_suffixes = ["foo"]
+"#;
+
+/// A gzip tarball holding the `foo` language extension.
+async fn foo_extension_tarball() -> Vec<u8> {
+    let mut builder = async_tar::Builder::new(Vec::new());
+    for (path, contents) in [
+        ("extension.toml", FOO_MANIFEST),
+        ("languages/foo/config.toml", FOO_LANGUAGE_CONFIG),
+    ] {
+        let mut header = async_tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, contents.as_bytes())
+            .await
+            .unwrap();
+    }
+    let tar = builder.into_inner().await.unwrap();
+    workspace::client_state::gzip(&tar).await.unwrap()
+}
+
+/// A registry that serves the `foo` tarball for every `foo` download and 404s otherwise.
+async fn foo_registry() -> (
+    Arc<http_client::HttpClientWithUrl>,
+    Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    let tarball = foo_extension_tarball().await;
+    let paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let client = FakeHttpClient::create({
+        let paths = paths.clone();
+        move |request| {
+            let tarball = tarball.clone();
+            let paths = paths.clone();
+            async move {
+                let path = request.uri().path().to_owned();
+                paths.lock().unwrap().push(path.clone());
+                let (status, body) = if path.starts_with("/extensions/foo/") {
+                    (200, tarball)
+                } else {
+                    (404, Vec::new())
+                };
+                Ok(http_client::Response::builder()
+                    .status(status)
+                    .body(http_client::AsyncBody::from(body))?)
+            }
+        }
+    });
+    (client, paths)
+}
+
+#[gpui::test]
+async fn test_extension_install_over_session(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    let (project, headless) = init_test(&fs, cx, server_cx).await;
+    let (registry, registry_paths) = foo_registry().await;
+    let harness = SandboxHarness::enable_with_registry(
+        project,
+        headless,
+        SANDBOX_SECRET,
+        registry,
+        server_cx,
+    );
+    let store = harness.extension_store(cx);
+    let extension_dir = paths::remote_extensions_dir().join("foo");
+
+    store
+        .update(cx, |store, cx| store.install("foo".into(), None, cx))
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    assert!(
+        registry_paths
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path == "/extensions/foo/download"),
+        "{:?}",
+        registry_paths.lock().unwrap()
+    );
+    assert!(
+        fs.is_dir(&extension_dir).await,
+        "the extension landed on disk"
+    );
+    assert!(
+        fs.is_file(&extension_dir.join("languages/foo/config.toml"))
+            .await
+    );
+    let installed = store.read_with(cx, |store, _| store.installed().to_vec());
+    assert_eq!(installed.len(), 1, "{installed:?}");
+    assert_eq!(installed[0].id.as_ref(), "foo");
+    assert_eq!(installed[0].version.as_ref(), "1.0.0");
+    assert_eq!(installed[0].name, "Foo");
+    assert!(
+        installed[0]
+            .provides
+            .iter()
+            .any(|provides| provides == "languages")
+    );
+    assert!(!installed[0].dev);
+    assert!(!store.read_with(cx, |store, _| store.is_pending("foo")));
+    harness.headless.read_with(server_cx, |headless, cx| {
+        let sandbox = headless.sandbox.as_ref().expect("sandbox runtime");
+        assert!(
+            sandbox.extensions.read(cx).is_loaded("foo"),
+            "a language extension is loaded into the store"
+        );
+        let names: Vec<String> = headless
+            .languages
+            .language_names()
+            .into_iter()
+            .map(|name| name.as_ref().to_owned())
+            .collect();
+        assert!(
+            names.contains(&"Foo".to_string()),
+            "the store registered the extension's language: {names:?}"
+        );
+    });
+    {
+        let requests = harness.supervisor_requests.lock().unwrap();
+        assert!(
+            requests.iter().any(|request| request.method == "POST"
+                && request.path == "/extensions"
+                && request.body.contains("\"foo\"")),
+            "{requests:?}"
+        );
+    }
+
+    store
+        .update(cx, |store, cx| store.uninstall("foo".into(), cx))
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    assert!(store.read_with(cx, |store, _| store.installed().is_empty()));
+    assert!(!fs.is_dir(&extension_dir).await);
+    {
+        let requests = harness.supervisor_requests.lock().unwrap();
+        let last = requests
+            .iter()
+            .rev()
+            .find(|request| request.path == "/extensions")
+            .expect("an installed-extensions report");
+        assert!(!last.body.contains("foo"), "{last:?}");
+    }
+
+    let error = store
+        .update(cx, |store, cx| store.install("../escape".into(), None, cx))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("invalid extension id"),
+        "{error:#}"
+    );
+}
+
+/// Serve mode keeps the SSH-era `SyncExtensions` / `InstallExtension` messages but routes
+/// them through the sandbox: sync is additive (a desktop connect cannot wipe registry
+/// extensions) and an upload install is validated before anything is moved.
+#[gpui::test]
+async fn test_sync_extensions_is_additive_in_serve_mode(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(
+        path!("/workspaces/repo"),
+        json!({
+            "extension.toml": "id = \"evil\"\nname = \"evil\"\nversion = \"0.0.1\"\nschema_version = 1\nthemes = [\"t.json\"]\n",
+            "src": { "main.rs": "fn main() {}" }
+        }),
+    )
+    .await;
+    let (project, headless) = init_test(&fs, cx, server_cx).await;
+    let (registry, _) = foo_registry().await;
+    let harness = SandboxHarness::enable_with_registry(
+        project,
+        headless,
+        SANDBOX_SECRET,
+        registry,
+        server_cx,
+    );
+    let store = harness.extension_store(cx);
+    store
+        .update(cx, |store, cx| store.install("foo".into(), None, cx))
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    let extension_dir = paths::remote_extensions_dir().join("foo");
+    assert!(fs.is_dir(&extension_dir).await);
+
+    // The desktop's (empty) list removes nothing.
+    let response = harness
+        .client(cx)
+        .request(proto::SyncExtensions { extensions: vec![] })
+        .await
+        .unwrap();
+    assert!(response.missing_extensions.is_empty());
+    cx.run_until_parked();
+    assert!(fs.is_dir(&extension_dir).await, "sync is additive");
+    harness.headless.read_with(server_cx, |headless, cx| {
+        let sandbox = headless.sandbox.as_ref().expect("sandbox runtime");
+        assert!(sandbox.extensions.read(cx).is_installed("foo"));
+        assert!(sandbox.extensions.read(cx).is_loaded("foo"));
+    });
+    assert_eq!(store.read_with(cx, |store, _| store.installed().len()), 1);
+
+    // An upload naming a directory outside the uploads directory, or an id that escapes
+    // the extensions directory, is refused and touches nothing.
+    for (id, tmp_dir) in [
+        ("../../../../workspaces/repo", path!("/workspaces/repo")),
+        ("evil", path!("/workspaces/repo")),
+    ] {
+        let error = harness
+            .client(cx)
+            .request(proto::InstallExtension {
+                extension: Some(proto::Extension {
+                    id: id.into(),
+                    version: "0.0.1".into(),
+                    dev: true,
+                    content_fingerprint: None,
+                }),
+                tmp_dir: tmp_dir.into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("invalid extension id")
+                || format!("{error:#}").contains("not directly under"),
+            "{error:#}"
+        );
+    }
+    assert!(
+        fs.is_file(Path::new(path!("/workspaces/repo/src/main.rs")))
+            .await
+    );
+    assert!(
+        !fs.is_dir(&paths::remote_extensions_dir().join("evil"))
+            .await
+    );
+    assert!(fs.is_dir(&extension_dir).await);
+}
+
+/// SSH `run` mode (no sandbox) keeps the SSH store's sync: a dev extension is always
+/// reported missing and the response names the uploads directory.
+#[gpui::test]
+async fn test_sync_extensions_in_run_mode_uses_the_ssh_store(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    let (project, _headless) = init_test(&fs, cx, server_cx).await;
+    let client = project.read_with(cx, |project, cx| {
+        project.remote_client().unwrap().read(cx).proto_client()
+    });
+    let response = client
+        .request(proto::SyncExtensions {
+            extensions: vec![proto::Extension {
+                id: "foo-dev".into(),
+                version: "1.0.0".into(),
+                dev: true,
+                content_fingerprint: None,
+            }],
+        })
+        .await
+        .unwrap();
+    assert_eq!(response.missing_extensions.len(), 1);
+    assert_eq!(response.missing_extensions[0].id, "foo-dev");
+    assert_eq!(
+        response.tmp_dir,
+        paths::remote_extensions_uploads_dir().to_string_lossy()
+    );
+}
+
+const THEME_MANIFEST: &str = r#"
+id = "mytheme"
+name = "My Theme"
+version = "0.1.0"
+schema_version = 1
+themes = ["themes/mytheme.json"]
+"#;
+
+#[gpui::test]
+async fn test_session_attach_replays_state(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    use project::port_store::PortStoreEvent;
+
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(
+        paths::remote_extensions_dir(),
+        json!({
+            "mytheme": {
+                "extension.toml": THEME_MANIFEST,
+                "themes": { "mytheme.json": "{}" }
+            },
+            "work": {},
+            "staging": { "leftover": { "extension.toml": "garbage" } }
+        }),
+    )
+    .await;
+    let (project, headless) = init_test(&fs, cx, server_cx).await;
+    let harness = SandboxHarness::enable(project, headless, SANDBOX_SECRET, server_cx);
+    server_cx.run_until_parked();
+    cx.run_until_parked();
+
+    let port_store = harness.port_store(cx);
+    let changed = Arc::new(AtomicUsize::new(0));
+    cx.update({
+        let changed = changed.clone();
+        let port_store = port_store.clone();
+        move |cx| {
+            cx.subscribe(&port_store, move |_, event, _| {
+                if matches!(event, PortStoreEvent::Changed) {
+                    changed.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .detach();
+        }
+    });
+    let response = harness
+        .control
+        .handle(crate::control::ControlRequest {
+            method: "POST",
+            path: crate::control::PORTS_PATH,
+            bearer: Some(SANDBOX_SECRET),
+            peer_is_loopback: true,
+            session_attached: true,
+            body: br#"{"ports":[{"port":5173,"pid":9,"process_name":"vite"}]}"#,
+        })
+        .await;
+    assert_eq!(response, crate::control::ControlResponse::NoContent);
+    cx.run_until_parked();
+    assert_eq!(changed.load(Ordering::SeqCst), 1);
+
+    harness
+        .headless
+        .update(server_cx, |headless, cx| headless.on_session_attached(cx));
+    cx.run_until_parked();
+    assert_eq!(
+        changed.load(Ordering::SeqCst),
+        2,
+        "the port picture was replayed"
+    );
+    port_store.read_with(cx, |store, _| {
+        assert_eq!(store.listening_ports().len(), 1);
+        assert_eq!(store.listening_ports()[0].port, 5173);
+    });
+    let installed = harness
+        .extension_store(cx)
+        .read_with(cx, |store, _| store.installed().to_vec());
+    assert_eq!(installed.len(), 1, "{installed:?}");
+    assert_eq!(installed[0].id.as_ref(), "mytheme");
+    assert_eq!(installed[0].provides, vec!["themes".to_string()]);
+    harness.headless.read_with(server_cx, |headless, cx| {
+        let sandbox = headless.sandbox.as_ref().expect("sandbox runtime");
+        let records = sandbox.extensions.read(cx).installed_extension_records();
+        assert_eq!(records.len(), 1, "work/ and staging/ are not extensions");
+    });
+}
+
+#[gpui::test]
+async fn test_old_server_rejects_save_client_state(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    use db::{
+        AppDatabase, RestoreOutcome,
+        client_state::{ClientStateEvent, ClientStateStore},
+    };
+    use workspace::client_state::RemoteClientStateSink;
+
+    // A server without the sandbox handlers (SSH `run` mode): `enable_sandbox` never ran.
+    let fs = FakeFs::new(server_cx.executor());
+    let (project, _headless) = init_test(&fs, cx, server_cx).await;
+    let client = project.read_with(cx, |project, cx| {
+        project.remote_client().unwrap().read(cx).proto_client()
+    });
+
+    let db = AppDatabase::test_new();
+    let sink = RemoteClientStateSink::new(client.clone(), "test-build".into());
+    let store = cx.new(|cx| ClientStateStore::new(&db, sink, 0, RestoreOutcome::NoImage, cx));
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    cx.update({
+        let events = events.clone();
+        let store = store.clone();
+        move |cx| {
+            cx.subscribe(&store, move |_, event, _| {
+                events.lock().unwrap().push(event.clone())
+            })
+            .detach();
+        }
+    });
+
+    let error = store
+        .update(cx, |store, cx| store.flush_now(cx))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("no handler registered"),
+        "{error:#}"
+    );
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, ClientStateEvent::SaveFailed(message) if message.contains("no handler registered")))
+    );
+    assert_eq!(store.read_with(cx, |store, _| store.version()), 0);
+
+    client.request(proto::Ping {}).await.unwrap();
+}
+
+#[gpui::test]
+async fn test_sandbox_runtime_survives_fresh_session(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(
+        path!("/code/project1"),
+        json!({ "README.md": "# project 1" }),
+    )
+    .await;
+    let (project, headless) = init_test(&fs, cx, server_cx).await;
+    project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/code/project1"), true, cx)
+        })
+        .await
+        .unwrap();
+    let harness = SandboxHarness::enable(project, headless.clone(), SANDBOX_SECRET, server_cx);
+    let response = harness.save_client_state(1, false, cx).await;
+    assert!(response.accepted);
+
+    let discarded = headless.update(server_cx, |headless, cx| headless.reset_for_new_client(cx));
+    assert_eq!(discarded, 0);
+    headless.read_with(server_cx, |headless, _| {
+        assert!(
+            headless.sandbox.is_some(),
+            "the runtime survives a fresh session"
+        );
+    });
+
+    let loaded = harness
+        .client(cx)
+        .request(proto::LoadClientState {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            metadata_only: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(loaded.version, 1);
+
+    let port_store = harness.port_store(cx);
+    let response = harness
+        .control
+        .handle(crate::control::ControlRequest {
+            method: "POST",
+            path: crate::control::PORTS_PATH,
+            bearer: Some(SANDBOX_SECRET),
+            peer_is_loopback: true,
+            session_attached: true,
+            body: br#"{"ports":[{"port":8080,"pid":1,"process_name":"python"}]}"#,
+        })
+        .await;
+    assert_eq!(response, crate::control::ControlResponse::NoContent);
+    cx.run_until_parked();
+    port_store.read_with(cx, |store, _| {
+        assert_eq!(store.listening_ports().len(), 1);
+    });
+    headless.update(server_cx, |headless, cx| headless.on_session_attached(cx));
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn test_stopping_snapshots_unsaved_buffers(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    use db::{AppDatabase, RestoreOutcome, client_state::ClientStateStore};
+    use project::lifecycle::LifecycleKind;
+    use workspace::{
+        AppState, Workspace, WorkspaceId,
+        client_state::{
+            RemoteClientStateSink, gunzip, restore_unsaved_buffers, snapshot_unsaved_buffers,
+        },
+    };
+
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(
+        path!("/code/project1"),
+        json!({ "main.rs": "fn main() {}" }),
+    )
+    .await;
+    let (project, headless) = init_test(&fs, cx, server_cx).await;
+    let harness = SandboxHarness::enable(project.clone(), headless, SANDBOX_SECRET, server_cx);
+    let client = harness.client(cx);
+
+    cx.update(|cx| {
+        cx.set_global(AppDatabase::test_new());
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+    });
+    // `unsaved_buffers` references `workspaces`; the shell persists the workspace before any
+    // snapshot, so the row exists there.
+    cx.update(|cx| {
+        let db = AppDatabase::global(cx).clone();
+        cx.background_spawn(async move {
+            db.write(|connection| {
+                connection.exec_bound::<i64>("INSERT INTO workspaces(workspace_id) VALUES (?)")?(1)
+            })
+            .await
+        })
+    })
+    .await
+    .unwrap();
+
+    let (worktree, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/code/project1"), true, cx)
+        })
+        .await
+        .unwrap();
+    let worktree_id = worktree.read_with(cx, |worktree, _| worktree.id());
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_buffer((worktree_id, rel_path("main.rs")), cx)
+        })
+        .await
+        .unwrap();
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..0, "// edited\n")], None, cx);
+    });
+    cx.run_until_parked();
+
+    let app_state = cx.update(AppState::test);
+    // From here on `cx` is the window's `VisualTestContext` (it derefs to the app context).
+    let (workspace, cx) = cx.add_window_view({
+        let project = project.clone();
+        |window, cx| {
+            Workspace::new(
+                Some(WorkspaceId::from_i64(1)),
+                project,
+                app_state,
+                window,
+                cx,
+            )
+        }
+    });
+    let sink = RemoteClientStateSink::new(client, "test-build".into());
+    let store = cx.new(|cx| {
+        let db = AppDatabase(AppDatabase::global(cx).clone());
+        ClientStateStore::new(&db, sink, 0, RestoreOutcome::NoImage, cx)
+    });
+
+    // The entry crate's stand-in: on `Stopping`, snapshot the dirty buffers, then flush.
+    // Weak handles: the subscription lives as long as the project, which the workspace owns.
+    cx.update({
+        let workspace = workspace.downgrade();
+        let store = store.downgrade();
+        let project = project.clone();
+        move |_, cx| {
+            cx.subscribe(&project, move |_, event, cx| {
+                if let project::Event::LifecycleNotice {
+                    kind: LifecycleKind::Stopping,
+                    ..
+                } = event
+                {
+                    let Some(workspace) = workspace.upgrade() else {
+                        return;
+                    };
+                    let snapshot = snapshot_unsaved_buffers(&workspace, cx);
+                    let store = store.clone();
+                    cx.spawn(async move |cx| {
+                        let rows = snapshot.await?;
+                        assert_eq!(rows, 1);
+                        store
+                            .update(cx, |store, cx| store.flush_for_stop(cx))?
+                            .await
+                    })
+                    .detach_and_log_err(cx);
+                }
+            })
+            .detach();
+        }
+    });
+
+    let stopping = server_cx.background_executor.spawn({
+        let control = harness.control.clone();
+        async move {
+            control
+                .handle(crate::control::ControlRequest {
+                    method: "POST",
+                    path: crate::control::LIFECYCLE_PATH,
+                    bearer: Some(SANDBOX_SECRET),
+                    peer_is_loopback: true,
+                    session_attached: true,
+                    body: br#"{"kind":"stopping"}"#,
+                })
+                .await
+        }
+    });
+    cx.run_until_parked();
+    // No clock advance: the wait ended on the accepted flush, not the timeout.
+    assert_eq!(stopping.await, crate::control::ControlResponse::NoContent);
+    assert_eq!(store.read_with(cx, |store, _| store.version()), 1);
+
+    let stored = fs
+        .load_bytes(test_client_state_dir().join("db.sqlite").as_path())
+        .await
+        .unwrap();
+    let image = gunzip(&stored, db::client_state::MAX_IMAGE_BYTES)
+        .await
+        .unwrap();
+    let (restored_db, outcome) = AppDatabase::test_new_with_image(Some(image));
+    assert_eq!(outcome, RestoreOutcome::Restored);
+    let row = restored_db
+        .0
+        .select_row::<(String, String)>("SELECT abs_path, text FROM unsaved_buffers")
+        .unwrap()()
+    .unwrap();
+    assert_eq!(
+        row,
+        Some((
+            path!("/code/project1/main.rs").to_string(),
+            "// edited\nfn main() {}".to_string()
+        ))
+    );
+    assert_eq!(
+        fs.load(Path::new(path!("/code/project1/main.rs")))
+            .await
+            .unwrap(),
+        "fn main() {}",
+        "the client never writes to the workspace filesystem"
+    );
+
+    // The next open: the restored image is the application database, and the buffer comes
+    // back dirty with the snapshot text.
+    buffer.update(cx, |buffer, cx| {
+        buffer.set_text("fn main() {}", cx);
+    });
+    cx.update(|_, cx| cx.set_global(restored_db));
+    let restored = cx
+        .update(|window, cx| restore_unsaved_buffers(&workspace, window, cx))
+        .await
+        .unwrap();
+    assert_eq!(restored, 1);
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "// edited\nfn main() {}");
+        assert!(buffer.is_dirty());
+    });
+    let rows = cx.update(|_, cx| {
+        AppDatabase::global(cx)
+            .select_row::<i64>("SELECT count(*) FROM unsaved_buffers")
+            .unwrap()()
+        .unwrap()
+    });
+    assert_eq!(rows, Some(0));
+
+    // The window owns the project, whose release drops the server-side project; close it
+    // before the contexts are torn down so no handle outlives the server context.
+    drop((buffer, store, workspace));
+    cx.update(|window, _| window.remove_window());
+    cx.run_until_parked();
+    drop((project, harness));
 }
