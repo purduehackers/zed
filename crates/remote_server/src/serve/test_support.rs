@@ -145,6 +145,9 @@ impl RecordingHooks {
 }
 
 impl ServeHooks for RecordingHooks {
+    fn replica_id(&self) -> u16 {
+        8
+    }
     fn begin_fresh_session(&self) -> BoxFuture<'static, anyhow::Result<ChannelEnds>> {
         let state = self.state.clone();
         Box::pin(async move {
@@ -476,7 +479,6 @@ impl TestClient {
         session_id: &str,
         instance: &str,
         reconnect: bool,
-        takeover: bool,
         epoch: Option<u64>,
     ) {
         self.send_hello(Hello {
@@ -487,7 +489,6 @@ impl TestClient {
             identifier: format!("setup-{instance}"),
             instance: instance.into(),
             reconnect,
-            takeover,
             client: ClientKind::Web,
             epoch,
         })

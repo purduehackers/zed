@@ -1,6 +1,6 @@
 //! The session broker: one tokio task that owns the envelope channel ends and at most one
 //! attached WebSocket session; each attached socket is driven by its own task. The broker
-//! never awaits a socket write, so a stalled peer cannot delay a takeover or SIGTERM.
+//! never awaits a socket write, so a stalled peer cannot delay a replacement or SIGTERM.
 //!
 //! Arbitration (D23, D24, D25): resume is keyed on the *epoch* the server hands out in every
 //! `HelloAck` (echoed back in `Hello.epoch`) and on the client's per-boot `Hello.instance`
@@ -23,9 +23,9 @@ use remote::{
     protocol::{decode_envelope_frame, encode_envelope_frame},
     websocket_wire::{
         CLOSE_BAD_HELLO, CLOSE_BUILD_MISMATCH, CLOSE_FRAME_TOO_LARGE, CLOSE_GOING_AWAY,
-        CLOSE_POLICY_VIOLATION, CLOSE_REASON_STALE_EPOCH, CLOSE_SESSION_ACTIVE, CLOSE_TAKEN_OVER,
-        ClientKind, ControlFrame, HEARTBEAT_INTERVAL_SECS, Hello, HelloAck, MAX_FRAME_BYTES,
-        PROTOCOL_VERSION, builds_compatible,
+        CLOSE_POLICY_VIOLATION, CLOSE_REASON_STALE_EPOCH, CLOSE_TAKEN_OVER, ClientKind,
+        ControlFrame, HEARTBEAT_INTERVAL_SECS, Hello, HelloAck, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+        builds_compatible,
     },
 };
 use rpc::{
@@ -151,9 +151,14 @@ pub enum BrokerCommand {
 
 /// Bridge to the gpui side; the production implementation talks over channels, tests stub it.
 pub trait ServeHooks: Send + Sync + 'static {
-    /// Must, on the gpui thread and in this order: reset the `HeadlessProject` for a new client
-    /// (D3), then hand the `ChannelClient` a new channel pair (`RemoteStarted` queued on the
-    /// new `outgoing_rx`). Never touches the `PtyManager` (D24). Returns the broker's new ends;
+    fn replay_healthy(&self) -> bool {
+        true
+    }
+    /// Replica assigned to this participant; collaborative replicas start at 8.
+    fn replica_id(&self) -> u16;
+    /// Resets only this participant's snapshot ledger, then hands its channel a new
+    /// pair of ends with `RemoteStarted` queued. Shared buffers and PTYs remain alive.
+    /// Returns the broker's new ends;
     /// an error means the gpui side is gone, and the broker refuses the attach instead of
     /// waiting forever.
     fn begin_fresh_session(&self) -> BoxFuture<'static, anyhow::Result<ChannelEnds>>;
@@ -251,6 +256,7 @@ enum Classification {
 }
 
 enum BrokerEvent {
+    ReplayCheck,
     Command(Option<BrokerCommand>),
     SessionExited(SessionExit),
     Outgoing(Option<Envelope>),
@@ -337,6 +343,10 @@ impl SessionBroker {
     /// Runs until `Shutdown` is processed (or every command sender is gone).
     pub async fn run(mut self) {
         loop {
+            if self.current.is_some() && !self.hooks.replay_healthy() {
+                self.close_current(CLOSE_TAKEN_OVER, CLOSE_REASON_STALE_EPOCH)
+                    .await;
+            }
             let event = if let Some(command) = self.stashed.take() {
                 BrokerEvent::Command(Some(command))
             } else if self.current.is_some() && self.pending_outgoing.is_some() {
@@ -358,6 +368,7 @@ impl SessionBroker {
                             exit = &mut current.done => BrokerEvent::SessionExited(
                                 exit.unwrap_or_else(|error| SessionExit::ReadError(format!("session task failed: {error}")))
                             ),
+                            _ = tokio::time::sleep(Duration::from_secs(1)) => BrokerEvent::ReplayCheck,
                             envelope = outgoing_rx.next(), if attached => BrokerEvent::Outgoing(envelope),
                         }
                     }
@@ -365,6 +376,7 @@ impl SessionBroker {
                 }
             };
             match event {
+                BrokerEvent::ReplayCheck => {}
                 BrokerEvent::Command(None) => {
                     log::info!("broker command channel closed; closing the session");
                     self.close_session(CLOSE_STOPPING, "server going away")
@@ -438,6 +450,10 @@ impl SessionBroker {
 
     async fn attach(&mut self, ws: WebSocket<HttpStream>, hello: Hello, claims: Claims) {
         self.reap_finished_session().await;
+        if hello.reconnect && !self.hooks.replay_healthy() {
+            refuse_socket(ws, CLOSE_TAKEN_OVER, CLOSE_REASON_STALE_EPOCH);
+            return;
+        }
         let (kind, epoch) = match self.classify(&hello) {
             Classification::StaleEpoch => {
                 log::warn!(
@@ -467,23 +483,15 @@ impl SessionBroker {
                         exit.map(|exit| exit.reason())
                     );
                 }
-                SessionKind::Fresh if hello.takeover => {
+                SessionKind::Fresh => {
                     let exit = self
-                        .close_current(CLOSE_TAKEN_OVER, "taken over by another session")
+                        .close_current(CLOSE_TAKEN_OVER, "replaced by participant reload")
                         .await;
                     log::info!(
-                        "session_replaced: instance {} took over ({:?})",
+                        "session_replaced: instance {} reloaded ({:?})",
                         hello.instance,
                         exit.map(|exit| exit.reason())
                     );
-                }
-                SessionKind::Fresh => {
-                    log::info!(
-                        "session_busy: refusing instance {} without takeover",
-                        hello.instance
-                    );
-                    refuse_socket(ws, CLOSE_SESSION_ACTIVE, "session active");
-                    return;
                 }
             }
         }
@@ -534,6 +542,7 @@ impl SessionBroker {
             attached_at_ms: unix_ms(),
         };
         let ack = HelloAck {
+            replica_id: self.hooks.replica_id(),
             protocol: PROTOCOL_VERSION,
             build: self.state.build.clone(),
             os: std::env::consts::OS.to_owned(),
@@ -575,7 +584,8 @@ impl SessionBroker {
             incoming_watermark,
         });
         self.state.set_session(Some(meta.clone()));
-        self.state.set_log_frame_sink(Some(frame_tx));
+        self.state
+            .set_log_frame_sink(&meta.session_id, Some(frame_tx));
         self.hooks.session_attached(&meta);
         log::info!(
             "session_attached: session_id={} identifier={} instance={} kind={:?} epoch={} sub={}",
@@ -650,6 +660,11 @@ impl SessionBroker {
             biased;
             command = self.commands.recv() => {
                 self.stashed = command;
+                self.pending_outgoing = Some(envelope);
+                return;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                // Recheck an overflowing replay buffer even while the socket is stalled.
                 self.pending_outgoing = Some(envelope);
                 return;
             }
@@ -759,8 +774,9 @@ impl SessionBroker {
 
     fn finish_detach(&mut self, session: ActiveSession, exit: &SessionExit) {
         self.last_watermark = session.incoming_watermark.load(SeqCst);
-        self.state.set_log_frame_sink(None);
-        self.state.set_session(None);
+        self.state
+            .set_log_frame_sink(&session.meta.session_id, None);
+        self.state.remove_session(&session.meta.session_id);
         self.hooks.session_detached(&session.meta);
         log::info!(
             "session_detached: session_id={} epoch={} reason={}",
@@ -772,7 +788,7 @@ impl SessionBroker {
 }
 
 /// Closes a socket the broker refused, off the broker task.
-fn refuse_socket(mut ws: WebSocket<HttpStream>, code: u16, reason: &'static str) {
+pub(super) fn refuse_socket(mut ws: WebSocket<HttpStream>, code: u16, reason: &'static str) {
     tokio::spawn(async move {
         send_close(&mut ws, code, reason).await;
     });
@@ -1367,7 +1383,7 @@ mod tests {
         instance: &str,
     ) -> (TestClient, HelloAck) {
         let mut client = server.connect(&server.token(sid)).await;
-        client.hello(sid, instance, false, false, None).await;
+        client.hello(sid, instance, false, None).await;
         let ack = client.hello_ack().await.expect("hello ack");
         (client, ack)
     }
@@ -1421,7 +1437,7 @@ mod tests {
         let server = TestServer::start().await;
         server.hooks.fail_next_fresh();
         let mut client = server.connect(&server.token("sid_1")).await;
-        client.hello("sid_1", "inst_1", false, false, None).await;
+        client.hello("sid_1", "inst_1", false, None).await;
         let (code, reason) = client.wait_for_close().await.expect("close");
         assert_eq!(code, 1011);
         assert_eq!(reason, "server not ready");
@@ -1430,29 +1446,6 @@ mod tests {
         let (mut client, ack) = attach_fresh(&server, "sid_2", "inst_2").await;
         assert!(!ack.resumed);
         assert_eq!(client.next_envelope().await.expect("RemoteStarted").id, 0);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn second_client_without_takeover_closes_4005() {
-        let server = TestServer::start().await;
-        let (mut first, _) = attach_fresh(&server, "sid_1", "inst_1").await;
-        first.next_envelope().await.expect("RemoteStarted");
-
-        let mut second = server.connect(&server.token("sid_2")).await;
-        second.hello("sid_2", "inst_2", false, false, None).await;
-        let (code, _) = second.wait_for_close().await.expect("close");
-        assert_eq!(code, CLOSE_SESSION_ACTIVE);
-
-        server
-            .hooks
-            .send_to_client(envelope(9, proto::envelope::Payload::Ping(proto::Ping {})))
-            .await;
-        let still_alive = first
-            .next_envelope()
-            .await
-            .expect("first client still attached");
-        assert_eq!(still_alive.id, 9);
-        assert_eq!(server.hooks.fresh_calls(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1466,7 +1459,7 @@ mod tests {
             // No wait: the Attach below may reach the broker before it polled the exit.
             let mut second = server.connect(&server.token("sid_next")).await;
             second
-                .hello("sid_next", &format!("next_{round}"), false, false, None)
+                .hello("sid_next", &format!("next_{round}"), false, None)
                 .await;
             let ack = second
                 .hello_ack()
@@ -1475,42 +1468,6 @@ mod tests {
             assert!(!ack.resumed);
             second.next_envelope().await.expect("RemoteStarted");
         }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn refused_attach_does_not_drop_envelopes() {
-        let server = TestServer::start().await;
-        let (mut first, _) = attach_fresh(&server, "sid_1", "inst_1").await;
-        first.next_envelope().await.expect("RemoteStarted");
-
-        // 200 × 256 KiB: more than the socket buffers plus the 64-frame queue can hold while
-        // the client is not reading, so the broker parks mid-push.
-        let count = 200u32;
-        for id in 1..=count {
-            server
-                .hooks
-                .send_to_client(big_envelope(id, 256 * 1024))
-                .await;
-        }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        let mut second = server.connect(&server.token("sid_2")).await;
-        second.hello("sid_2", "inst_2", false, false, None).await;
-        let (code, _) = second.wait_for_close().await.expect("close");
-        assert_eq!(code, CLOSE_SESSION_ACTIVE);
-
-        for expected in 1..=count {
-            let received = first.next_envelope().await.expect("queued envelope");
-            assert_eq!(received.id, expected, "ids must stay contiguous");
-        }
-        server
-            .hooks
-            .send_to_client(envelope(
-                count + 1,
-                proto::envelope::Payload::Ping(proto::Ping {}),
-            ))
-            .await;
-        assert_eq!(first.next_envelope().await.expect("marker").id, count + 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1529,12 +1486,12 @@ mod tests {
 
         let started = std::time::Instant::now();
         let mut second = server.connect(&server.token("sid_2")).await;
-        second.hello("sid_2", "inst_2", false, true, None).await;
+        second.hello("sid_2", "inst_2", false, None).await;
         let stalled = tokio::spawn(async move { first.wait_for_close().await });
-        let ack = second.hello_ack().await.expect("takeover hello ack");
+        let ack = second.hello_ack().await.expect("replacement hello ack");
         assert!(
             started.elapsed() < Duration::from_secs(1),
-            "takeover took {:?}",
+            "replacement took {:?}",
             started.elapsed()
         );
         assert!(!ack.resumed);
@@ -1555,9 +1512,7 @@ mod tests {
         first.next_envelope().await.expect("RemoteStarted");
 
         let mut second = server.connect(&server.token("sid_2")).await;
-        second
-            .hello("sid_2", "inst_1", true, false, Some(ack.epoch))
-            .await;
+        second.hello("sid_2", "inst_1", true, Some(ack.epoch)).await;
         let resumed = second.hello_ack().await.expect("hello ack");
         assert!(resumed.resumed);
         assert_eq!(resumed.epoch, ack.epoch);
@@ -1571,13 +1526,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn takeover_closes_old_with_4001_and_stale_epoch_is_refused() {
+    async fn replacement_closes_old_with_4001_and_stale_epoch_is_refused() {
         let server = TestServer::start().await;
         let (mut first, first_ack) = attach_fresh(&server, "sid_1", "inst_1").await;
         first.next_envelope().await.expect("RemoteStarted");
 
         let mut second = server.connect(&server.token("sid_2")).await;
-        second.hello("sid_2", "inst_2", false, true, None).await;
+        second.hello("sid_2", "inst_2", false, None).await;
         let second_ack = second.hello_ack().await.expect("hello ack");
         assert!(!second_ack.resumed);
         assert!(second_ack.epoch > first_ack.epoch);
@@ -1590,7 +1545,7 @@ mod tests {
         let hooks_before = server.hooks.events().len();
         let mut third = server.connect(&server.token("sid_3")).await;
         third
-            .hello("sid_3", "inst_1", true, false, Some(first_ack.epoch))
+            .hello("sid_3", "inst_1", true, Some(first_ack.epoch))
             .await;
         let (code, reason) = third.wait_for_close().await.expect("close");
         assert_eq!(code, CLOSE_TAKEN_OVER);
@@ -1613,7 +1568,7 @@ mod tests {
             let sid = format!("sid_{index}");
             let mut client = server.connect(&server.token(&sid)).await;
             client
-                .hello(&sid, &format!("inst_{index}"), false, true, None)
+                .hello(&sid, &format!("inst_{index}"), false, None)
                 .await;
             let ack = client.hello_ack().await.expect("hello ack");
             epochs.push(ack.epoch);
@@ -1653,9 +1608,7 @@ mod tests {
         }
 
         let mut client = server.connect(&server.token("sid_9")).await;
-        client
-            .hello("sid_9", "inst_1", true, false, Some(ack.epoch))
-            .await;
+        client.hello("sid_9", "inst_1", true, Some(ack.epoch)).await;
         let resumed = client.hello_ack().await.expect("hello ack");
         assert!(resumed.resumed);
         assert_eq!(resumed.epoch, ack.epoch);
@@ -1673,16 +1626,14 @@ mod tests {
     async fn reconnect_to_fresh_process_is_not_resumed() {
         let server = TestServer::start().await;
         let mut client = server.connect(&server.token("sid_1")).await;
-        client
-            .hello("sid_1", "inst_1", true, false, Some(123))
-            .await;
+        client.hello("sid_1", "inst_1", true, Some(123)).await;
         let ack = client.hello_ack().await.expect("hello ack");
         assert!(!ack.resumed);
         assert_eq!(client.next_envelope().await.expect("RemoteStarted").id, 0);
 
         let server = TestServer::start().await;
         let mut client = server.connect(&server.token("sid_1")).await;
-        client.hello("sid_1", "inst_1", true, false, None).await;
+        client.hello("sid_1", "inst_1", true, None).await;
         let ack = client.hello_ack().await.expect("hello ack");
         assert!(!ack.resumed);
     }
@@ -1715,9 +1666,7 @@ mod tests {
         drop(client);
         wait_for_detach(&server).await;
         let mut client = server.connect(&server.token("sid_2")).await;
-        client
-            .hello("sid_2", "inst_1", true, false, Some(ack.epoch))
-            .await;
+        client.hello("sid_2", "inst_1", true, Some(ack.epoch)).await;
         assert!(client.hello_ack().await.expect("hello ack").resumed);
         let mut never_sent = envelope(52, proto::envelope::Payload::Ack(proto::Ack {}));
         never_sent.responding_to = Some(60);
@@ -1751,7 +1700,6 @@ mod tests {
                 identifier: "setup-1".into(),
                 instance: "inst_1".into(),
                 reconnect: false,
-                takeover: false,
                 client: ClientKind::Web,
                 epoch: None,
             })
@@ -1776,7 +1724,6 @@ mod tests {
             identifier: "setup-1".into(),
             instance: "inst_1".into(),
             reconnect: false,
-            takeover: false,
             client: ClientKind::Web,
             epoch: None,
         };
@@ -1833,7 +1780,6 @@ mod tests {
                 identifier: "setup-1".into(),
                 instance: "inst_1".into(),
                 reconnect: false,
-                takeover: false,
                 client: ClientKind::Web,
                 epoch: None,
             })
@@ -1852,7 +1798,6 @@ mod tests {
                 identifier: "setup-1".into(),
                 instance: "inst_1".into(),
                 reconnect: false,
-                takeover: false,
                 client: ClientKind::Web,
                 epoch: None,
             })
@@ -1864,7 +1809,7 @@ mod tests {
     async fn hello_session_id_mismatch_is_accepted() {
         let server = TestServer::start().await;
         let mut client = server.connect(&server.token("sid_1")).await;
-        client.hello("other", "inst_1", false, false, None).await;
+        client.hello("other", "inst_1", false, None).await;
         let ack = client.hello_ack().await.expect("hello ack");
         assert_eq!(ack.session_id, "sid_1");
         let health = server.state.health(true);
@@ -1903,9 +1848,7 @@ mod tests {
         drop(client);
         wait_for_detach(&server).await;
         let mut client = server.connect(&server.token("sid_2")).await;
-        client
-            .hello("sid_2", "inst_1", true, false, Some(ack.epoch))
-            .await;
+        client.hello("sid_2", "inst_1", true, Some(ack.epoch)).await;
         client.hello_ack().await.expect("hello ack");
         client
             .send_envelope(
@@ -2174,9 +2117,7 @@ mod tests {
         drop(client);
         wait_for_detach(&server).await;
         let mut client = server.connect(&server.token("sid_2")).await;
-        client
-            .hello("sid_2", "inst_1", true, false, Some(ack.epoch))
-            .await;
+        client.hello("sid_2", "inst_1", true, Some(ack.epoch)).await;
         assert!(client.hello_ack().await.expect("hello ack").resumed);
     }
 

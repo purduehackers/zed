@@ -5221,7 +5221,9 @@ pub(crate) struct SupervisorRequest {
 
 /// Where the harness stores client-state images on the server's `FakeFs`.
 pub(crate) fn test_client_state_dir() -> PathBuf {
-    PathBuf::from(path!("/data/server_state/client_state"))
+    PathBuf::from(path!(
+        "/data/server_state/client_state/participants/p_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ))
 }
 
 /// A `HeadlessProject` with `enable_sandbox` over a fake supervisor and registry, plus the
@@ -5346,10 +5348,21 @@ impl SandboxHarness {
                         http: registry,
                         release_channel: release_channel::ReleaseChannel::Dev,
                     },
-                    client_state_dir: test_client_state_dir(),
+                    client_state_dir: PathBuf::from(path!("/data/server_state/client_state")),
                 },
                 cx,
             )
+        });
+        // This harness uses the in-process channel, whose authenticated sender is
+        // REMOTE_SERVER_PEER_ID. Register it explicitly, just like the serve dispatcher.
+        headless.update(server_cx, |headless, cx| {
+            let peer = proto::REMOTE_SERVER_PEER_ID;
+            headless.add_participant(peer, "p_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", cx);
+            let store = &headless.sandbox.as_ref().unwrap().client_state;
+            control.set_participant_saves(
+                peer,
+                store.read(cx).participant_stopping_versions(peer, cx),
+            );
         });
         Self {
             project,
@@ -6082,68 +6095,6 @@ async fn test_old_server_rejects_save_client_state(
     assert_eq!(store.read_with(cx, |store, _| store.version()), 0);
 
     client.request(proto::Ping {}).await.unwrap();
-}
-
-#[gpui::test]
-async fn test_sandbox_runtime_survives_fresh_session(
-    cx: &mut TestAppContext,
-    server_cx: &mut TestAppContext,
-) {
-    let fs = FakeFs::new(server_cx.executor());
-    fs.insert_tree(
-        path!("/code/project1"),
-        json!({ "README.md": "# project 1" }),
-    )
-    .await;
-    let (project, headless) = init_test(&fs, cx, server_cx).await;
-    project
-        .update(cx, |project, cx| {
-            project.find_or_create_worktree(path!("/code/project1"), true, cx)
-        })
-        .await
-        .unwrap();
-    let harness = SandboxHarness::enable(project, headless.clone(), SANDBOX_SECRET, server_cx);
-    let response = harness.save_client_state(1, false, cx).await;
-    assert!(response.accepted);
-
-    let discarded = headless.update(server_cx, |headless, cx| headless.reset_for_new_client(cx));
-    assert_eq!(discarded, 0);
-    headless.read_with(server_cx, |headless, _| {
-        assert!(
-            headless.sandbox.is_some(),
-            "the runtime survives a fresh session"
-        );
-    });
-
-    let loaded = harness
-        .client(cx)
-        .request(proto::LoadClientState {
-            project_id: proto::REMOTE_SERVER_PROJECT_ID,
-            metadata_only: true,
-        })
-        .await
-        .unwrap();
-    assert_eq!(loaded.version, 1);
-
-    let port_store = harness.port_store(cx);
-    let response = harness
-        .control
-        .handle(crate::control::ControlRequest {
-            method: "POST",
-            path: crate::control::PORTS_PATH,
-            bearer: Some(SANDBOX_SECRET),
-            peer_is_loopback: true,
-            session_attached: true,
-            body: br#"{"ports":[{"port":8080,"pid":1,"process_name":"python"}]}"#,
-        })
-        .await;
-    assert_eq!(response, crate::control::ControlResponse::NoContent);
-    cx.run_until_parked();
-    port_store.read_with(cx, |store, _| {
-        assert_eq!(store.listening_ports().len(), 1);
-    });
-    headless.update(server_cx, |headless, cx| headless.on_session_attached(cx));
-    cx.run_until_parked();
 }
 
 #[gpui::test]

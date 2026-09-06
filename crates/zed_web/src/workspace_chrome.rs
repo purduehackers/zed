@@ -244,6 +244,18 @@ fn quit(cx: &mut App) {
 
 fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<anyhow::Result<()>> {
     cx.spawn_in(window, async move |workspace_handle, cx| {
+        // Joining peers receive root metadata before its entries. The default shell
+        // needs the root entry to choose the repository rather than the sandbox home.
+        let roots = workspace_handle.read_with(cx, |workspace, cx| {
+            workspace.worktrees(cx).collect::<Vec<_>>()
+        })?;
+        for root in roots {
+            if let Some(ready) = root.update(cx, |root, _| {
+                root.as_remote_mut().map(|root| root.wait_for_snapshot(1))
+            }) {
+                ready.await?;
+            }
+        }
         let project_panel = ProjectPanel::load(workspace_handle.clone(), cx.clone());
         let outline_panel = OutlinePanel::load(workspace_handle.clone(), cx.clone());
         let terminal_panel = TerminalPanel::load(workspace_handle.clone(), cx.clone());

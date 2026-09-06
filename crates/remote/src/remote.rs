@@ -10,7 +10,7 @@ pub use remote_client::OpenWslPath;
 pub use remote_client::{
     ChannelEnds, CommandTemplate, ConnectionIdentifier, ConnectionState, Interactive, RemoteArch,
     RemoteClient, RemoteClientDelegate, RemoteClientEvent, RemoteConnection,
-    RemoteConnectionOptions, RemoteOs, RemotePlatform, ServerChannel, connect,
+    RemoteConnectionOptions, RemoteOs, RemotePlatform, ServerChannel, ServerHub, connect,
     has_active_connection,
 };
 pub use remote_identity::{

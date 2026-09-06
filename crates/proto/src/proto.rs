@@ -432,6 +432,8 @@ messages!(
     (InstallRegistryExtension, Background),
     (UninstallExtension, Background),
     (ExtensionsChanged, Background),
+    (RestoreBufferSnapshot, Foreground),
+    (RestoreBufferSnapshotResponse, Foreground),
 );
 
 request_messages!(
@@ -673,6 +675,7 @@ request_messages!(
     (AttachTerminal, AttachTerminalResponse),
     (SaveClientState, SaveClientStateResponse),
     (LoadClientState, LoadClientStateResponse),
+    (RestoreBufferSnapshot, RestoreBufferSnapshotResponse),
     (ForwardPort, ForwardPortResponse),
     (UnforwardPort, Ack),
     (ListExtensions, ListExtensionsResponse),

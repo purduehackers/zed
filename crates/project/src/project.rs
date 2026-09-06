@@ -239,6 +239,7 @@ pub struct Project {
     client_state: ProjectClientState,
     git_store: Entity<GitStore>,
     collaborators: HashMap<proto::PeerId, Collaborator>,
+    sandbox_replica_id: Option<ReplicaId>,
     client_subscriptions: Vec<client::Subscription>,
     worktree_store: Entity<WorktreeStore>,
     buffer_store: Entity<BufferStore>,
@@ -1379,6 +1380,7 @@ impl Project {
             Self {
                 buffer_ordered_messages_tx: tx,
                 collaborators: Default::default(),
+                sandbox_replica_id: None,
                 worktree_store,
                 buffer_store,
                 image_store,
@@ -1621,6 +1623,10 @@ impl Project {
             let this = Self {
                 buffer_ordered_messages_tx: tx,
                 collaborators: Default::default(),
+                sandbox_replica_id: remote
+                    .read(cx)
+                    .connection()
+                    .map(|connection| ReplicaId::new(connection.replica_id())),
                 worktree_store,
                 buffer_store,
                 image_store,
@@ -1700,6 +1706,8 @@ impl Project {
             remote_proto.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &remote_extension_store);
 
             remote_proto.add_entity_message_handler(Self::handle_create_buffer_for_peer);
+            remote_proto.add_entity_message_handler(Self::handle_add_collaborator);
+            remote_proto.add_entity_message_handler(Self::handle_remove_collaborator);
             remote_proto.add_entity_message_handler(Self::handle_create_image_for_peer);
             remote_proto.add_entity_message_handler(Self::handle_create_file_for_peer);
             remote_proto.add_entity_message_handler(Self::handle_update_worktree);
@@ -1944,6 +1952,7 @@ impl Project {
                 context_server_store,
                 active_entry: None,
                 collaborators: Default::default(),
+                sandbox_replica_id: None,
                 join_project_response_message_id: response.message_id,
                 languages,
                 user_store: user_store.clone(),
@@ -2427,12 +2436,59 @@ impl Project {
             ProjectClientState::Collab { replica_id, .. } => replica_id,
             _ => {
                 if self.remote_client.is_some() {
-                    ReplicaId::REMOTE_SERVER
+                    self.sandbox_replica_id.unwrap_or(ReplicaId::REMOTE_SERVER)
                 } else {
                     ReplicaId::LOCAL
                 }
             }
         }
+    }
+
+    pub fn is_shared_sandbox(&self) -> bool {
+        self.remote_client.is_some() && self.sandbox_replica_id.is_some_and(|id| id.as_u16() >= 8)
+    }
+
+    /// Both tab restoration and the stopping snapshot use the host's atomic
+    /// recovery decision. A stale local database must never edit shared text.
+    pub fn restore_shared_buffer_snapshot(
+        &self,
+        buffer: Entity<Buffer>,
+        text: String,
+        mtime: Option<fs::MTime>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Option<ProjectPath>>> {
+        let Some(remote) = self
+            .remote_client
+            .as_ref()
+            .filter(|_| self.is_shared_sandbox())
+        else {
+            return Task::ready(Err(anyhow!("snapshot requires a shared sandbox")));
+        };
+        let client = remote.read(cx).proto_client();
+        let buffer_id = buffer.read(cx).remote_id().to_proto();
+        cx.spawn(async move |project, cx| {
+            let response = client
+                .request(proto::RestoreBufferSnapshot {
+                    project_id: REMOTE_SERVER_PROJECT_ID,
+                    buffer_id,
+                    text,
+                    mtime: mtime.map(Into::into),
+                })
+                .await?;
+            buffer
+                .update(cx, |buffer, _| {
+                    buffer.wait_for_version(language::proto::deserialize_version(&response.version))
+                })
+                .await?;
+            response
+                .recovery_path
+                .map(|path| {
+                    project
+                        .read_with(cx, |project, cx| project.find_project_path(&path, cx))?
+                        .context("recovered draft is outside the project")
+                })
+                .transpose()
+        })
     }
 
     #[inline]
@@ -5469,6 +5525,7 @@ impl Project {
             cx.emit(Event::CollaboratorJoined(collaborator.peer_id));
             this.collaborators
                 .insert(collaborator.peer_id, collaborator);
+            cx.notify();
         });
 
         Ok(())
@@ -5523,11 +5580,16 @@ impl Project {
     ) -> Result<()> {
         this.update(&mut cx, |this, cx| {
             let peer_id = envelope.payload.peer_id.context("invalid peer id")?;
-            let replica_id = this
-                .collaborators
-                .remove(&peer_id)
-                .with_context(|| format!("unknown peer {peer_id:?}"))?
-                .replica_id;
+            let Some(collaborator) = this.collaborators.remove(&peer_id) else {
+                // A sandbox reconnect can replay a departure already reflected by
+                // the current roster. Removing an absent participant is idempotent.
+                anyhow::ensure!(
+                    this.sandbox_replica_id.is_some_and(|id| id.as_u16() >= 8),
+                    "unknown peer {peer_id:?}"
+                );
+                return Ok(());
+            };
+            let replica_id = collaborator.replica_id;
             this.buffer_store.update(cx, |buffer_store, cx| {
                 buffer_store.forget_shared_buffers_for(&peer_id);
                 for buffer in buffer_store.buffers() {
@@ -5539,6 +5601,7 @@ impl Project {
             });
 
             cx.emit(Event::CollaboratorLeft(peer_id));
+            cx.notify();
             Ok(())
         })
     }

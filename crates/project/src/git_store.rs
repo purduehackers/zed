@@ -1150,6 +1150,16 @@ impl GitStore {
         self.set_active_repo_id(repo_id, cx);
     }
 
+    /// Replay repositories without restarting their shared update stream.
+    pub fn send_initial_state(&self, project_id: u64, client: &AnyProtoClient, cx: &App) {
+        for repo in self.repositories.values() {
+            for update in split_repository_update(repo.read(cx).snapshot.initial_update(project_id))
+            {
+                client.send(update).log_err();
+            }
+        }
+    }
+
     pub fn shared(&mut self, project_id: u64, client: AnyProtoClient, cx: &mut Context<Self>) {
         match &mut self.state {
             GitStoreState::Remote {

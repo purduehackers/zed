@@ -11623,6 +11623,19 @@ impl CollaborationHub for Entity<Project> {
 
     fn user_names(&self, cx: &App) -> HashMap<u64, SharedString> {
         let this = self.read(cx);
+        #[cfg(target_family = "wasm")]
+        if this.replica_id() >= ReplicaId::FIRST_COLLAB_ID {
+            return this
+                .collaborators()
+                .values()
+                .map(|peer| {
+                    (
+                        peer.user_id,
+                        format!("Guest {}", peer.replica_id.as_u16().saturating_sub(7)).into(),
+                    )
+                })
+                .collect();
+        }
         let user_ids = this.collaborators().values().map(|c| c.user_id);
         this.user_store().read(cx).participant_names(user_ids, cx)
     }
@@ -11959,6 +11972,12 @@ impl EditorSnapshot {
                         user_name,
                         color: if let Some(index) = participant_index {
                             cx.theme().players().color_for_participant(index.0)
+                        } else if cfg!(target_family = "wasm")
+                            && collaborator.replica_id >= ReplicaId::FIRST_COLLAB_ID
+                        {
+                            cx.theme().players().color_for_participant(
+                                collaborator.replica_id.as_u16().saturating_sub(8) as u32,
+                            )
                         } else {
                             cx.theme().players().absent()
                         },

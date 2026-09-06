@@ -56,6 +56,11 @@ impl std::fmt::Debug for State {
 }
 
 pub trait ProtoClient: Send + Sync {
+    /// Select a downstream participant when a transport hosts several clients. Ordinary
+    /// collab/SSH transports already route their own messages and keep the default.
+    fn peer_client(&self, _peer: proto::PeerId) -> Result<Option<AnyProtoClient>> {
+        Ok(None)
+    }
     fn request(
         &self,
         envelope: Envelope,
@@ -212,6 +217,14 @@ where
 }
 
 impl AnyProtoClient {
+    pub fn for_peer(&self, peer: proto::PeerId) -> Result<Self> {
+        Ok(self
+            .0
+            .client
+            .peer_client(peer)?
+            .unwrap_or_else(|| self.clone()))
+    }
+
     pub fn new<T: ProtoClient + 'static>(client: Arc<T>) -> Self {
         Self(Arc::new(State {
             client,

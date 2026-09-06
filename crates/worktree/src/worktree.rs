@@ -2591,7 +2591,8 @@ impl Snapshot {
         self.root_repo_is_linked_worktree
     }
 
-    fn build_initial_update(&self, project_id: u64, worktree_id: u64) -> proto::UpdateWorktree {
+    /// Snapshot for a newly joined downstream peer, without replacing the live observer.
+    pub fn build_initial_update(&self, project_id: u64, worktree_id: u64) -> proto::UpdateWorktree {
         let mut updated_entries = self
             .entries_by_path
             .iter()

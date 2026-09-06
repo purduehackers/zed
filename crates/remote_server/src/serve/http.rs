@@ -160,11 +160,11 @@ pub struct ServeState {
     verify_permits: tokio::sync::Semaphore,
     auth_failures: AtomicU64,
     auth_penalties: Mutex<HashMap<IpAddr, PeerPenalty>>,
-    session: Mutex<Option<SessionMeta>>,
+    sessions: Mutex<HashMap<String, SessionMeta>>,
     last_input_at_ms: AtomicU64,
     worktrees: Mutex<Vec<String>>,
     dirty_buffers: AtomicU32,
-    log_frame_sink: Mutex<Option<tokio::sync::mpsc::Sender<Frame>>>,
+    log_frame_sinks: Mutex<HashMap<String, tokio::sync::mpsc::Sender<Frame>>>,
     pending_connections: AtomicUsize,
 }
 
@@ -258,11 +258,11 @@ impl ServeState {
             verify_permits: tokio::sync::Semaphore::new(VERIFY_CONCURRENCY),
             auth_failures: AtomicU64::new(0),
             auth_penalties: Mutex::new(HashMap::new()),
-            session: Mutex::new(None),
+            sessions: Mutex::new(HashMap::new()),
             last_input_at_ms: AtomicU64::new(0),
             worktrees: Mutex::new(Vec::new()),
             dirty_buffers: AtomicU32::new(0),
-            log_frame_sink: Mutex::new(None),
+            log_frame_sinks: Mutex::default(),
             pending_connections: AtomicUsize::new(0),
         }
     }
@@ -282,22 +282,36 @@ impl ServeState {
 
     /// Records the attached session (or its absence) for `/health` and the log context.
     pub fn set_session(&self, meta: Option<SessionMeta>) {
-        crate::serve::set_current_session(
-            meta.as_ref()
-                .map(|meta| (meta.session_id.clone(), meta.epoch)),
-        );
-        *self
-            .session
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = meta;
+        let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(meta) = meta {
+            sessions.insert(meta.session_id.clone(), meta);
+        } else {
+            sessions.clear();
+        }
+        // A process-wide log record cannot be attributed to one of several participants.
+        crate::serve::set_current_session((sessions.len() == 1).then(|| {
+            let meta = sessions.values().next().unwrap();
+            (meta.session_id.clone(), meta.epoch)
+        }));
+    }
+
+    pub fn remove_session(&self, session_id: &str) {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        sessions.remove(session_id);
+        crate::serve::set_current_session((sessions.len() == 1).then(|| {
+            let meta = sessions.values().next().unwrap();
+            (meta.session_id.clone(), meta.epoch)
+        }));
     }
 
     /// The attached session, if any.
     pub fn session(&self) -> Option<SessionMeta> {
-        self.session
+        self.sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+            .values()
+            .next()
+            .cloned()
     }
 
     /// Replaces the worktree roots reported by `/health`.
@@ -408,11 +422,20 @@ impl ServeState {
 
     /// Installs (or clears) the attached session's frame queue as the target of mirrored log
     /// records. Nothing in this path logs.
-    pub fn set_log_frame_sink(&self, sink: Option<tokio::sync::mpsc::Sender<Frame>>) {
-        *self
-            .log_frame_sink
+    pub fn set_log_frame_sink(
+        &self,
+        session_id: &str,
+        sink: Option<tokio::sync::mpsc::Sender<Frame>>,
+    ) {
+        let mut sinks = self
+            .log_frame_sinks
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = sink;
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(sink) = sink {
+            sinks.insert(session_id.to_owned(), sink);
+        } else {
+            sinks.remove(session_id);
+        }
     }
 
     /// Mirrors one log record to the attached session as `ControlFrame::Log` with `try_send`:
@@ -436,11 +459,11 @@ impl ServeState {
             return;
         };
         let guard = self
-            .log_frame_sink
+            .log_frame_sinks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(sink) = guard.as_ref() {
-            sink.try_send(Frame::text(json)).ok();
+        for sink in guard.values() {
+            sink.try_send(Frame::text(json.clone())).ok();
         }
     }
 
@@ -984,7 +1007,7 @@ mod tests {
         assert!(minimal.session.is_none());
 
         let mut client = server.connect(&server.token("sid_1")).await;
-        client.hello("sid_1", "inst_1", false, false, None).await;
+        client.hello("sid_1", "inst_1", false, None).await;
         let ack = client.hello_ack().await.expect("hello ack");
         let attached: HealthResponse = http_request(server.addr, get("/health")).await.json();
         assert!(attached.session_active);
@@ -1056,7 +1079,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let started = std::time::Instant::now();
         let mut client = server.connect(&server.token("sid_1")).await;
-        client.hello("sid_1", "inst_1", false, false, None).await;
+        client.hello("sid_1", "inst_1", false, None).await;
         assert!(client.hello_ack().await.is_some());
         assert!(
             started.elapsed() < Duration::from_secs(1),
@@ -1209,7 +1232,7 @@ mod tests {
         let mut client = TestClient::connect(server.addr, &token, &[])
             .await
             .expect("no Origin header is unaffected");
-        client.hello("sid_1", "inst_1", false, false, None).await;
+        client.hello("sid_1", "inst_1", false, None).await;
         assert!(client.hello_ack().await.is_some());
     }
 
@@ -1391,7 +1414,7 @@ mod tests {
     async fn control_reports_session_attached() {
         let server = TestServer::start().await;
         let mut client = server.connect(&server.token("sid_1")).await;
-        client.hello("sid_1", "inst_1", false, false, None).await;
+        client.hello("sid_1", "inst_1", false, None).await;
         client.hello_ack().await.expect("hello ack");
 
         let outcome = http_request(server.control_addr, {

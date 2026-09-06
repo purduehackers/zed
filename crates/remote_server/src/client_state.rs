@@ -1,7 +1,7 @@
 //! Server-side store of the client's database image (BUILD-SPEC 5.4, D7): the bytes of
 //! `SaveClientState` land under the server data directory, inside the sandbox snapshot and
 //! the rebuild tarball (D9), and come back through `LoadClientState` on the next open.
-//! One server process serves one workspace, so the store is keyed by nothing.
+//! Each signed participant has its own image and version under `participants/<id>`.
 
 use std::{
     path::PathBuf,
@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context as _, Result};
 use fs::{CopyOptions, Fs, RenameOptions};
 use futures::{FutureExt as _, future::Shared};
-use gpui::{AsyncApp, Context, Entity, Task};
+use gpui::{App, AppContext as _, AsyncApp, Context, Entity, Task};
 use rpc::{TypedEnvelope, proto};
 use serde::{Deserialize, Serialize};
 use util::ResultExt as _;
@@ -57,6 +57,7 @@ pub struct ClientStateMeta {
 
 /// The blob store behind `SaveClientState` / `LoadClientState`.
 pub struct ClientStateStore {
+    peers: collections::HashMap<proto::PeerId, Entity<Self>>,
     fs: Arc<dyn Fs>,
     dir: PathBuf,
     /// `None` until `loaded` resolves and when nothing is stored.
@@ -109,6 +110,7 @@ impl ClientStateStore {
             })
             .shared();
         Self {
+            peers: Default::default(),
             fs,
             dir,
             current: None,
@@ -125,6 +127,33 @@ impl ClientStateStore {
     /// The directory the images live in.
     pub fn dir(&self) -> &PathBuf {
         &self.dir
+    }
+
+    pub fn register_participant(
+        &mut self,
+        peer: proto::PeerId,
+        participant: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let dir = self.dir.join("participants").join(participant);
+        self.peers
+            .entry(peer)
+            .or_insert_with(|| cx.new(|cx| Self::new(self.fs.clone(), dir, cx)));
+    }
+
+    pub fn participant_stopping_versions(
+        &self,
+        peer: proto::PeerId,
+        cx: &App,
+    ) -> Option<watch::Receiver<u64>> {
+        self.peers
+            .get(&peer)
+            .map(|store| store.read(cx).stopping_saved_versions())
+    }
+
+    fn for_peer(this: Entity<Self>, peer: proto::PeerId, cx: &AsyncApp) -> Result<Entity<Self>> {
+        this.read_with(cx, |store, _| store.peers.get(&peer).cloned())
+            .context("unknown client-state participant")
     }
 
     /// Metadata of the stored image, once loaded.
@@ -156,6 +185,19 @@ impl ClientStateStore {
     /// envelope after a lost response lands here; the client converges on the returned
     /// version).
     pub async fn handle_save_client_state(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::SaveClientState>,
+        cx: AsyncApp,
+    ) -> Result<proto::SaveClientStateResponse> {
+        let this = Self::for_peer(
+            this,
+            envelope.original_sender_id.unwrap_or(envelope.sender_id),
+            &cx,
+        )?;
+        Self::save_image(this, envelope, cx).await
+    }
+
+    async fn save_image(
         this: Entity<Self>,
         envelope: TypedEnvelope<proto::SaveClientState>,
         mut cx: AsyncApp,
@@ -270,6 +312,19 @@ impl ClientStateStore {
         envelope: TypedEnvelope<proto::LoadClientState>,
         cx: AsyncApp,
     ) -> Result<proto::LoadClientStateResponse> {
+        let this = Self::for_peer(
+            this,
+            envelope.original_sender_id.unwrap_or(envelope.sender_id),
+            &cx,
+        )?;
+        Self::load_image(this, envelope, cx).await
+    }
+
+    async fn load_image(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::LoadClientState>,
+        cx: AsyncApp,
+    ) -> Result<proto::LoadClientStateResponse> {
         let (loaded, operation_lock) =
             this.read_with(&cx, |this, _| (this.loaded(), this.operation_lock.clone()));
         loaded.await;
@@ -352,7 +407,7 @@ fn unix_millis_now() -> u64 {
 mod tests {
     use super::*;
     use fs::FakeFs;
-    use gpui::{AppContext as _, TestAppContext};
+    use gpui::TestAppContext;
     use serde_json::json;
     use std::time::Instant;
     use util::path;
@@ -404,16 +459,50 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn participants_keep_independent_images_and_versions(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        let root = store(&fs, cx);
+        let a = proto::PeerId { owner_id: 0, id: 8 };
+        let b = proto::PeerId { owner_id: 0, id: 9 };
+        root.update(cx, |store, cx| {
+            store.register_participant(a, "p_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", cx);
+            store.register_participant(b, "p_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", cx);
+        });
+        for (peer, bytes) in [(a, b"layout-a"), (b, b"layout-b")] {
+            let mut request = save(1, bytes);
+            request.original_sender_id = Some(peer);
+            assert!(
+                ClientStateStore::handle_save_client_state(root.clone(), request, cx.to_async())
+                    .await
+                    .unwrap()
+                    .accepted
+            );
+        }
+        for (peer, bytes) in [(a, b"layout-a"), (b, b"layout-b")] {
+            let mut request = load(false);
+            request.original_sender_id = Some(peer);
+            let response =
+                ClientStateStore::handle_load_client_state(root.clone(), request, cx.to_async())
+                    .await
+                    .unwrap();
+            assert_eq!(response.sqlite, bytes);
+            assert_eq!(response.version, 1);
+        }
+        assert!(
+            ClientStateStore::handle_load_client_state(root, load(false), cx.to_async())
+                .await
+                .is_err()
+        );
+    }
+
+    #[gpui::test]
     async fn save_then_load_round_trips(cx: &mut TestAppContext) {
         let fs = FakeFs::new(cx.executor());
         let store = store(&fs, cx);
-        let response = ClientStateStore::handle_save_client_state(
-            store.clone(),
-            save(3, b"image-3"),
-            cx.to_async(),
-        )
-        .await
-        .unwrap();
+        let response =
+            ClientStateStore::save_image(store.clone(), save(3, b"image-3"), cx.to_async())
+                .await
+                .unwrap();
         assert_eq!(
             response,
             proto::SaveClientStateResponse {
@@ -422,7 +511,7 @@ mod tests {
             }
         );
 
-        let loaded = ClientStateStore::handle_load_client_state(store, load(false), cx.to_async())
+        let loaded = ClientStateStore::load_image(store, load(false), cx.to_async())
             .await
             .unwrap();
         assert_eq!(loaded.sqlite, b"image-3");
@@ -439,16 +528,13 @@ mod tests {
     async fn stale_version_returns_current(cx: &mut TestAppContext) {
         let fs = FakeFs::new(cx.executor());
         let store = store(&fs, cx);
-        ClientStateStore::handle_save_client_state(store.clone(), save(5, b"five"), cx.to_async())
+        ClientStateStore::save_image(store.clone(), save(5, b"five"), cx.to_async())
             .await
             .unwrap();
-        let response = ClientStateStore::handle_save_client_state(
-            store.clone(),
-            save(5, b"other"),
-            cx.to_async(),
-        )
-        .await
-        .unwrap();
+        let response =
+            ClientStateStore::save_image(store.clone(), save(5, b"other"), cx.to_async())
+                .await
+                .unwrap();
         assert_eq!(
             response,
             proto::SaveClientStateResponse {
@@ -456,10 +542,9 @@ mod tests {
                 version: 5
             }
         );
-        let response =
-            ClientStateStore::handle_save_client_state(store, save(2, b"older"), cx.to_async())
-                .await
-                .unwrap();
+        let response = ClientStateStore::save_image(store, save(2, b"older"), cx.to_async())
+            .await
+            .unwrap();
         assert!(!response.accepted);
         assert_eq!(
             fs.load_bytes(&dir().join(IMAGE_FILE)).await.unwrap(),
@@ -471,7 +556,7 @@ mod tests {
     async fn load_without_state_is_empty(cx: &mut TestAppContext) {
         let fs = FakeFs::new(cx.executor());
         let store = store(&fs, cx);
-        let loaded = ClientStateStore::handle_load_client_state(store, load(false), cx.to_async())
+        let loaded = ClientStateStore::load_image(store, load(false), cx.to_async())
             .await
             .unwrap();
         assert!(loaded.sqlite.is_empty());
@@ -484,7 +569,7 @@ mod tests {
     async fn state_survives_new_store_instance(cx: &mut TestAppContext) {
         let fs = FakeFs::new(cx.executor());
         let first = store(&fs, cx);
-        ClientStateStore::handle_save_client_state(first, save(7, b"seven"), cx.to_async())
+        ClientStateStore::save_image(first, save(7, b"seven"), cx.to_async())
             .await
             .unwrap();
 
@@ -494,7 +579,7 @@ mod tests {
             second.read_with(cx, |store, _| store.current().map(|meta| meta.version)),
             Some(7)
         );
-        let loaded = ClientStateStore::handle_load_client_state(second, load(false), cx.to_async())
+        let loaded = ClientStateStore::load_image(second, load(false), cx.to_async())
             .await
             .unwrap();
         assert_eq!(loaded.sqlite, b"seven");
@@ -521,7 +606,7 @@ mod tests {
         let store = store(&fs, cx);
         // No `run_until_parked` between construction and the request: the `loaded` gate
         // must hold the request until the metadata is read.
-        let loaded = ClientStateStore::handle_load_client_state(store, load(true), cx.to_async())
+        let loaded = ClientStateStore::load_image(store, load(true), cx.to_async())
             .await
             .unwrap();
         assert_eq!(loaded.version, 11);
@@ -532,10 +617,10 @@ mod tests {
     async fn prev_image_kept(cx: &mut TestAppContext) {
         let fs = FakeFs::new(cx.executor());
         let store = store(&fs, cx);
-        ClientStateStore::handle_save_client_state(store.clone(), save(1, b"first"), cx.to_async())
+        ClientStateStore::save_image(store.clone(), save(1, b"first"), cx.to_async())
             .await
             .unwrap();
-        ClientStateStore::handle_save_client_state(store, save(2, b"second"), cx.to_async())
+        ClientStateStore::save_image(store, save(2, b"second"), cx.to_async())
             .await
             .unwrap();
         assert_eq!(
@@ -556,7 +641,7 @@ mod tests {
         let mut versions = store.read_with(cx, |store, _| store.saved_versions());
         let mut stopping_versions = store.read_with(cx, |store, _| store.stopping_saved_versions());
         assert_eq!(*versions.borrow(), 0);
-        ClientStateStore::handle_save_client_state(store.clone(), save(4, b"four"), cx.to_async())
+        ClientStateStore::save_image(store.clone(), save(4, b"four"), cx.to_async())
             .await
             .unwrap();
         versions.changed().await.unwrap();
@@ -567,7 +652,7 @@ mod tests {
             "a plain save is not a stopping save"
         );
 
-        ClientStateStore::handle_save_client_state(
+        ClientStateStore::save_image(
             store,
             save_with_build(5, b"five", None, true),
             cx.to_async(),
@@ -582,20 +667,17 @@ mod tests {
     async fn rejects_far_future_versions_and_unprintable_client_builds(cx: &mut TestAppContext) {
         let fs = FakeFs::new(cx.executor());
         let store = store(&fs, cx);
-        let error = ClientStateStore::handle_save_client_state(
-            store.clone(),
-            save(u64::MAX, b"max"),
-            cx.to_async(),
-        )
-        .await
-        .unwrap_err();
+        let error =
+            ClientStateStore::save_image(store.clone(), save(u64::MAX, b"max"), cx.to_async())
+                .await
+                .unwrap_err();
         assert!(
             format!("{error:#}").contains("above the stored"),
             "{error:#}"
         );
         assert!(!fs.is_file(&dir().join(IMAGE_FILE)).await);
 
-        let response = ClientStateStore::handle_save_client_state(
+        let response = ClientStateStore::save_image(
             store.clone(),
             save(MAX_VERSION_ADVANCE, b"edge"),
             cx.to_async(),
@@ -616,31 +698,27 @@ mod tests {
             let version = store.read_with(cx, |store, _| {
                 store.current().map_or(0, |meta| meta.version)
             }) + 1;
-            ClientStateStore::handle_save_client_state(
+            ClientStateStore::save_image(
                 store.clone(),
                 save_with_build(version, b"b", Some(bad), false),
                 cx.to_async(),
             )
             .await
             .unwrap();
-            let loaded = ClientStateStore::handle_load_client_state(
-                store.clone(),
-                load(true),
-                cx.to_async(),
-            )
-            .await
-            .unwrap();
+            let loaded = ClientStateStore::load_image(store.clone(), load(true), cx.to_async())
+                .await
+                .unwrap();
             assert_eq!(loaded.client_build, None);
         }
         let version = store.read_with(cx, |store, _| store.current().unwrap().version) + 1;
-        ClientStateStore::handle_save_client_state(
+        ClientStateStore::save_image(
             store.clone(),
             save_with_build(version, b"b", Some("dev-abc123".into()), false),
             cx.to_async(),
         )
         .await
         .unwrap();
-        let loaded = ClientStateStore::handle_load_client_state(store, load(true), cx.to_async())
+        let loaded = ClientStateStore::load_image(store, load(true), cx.to_async())
             .await
             .unwrap();
         assert_eq!(loaded.client_build.as_deref(), Some("dev-abc123"));
@@ -650,10 +728,10 @@ mod tests {
     async fn metadata_only_omits_bytes(cx: &mut TestAppContext) {
         let fs = FakeFs::new(cx.executor());
         let store = store(&fs, cx);
-        ClientStateStore::handle_save_client_state(store.clone(), save(9, b"nine"), cx.to_async())
+        ClientStateStore::save_image(store.clone(), save(9, b"nine"), cx.to_async())
             .await
             .unwrap();
-        let loaded = ClientStateStore::handle_load_client_state(store, load(true), cx.to_async())
+        let loaded = ClientStateStore::load_image(store, load(true), cx.to_async())
             .await
             .unwrap();
         assert!(loaded.sqlite.is_empty());
@@ -666,13 +744,13 @@ mod tests {
         let fs = FakeFs::new(cx.executor());
         let store = store(&fs, cx);
         assert!(
-            ClientStateStore::handle_save_client_state(store.clone(), save(1, b""), cx.to_async())
+            ClientStateStore::save_image(store.clone(), save(1, b""), cx.to_async())
                 .await
                 .is_err()
         );
         let oversized = vec![0u8; MAX_IMAGE_BYTES + 1];
         assert!(
-            ClientStateStore::handle_save_client_state(store, save(1, &oversized), cx.to_async())
+            ClientStateStore::save_image(store, save(1, &oversized), cx.to_async())
                 .await
                 .is_err()
         );

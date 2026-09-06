@@ -69,6 +69,8 @@ pub const WEB_LAYOUT_DEFAULTS: &str = r#"{
   },
   "project_panel": {
     "dock": "left",
+    // First-run setup opens it explicitly; returning tabs restore their saved dock state.
+    "starts_open": false,
     "diagnostic_badges": false,
     "hide_hidden": false,
     "hide_root": true,
@@ -211,6 +213,7 @@ mod tests {
         assert_eq!(merged["vim_mode"], serde_json::json!(true));
         assert_eq!(merged["theme"]["mode"], serde_json::json!("dark"));
         assert_eq!(merged["project_panel"]["dock"], serde_json::json!("left"));
+        assert_eq!(merged["project_panel"]["starts_open"], serde_json::json!(false));
         assert_eq!(merged["terminal"]["dock"], serde_json::json!("right"));
         assert_eq!(merged["terminal"]["font_family"], "Lilex Nerd Font Mono");
         // The tab is the window: the machine and project name go, the git identity stays.

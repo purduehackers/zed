@@ -59,9 +59,8 @@ use crate::{
 };
 use wire::{
     CLOSE_BAD_HELLO, CLOSE_BUILD_MISMATCH, CLOSE_GOING_AWAY, CLOSE_REASON_STALE_EPOCH,
-    CLOSE_SESSION_ACTIVE, CLOSE_TAKEN_OVER, CLOSE_UNAUTHORIZED, ClientKind, ControlFrame,
-    DEV_BUILD_PREFIX, Hello, HelloAck, MAX_FRAME_BYTES, PROTOCOL_VERSION, ZS_BUILD_ID,
-    builds_compatible,
+    CLOSE_TAKEN_OVER, CLOSE_UNAUTHORIZED, ClientKind, ControlFrame, DEV_BUILD_PREFIX, Hello,
+    HelloAck, MAX_FRAME_BYTES, PROTOCOL_VERSION, ZS_BUILD_ID, builds_compatible,
 };
 
 /// Reconnect budget for the WebSocket transport (D2): attempts, each preceded by a refresh
@@ -92,7 +91,7 @@ const CLIENT_KIND: ClientKind = if cfg!(target_family = "wasm") {
 static INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Connection options for a `zed-remote-server serve` endpoint
-/// (`{ url, workspace_id, session_id, token, takeover }` plus two runtime-only fields, D1).
+/// (`{ url, workspace_id, session_id, token }` plus two runtime-only fields, D1).
 ///
 /// Identity (`Hash`/`Eq`, workspace persistence, the `ConnectionPool` key) is `workspace_id`
 /// only: `url`, `token` and `session_id` change across resumes and reconnects.
@@ -112,10 +111,6 @@ pub struct WebSocketConnectionOptions {
     /// ES256 session JWT. Never serialized, never printed.
     #[serde(skip)]
     pub token: String,
-    /// Ask the server to close any other attached client with 4001 and attach us. Per-attempt,
-    /// never persisted.
-    #[serde(skip)]
-    pub takeover: bool,
     /// Supplies a fresh `{url, token, session_id}` before each reconnect dial. `None` falls
     /// back to the process-wide [`session_refresh_provider`], else the current values are
     /// reused.
@@ -147,16 +142,9 @@ impl WebSocketConnectionOptions {
             workspace_id: workspace_id.into(),
             session_id,
             token,
-            takeover: false,
             refresh: None,
             state: Some(Arc::new(state)),
         }
-    }
-
-    /// Sets the per-attempt takeover flag.
-    pub fn with_takeover(mut self, takeover: bool) -> Self {
-        self.takeover = takeover;
-        self
     }
 
     /// Sets the refresh callback consulted before every reconnect dial.
@@ -230,7 +218,6 @@ impl fmt::Debug for WebSocketConnectionOptions {
             .field("workspace_id", &self.workspace_id)
             .field("session_id", &self.session_id)
             .field("token", &"<redacted>")
-            .field("takeover", &self.takeover)
             .field("refresh", &self.refresh.is_some())
             .field(
                 "instance",
@@ -417,7 +404,7 @@ impl WebSocketSessionState {
 
 /// A fresh `Hello.instance` (D25). The server keys same-instance reconnects on it — a
 /// matching `instance` with a matching epoch attaches warm and inherits the replay buffer
-/// without `takeover` — so it must not be guessable: 128 bits from the platform CSPRNG
+/// for that participant — so it must not be guessable: 128 bits from the platform CSPRNG
 /// (`getrandom`, `crypto.getRandomValues` in the browser), plus a process-local counter that
 /// keeps two nonces distinct even if the entropy source were to repeat.
 fn new_instance_nonce() -> String {
@@ -433,6 +420,8 @@ fn new_instance_nonce() -> String {
 /// No `PartialEq`: `RemotePlatform` only derives `Copy, Clone, Debug`.
 #[derive(Clone, Debug)]
 pub struct WebSocketServerInfo {
+    /// Per-participant CRDT identity, when supported by the sandbox.
+    pub replica_id: u16,
     /// The server build id.
     pub build: String,
     /// Parsed from `HelloAck.os` / `HelloAck.arch`.
@@ -450,6 +439,7 @@ pub struct WebSocketServerInfo {
 impl WebSocketServerInfo {
     fn from_hello_ack(ack: &HelloAck) -> Self {
         Self {
+            replica_id: ack.replica_id,
             build: ack.build.clone(),
             platform: parse_platform(&ack.os, &ack.arch),
             os_version: ack.os_version.clone(),
@@ -800,7 +790,6 @@ impl WebSocketRemoteConnection {
         workspace_id: &str,
         unique_identifier: String,
         reconnect: bool,
-        takeover: bool,
         client_build: String,
     ) -> Result<Hello> {
         let session = state
@@ -814,7 +803,6 @@ impl WebSocketRemoteConnection {
             identifier: unique_identifier,
             instance: state.instance.clone(),
             reconnect,
-            takeover,
             client: CLIENT_KIND,
             epoch: if reconnect { state.epoch() } else { None },
         })
@@ -951,9 +939,7 @@ fn exit_code_for_close(close: &CloseInfo) -> Result<i32> {
         CLOSE_TAKEN_OVER if close.reason == CLOSE_REASON_STALE_EPOCH => {
             Ok(ProxyLaunchError::ServerNotRunning.to_exit_code())
         }
-        CLOSE_TAKEN_OVER | CLOSE_SESSION_ACTIVE => {
-            Ok(ProxyLaunchError::SessionTakenOver.to_exit_code())
-        }
+        CLOSE_TAKEN_OVER => Ok(ProxyLaunchError::SessionTakenOver.to_exit_code()),
         CLOSE_BUILD_MISMATCH | CLOSE_BAD_HELLO => {
             Ok(ProxyLaunchError::IncompatibleServer.to_exit_code())
         }
@@ -969,7 +955,10 @@ fn exit_code_for_close(close: &CloseInfo) -> Result<i32> {
 /// epoch, or another instance attached in between) is exit 90, because replaying unacked
 /// envelopes against a reset project would be wrong.
 fn exit_code_for_hello_ack(client_build: &str, reconnect: bool, ack: &HelloAck) -> Option<i32> {
-    if ack.protocol != PROTOCOL_VERSION || !builds_compatible(client_build, &ack.build) {
+    if ack.protocol != PROTOCOL_VERSION
+        || !builds_compatible(client_build, &ack.build)
+        || ack.replica_id < 8
+    {
         Some(ProxyLaunchError::IncompatibleServer.to_exit_code())
     } else if reconnect && !ack.resumed {
         Some(ProxyLaunchError::ServerNotRunning.to_exit_code())
@@ -1129,17 +1118,13 @@ impl RemoteConnection for WebSocketRemoteConnection {
         let Some((frames_tx, frames_rx)) = channels else {
             return Task::ready(Err(anyhow!("websocket session already attached or killed")));
         };
-        let (workspace_id, takeover) = {
-            let options = self.options.lock();
-            (options.workspace_id.clone(), options.takeover)
-        };
+        let workspace_id = self.options.lock().workspace_id.clone();
         let client_build = cx.update(|cx| client_build_id(cx));
         let hello = match Self::compose_hello(
             &self.state,
             &workspace_id,
             unique_identifier,
             reconnect,
-            takeover,
             client_build,
         ) {
             Ok(hello) => hello,
@@ -1223,6 +1208,14 @@ impl RemoteConnection for WebSocketRemoteConnection {
 
     fn path_style(&self) -> PathStyle {
         PathStyle::Unix
+    }
+
+    fn replica_id(&self) -> u16 {
+        self.server_info
+            .lock()
+            .as_ref()
+            .expect("replica id is assigned during the WebSocket handshake")
+            .replica_id
     }
 
     fn remote_platform(&self) -> RemotePlatform {

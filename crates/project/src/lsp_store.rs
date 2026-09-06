@@ -4396,6 +4396,7 @@ pub struct BufferLspData {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct LspKey {
+    peer: proto::PeerId,
     request_type: TypeId,
     server_queried: Option<LanguageServerId>,
 }
@@ -9257,7 +9258,11 @@ impl LspStore {
         _: &mut Context<Self>,
     ) {
         self.downstream_client = Some((downstream_client.clone(), project_id));
+        self.send_initial_state(project_id, &downstream_client);
+    }
 
+    /// Replay running servers to a joining participant; keep the shared downstream hub.
+    pub fn send_initial_state(&self, project_id: u64, downstream_client: &AnyProtoClient) {
         for (server_id, status) in &self.language_server_statuses {
             if let Some(server) = self.language_server_for_id(*server_id) {
                 downstream_client
@@ -10231,6 +10236,7 @@ impl LspStore {
                 Self::deduplicate_range_based_lsp_requests::<InlayHints>(
                     &lsp_store,
                     server_id,
+                    sender_id,
                     lsp_request_id,
                     &inlay_hints,
                     query_start..query_end,
@@ -10300,6 +10306,7 @@ impl LspStore {
                 lsp_store.update(&mut cx, |lsp_store, cx| {
                     let lsp_data = lsp_store.latest_lsp_data(&buffer, cx);
                     let key = LspKey {
+                        peer: sender_id,
                         request_type: TypeId::of::<GetDocumentDiagnostics>(),
                         server_queried: server_id,
                     };
@@ -13729,6 +13736,7 @@ impl LspStore {
     async fn deduplicate_range_based_lsp_requests<T>(
         lsp_store: &Entity<Self>,
         server_id: Option<LanguageServerId>,
+        sender_id: proto::PeerId,
         lsp_request_id: LspRequestId,
         proto_request: &T::ProtoRequest,
         range: Range<Anchor>,
@@ -13756,6 +13764,7 @@ impl LspStore {
             match chunks_queried_for.as_slice() {
                 &[chunk] => {
                     let key = LspKey {
+                        peer: sender_id,
                         request_type: TypeId::of::<T>(),
                         server_queried: server_id,
                     };
@@ -13801,6 +13810,7 @@ impl LspStore {
         let request =
             T::from_proto(proto_request, lsp_store.clone(), buffer.clone(), cx.clone()).await?;
         let key = LspKey {
+            peer: sender_id,
             request_type: TypeId::of::<T>(),
             server_queried: for_server_id,
         };
@@ -13842,6 +13852,9 @@ impl LspStore {
                         .update(cx, |lsp_store, cx| {
                             if let Some((client, project_id)) = lsp_store.downstream_client.clone()
                             {
+                                let Ok(client) = client.for_peer(sender_id) else {
+                                    return;
+                                };
                                 let response = response
                                     .into_iter()
                                     .map(|(server_id, response)| {
@@ -13895,8 +13908,12 @@ impl LspStore {
         let Some((client, project_id)) = self.downstream_client.clone() else {
             return;
         };
+        let Ok(client) = client.for_peer(sender_id) else {
+            return;
+        };
         let lsp_data = self.latest_lsp_data(buffer, cx);
         let key = LspKey {
+            peer: sender_id,
             request_type: TypeId::of::<T>(),
             server_queried: server_id,
         };

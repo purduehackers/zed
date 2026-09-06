@@ -2,6 +2,7 @@ syntax = "proto3";
 package zed.messages;
 
 import "worktree.proto";
+import "buffer.proto";
 
 // Sandbox session protocol (b4-proto-additions): client persistence, lifecycle
 // notices, port forwarding, upload notifications and registry-driven extension
@@ -31,6 +32,19 @@ message LoadClientStateResponse {
   uint64 version = 2;               // 0 when nothing stored
   bool gzip = 3;
   optional string client_build = 4;
+}
+
+// Atomically restore a participant's pre-stop draft only before newer VM edits.
+// A conflicting draft is preserved as a separate file, never applied over shared text.
+message RestoreBufferSnapshot {
+  uint64 project_id = 1;
+  uint64 buffer_id = 2;
+  string text = 3;
+  Timestamp mtime = 4;
+}
+message RestoreBufferSnapshotResponse {
+  repeated VectorClockEntry version = 1;
+  optional string recovery_path = 2;
 }
 
 // ---- 5.5 lifecycle notices (server -> client) ----

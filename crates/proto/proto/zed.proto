@@ -547,7 +547,9 @@ message Envelope {
     ListExtensionsResponse list_extensions_response = 511;
     InstallRegistryExtension install_registry_extension = 512;
     UninstallExtension uninstall_extension = 513;
-    ExtensionsChanged extensions_changed = 514; // current max
+    ExtensionsChanged extensions_changed = 514;
+    RestoreBufferSnapshot restore_buffer_snapshot = 515;
+    RestoreBufferSnapshotResponse restore_buffer_snapshot_response = 516; // current max
   }
 
   reserved 87 to 88;

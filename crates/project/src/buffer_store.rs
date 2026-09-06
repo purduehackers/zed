@@ -1218,7 +1218,8 @@ impl BufferStore {
                     .send(proto::BufferReloaded {
                         project_id: *project_id,
                         buffer_id: buffer.remote_id().to_proto(),
-                        version: serialize_version(&buffer.version()),
+                        // Edits may follow did_reload before this event is delivered.
+                        version: serialize_version(buffer.saved_version()),
                         mtime: buffer.saved_mtime().map(|t| t.into()),
                         line_ending: serialize_line_ending(buffer.line_ending()) as i32,
                     })
@@ -1234,6 +1235,21 @@ impl BufferStore {
         envelope: TypedEnvelope<proto::UpdateBuffer>,
         mut cx: AsyncApp,
     ) -> Result<proto::Ack> {
+        // The sandbox hosts the shared project. Relay selections too: apply_ops emits
+        // BufferEvent::Operation only for text, not received selection updates.
+        let relay = this.read_with(&cx, |this, _| {
+            (matches!(this.state, BufferStoreState::Local(_))
+                && envelope.original_sender_id.is_some_and(|peer| peer.id >= 8))
+            .then(|| {
+                this.downstream_client
+                    .as_ref()
+                    .filter(|(client, project)| {
+                        *project == proto::REMOTE_SERVER_PROJECT_ID && !client.is_via_collab()
+                    })
+                    .map(|(client, _)| (client.clone(), envelope.payload.clone()))
+            })
+            .flatten()
+        });
         let payload = envelope.payload;
         let buffer_id = BufferId::new(payload.buffer_id)?;
         let ops = payload
@@ -1254,6 +1270,9 @@ impl BufferStore {
                 hash_map::Entry::Vacant(e) => {
                     e.insert(OpenBuffer::Operations(ops));
                 }
+            }
+            if let Some((client, payload)) = relay {
+                cx.background_spawn(client.request(payload)).detach();
             }
             Ok(proto::Ack {})
         })

@@ -11,7 +11,7 @@ use extension_host::headless_host::HeadlessExtensionStore;
 use fs::Fs;
 use gpui::{
     App, AppContext as _, AsyncApp, Context, Entity, PromptLevel, Subscription, Task, TaskExt,
-    UpdateGlobal as _, WeakEntity,
+    WeakEntity,
 };
 use http_client::HttpClient;
 use language::{Buffer, BufferEvent, LanguageRegistry, proto::serialize_operation};
@@ -34,7 +34,7 @@ use project::{
 };
 use rpc::{
     AnyProtoClient, TypedEnvelope,
-    proto::{self, REMOTE_SERVER_PEER_ID, REMOTE_SERVER_PROJECT_ID},
+    proto::{self, REMOTE_SERVER_PROJECT_ID},
 };
 use smol::process::Child;
 
@@ -46,7 +46,7 @@ use crate::{
     pty,
 };
 
-use settings::{SettingsStore, initial_server_settings_content};
+use settings::initial_server_settings_content;
 use std::{
     num::NonZeroU64,
     path::{Path, PathBuf},
@@ -60,7 +60,14 @@ use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
 use util::{ResultExt, paths::PathStyle, rel_path::RelPath};
 use worktree::Worktree;
 
+mod recovery;
+
 pub struct HeadlessProject {
+    pub hub: Option<Arc<remote::ServerHub>>,
+    participants: HashSet<proto::PeerId>,
+    retained_buffers: Vec<Entity<Buffer>>,
+    edited_buffers: HashSet<u64>,
+    worktree_add_lock: Arc<futures::lock::Mutex<()>>,
     pub fs: Arc<dyn Fs>,
     pub session: AnyProtoClient,
     pub worktree_store: Entity<WorktreeStore>,
@@ -91,7 +98,7 @@ pub struct HeadlessProject {
     pub shutdown_request_handler: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Serve mode: everything sandbox-specific (client state, control channel, port
     /// forwarding, registry extensions); `None` in SSH `run` mode. Installed once per
-    /// process by `enable_sandbox` and untouched by `reset_for_new_client`.
+    /// process by `enable_sandbox`.
     pub sandbox: Option<SandboxRuntime>,
 }
 
@@ -312,8 +319,11 @@ impl HeadlessProject {
             languages.clone(),
         );
 
-        cx.subscribe(&buffer_store, |_this, _buffer_store, event, cx| {
+        cx.subscribe(&buffer_store, |this, _buffer_store, event, cx| {
             if let BufferStoreEvent::BufferAdded(buffer) = event {
+                if this.hub.is_some() {
+                    this.retained_buffers.push(buffer.clone());
+                }
                 cx.subscribe(buffer, Self::on_buffer_event).detach();
             }
         })
@@ -353,6 +363,7 @@ impl HeadlessProject {
         session.add_request_handler(cx.weak_entity(), Self::handle_get_path_metadata);
         session.add_request_handler(cx.weak_entity(), Self::handle_shutdown_remote_server);
         session.add_request_handler(cx.weak_entity(), Self::handle_ping);
+        session.add_request_handler(cx.weak_entity(), Self::handle_restore_buffer_snapshot);
         session.add_request_handler(cx.weak_entity(), Self::handle_get_processes);
         session.add_request_handler(cx.weak_entity(), Self::handle_get_remote_profiling_data);
 
@@ -424,12 +435,17 @@ impl HeadlessProject {
             pty_manager,
             shutdown_request_handler: None,
             sandbox: None,
+            hub: None,
+            participants: Default::default(),
+            retained_buffers: Vec::new(),
+            edited_buffers: HashSet::default(),
+            worktree_add_lock: Arc::default(),
         }
     }
 
     /// Serve mode: switches on everything sandbox-specific. Called at most once per
     /// process, right after construction (registering a handler twice panics, and
-    /// `reset_for_new_client` keeps the session's handler table, so the runtime survives
+    /// The shared project and runtime survive participant reloads.
     /// every fresh session). Returns the control channel for the loopback listener.
     pub fn enable_sandbox(
         &mut self,
@@ -449,7 +465,6 @@ impl HeadlessProject {
         let (control, mut install_requests) = ControlChannel::new(
             session.clone(),
             config.control_secret.clone(),
-            client_state.read(cx).stopping_saved_versions(),
             cx.background_executor().clone(),
         );
         let ports = PortForwarder::new(
@@ -595,6 +610,123 @@ impl HeadlessProject {
         self.send_extensions_changed(cx);
     }
 
+    pub fn add_participant(
+        &mut self,
+        peer: proto::PeerId,
+        participant: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(sandbox) = &self.sandbox {
+            sandbox.client_state.update(cx, |store, cx| {
+                store.register_participant(peer, participant, cx)
+            });
+        }
+    }
+
+    pub fn reset_participant(&mut self, peer: proto::PeerId, cx: &mut Context<Self>) {
+        // Reset only the participant's snapshot ledger, not the VM-owned buffers or LSPs.
+        self.buffer_store
+            .update(cx, |store, _| store.forget_shared_buffers_for(&peer));
+    }
+
+    pub fn participant_attached(&mut self, peer: proto::PeerId, cx: &mut Context<Self>) {
+        self.participants.insert(peer);
+        if let Some(hub) = &self.hub {
+            hub.set_active(peer, true);
+        }
+        if let Some(sandbox) = &self.sandbox {
+            sandbox.control.set_participant_saves(
+                peer,
+                sandbox
+                    .client_state
+                    .read(cx)
+                    .participant_stopping_versions(peer, cx),
+            );
+        }
+        let Ok(client) = self.session.for_peer(peer) else {
+            return;
+        };
+        for participant in &self.participants {
+            let collaborator = proto::Collaborator {
+                peer_id: Some(*participant),
+                replica_id: participant.id,
+                user_id: participant.id as u64,
+                is_host: false,
+                committer_name: None,
+                committer_email: None,
+            };
+            if *participant == peer {
+                self.session
+                    .send(proto::AddProjectCollaborator {
+                        project_id: REMOTE_SERVER_PROJECT_ID,
+                        collaborator: Some(collaborator),
+                    })
+                    .log_err();
+            } else {
+                client
+                    .send(proto::AddProjectCollaborator {
+                        project_id: REMOTE_SERVER_PROJECT_ID,
+                        collaborator: Some(collaborator),
+                    })
+                    .log_err();
+            }
+        }
+        let worktrees: Vec<_> = self.worktree_store.read(cx).worktrees().collect();
+        // On a cold VM the browser adds its roots before replaying pre-boot messages.
+        // Replaying an empty pre-boot project afterward would delete those new roots.
+        if !worktrees.is_empty() {
+            client
+                .send(proto::UpdateProject {
+                    project_id: REMOTE_SERVER_PROJECT_ID,
+                    worktrees: worktrees
+                        .iter()
+                        .map(|w| w.read(cx).metadata_proto())
+                        .collect(),
+                })
+                .log_err();
+        }
+        for worktree in worktrees {
+            let worktree = worktree.read(cx);
+            let update = worktree
+                .snapshot()
+                .build_initial_update(REMOTE_SERVER_PROJECT_ID, worktree.id().to_proto());
+            for chunk in proto::split_worktree_update(update) {
+                client.send(chunk).log_err();
+            }
+        }
+        self.settings_observer
+            .read(cx)
+            .send_initial_state(&client, cx);
+        self.lsp_store
+            .read(cx)
+            .send_initial_state(REMOTE_SERVER_PROJECT_ID, &client);
+        self.git_store
+            .read(cx)
+            .send_initial_state(REMOTE_SERVER_PROJECT_ID, &client, cx);
+        self.on_session_attached(cx);
+    }
+
+    pub fn participant_detached(&mut self, peer: proto::PeerId, _cx: &mut Context<Self>) {
+        self.participants.remove(&peer);
+        if let Some(sandbox) = &self.sandbox {
+            sandbox.control.set_participant_saves(peer, None);
+        }
+        if let Some(hub) = &self.hub {
+            hub.set_active(peer, false);
+            for terminal in self.pty_manager.list() {
+                if hub.owns_terminal(terminal.terminal_id, peer) {
+                    self.pty_manager.detach(terminal.terminal_id);
+                }
+            }
+        }
+        self.session
+            .send(proto::RemoveProjectCollaborator {
+                project_id: REMOTE_SERVER_PROJECT_ID,
+                peer_id: Some(peer),
+            })
+            .log_err();
+    }
+
     /// Sends the installed set to the client and reports it to the supervisor.
     fn send_extensions_changed(&self, cx: &mut Context<Self>) {
         let Some(sandbox) = &self.sandbox else {
@@ -681,9 +813,17 @@ impl HeadlessProject {
     ) {
         if let BufferEvent::Operation {
             operation,
-            is_local: true,
+            is_local,
         } = event
         {
+            if matches!(operation, language::Operation::Buffer(_)) {
+                self.edited_buffers
+                    .insert(buffer.read(cx).remote_id().to_proto());
+            }
+            // Received batches (text and selections) are relayed by BufferStore.
+            if !is_local {
+                return;
+            }
             cx.background_spawn(self.session.request(proto::UpdateBuffer {
                 project_id: REMOTE_SERVER_PROJECT_ID,
                 buffer_id: buffer.read(cx).remote_id().to_proto(),
@@ -794,6 +934,8 @@ impl HeadlessProject {
         mut cx: AsyncApp,
     ) -> Result<proto::AddWorktreeResponse> {
         use client::ErrorCodeExt;
+        let lock = this.read_with(&cx, |this, _| this.worktree_add_lock.clone());
+        let guard = lock.lock_owned().await;
         let fs = this.read_with(&cx, |this, _| this.fs.clone());
         let path = PathBuf::from(shellexpand::tilde(&message.payload.path).to_string());
 
@@ -820,6 +962,26 @@ impl HeadlessProject {
                 }
             }
         };
+        if let Some(response) = this.read_with(&cx, |this, cx| {
+            this.worktree_store
+                .read(cx)
+                .worktrees()
+                .find_map(|worktree| {
+                    let worktree = worktree.read(cx);
+                    (worktree.abs_path().as_ref() == canonicalized.as_path()).then(|| {
+                        proto::AddWorktreeResponse {
+                            worktree_id: worktree.id().to_proto(),
+                            canonicalized_path: canonicalized.to_string_lossy().into_owned(),
+                            root_repo_common_dir: worktree
+                                .root_repo_common_dir()
+                                .map(|p| p.to_string_lossy().into_owned()),
+                            root_repo_is_linked_worktree: worktree.root_repo_is_linked_worktree(),
+                        }
+                    })
+                })
+        }) {
+            return Ok(response);
+        }
         let next_worktree_id = this
             .update(&mut cx, |this, cx| {
                 this.worktree_store
@@ -865,6 +1027,7 @@ impl HeadlessProject {
         // to be dropped on the headless project, and the client only then
         // receiving a response to AddWorktree.
         cx.spawn(async move |cx| {
+            let _guard = guard;
             this.update(cx, |this, cx| {
                 this.worktree_store.update(cx, |worktree_store, cx| {
                     worktree_store.add(&worktree, cx);
@@ -881,6 +1044,11 @@ impl HeadlessProject {
         envelope: TypedEnvelope<proto::RemoveWorktree>,
         mut cx: AsyncApp,
     ) -> Result<proto::Ack> {
+        // The VM owns collaborative roots. Dropping a tab's local worktree handles must
+        // not tear down scanners, buffers or language servers used by other participants.
+        if envelope.original_sender_id.is_some_and(|peer| peer.id >= 8) {
+            return Ok(proto::Ack {});
+        }
         let worktree_id = WorktreeId::from_proto(envelope.payload.worktree_id);
         this.update(&mut cx, |this, cx| {
             this.worktree_store.update(cx, |worktree_store, cx| {
@@ -896,54 +1064,12 @@ impl HeadlessProject {
         self.shutdown_request_handler = Some(handler);
     }
 
-    /// Serve mode, fresh session (D3, D24): forget the previous client's buffers, drop every
-    /// worktree so a client that has no state re-adds its roots without duplicating scanners
-    /// (`handle_add_worktree` never dedupes), and reset the user settings the previous client
-    /// pushed. Never touches the `PtyManager` (terminals survive; the client re-attaches them),
-    /// `kernels`, or any store entity's identity (re-subscribing panics in `subscribe_to_entity`).
-    /// Returns the number of dirty buffers discarded.
-    pub fn reset_for_new_client(&mut self, cx: &mut Context<Self>) -> usize {
-        let dirty = self
-            .buffer_store
-            .read(cx)
-            .buffers()
-            .filter(|buffer| buffer.read(cx).is_dirty())
-            .count();
-        // BufferStore keeps strong `Entity<Buffer>` refs in `shared_buffers` and never reacts to
-        // WorktreeRemoved; without this the buffers, their `File.worktree` entities and the
-        // worktrees' background scanners would leak.
-        self.buffer_store
-            .update(cx, |store, _| store.forget_shared_buffers());
-        let ids: Vec<WorktreeId> = self
-            .worktree_store
-            .read(cx)
-            .worktrees()
-            .map(|worktree| worktree.read(cx).id())
-            .collect();
-        self.worktree_store.update(cx, |store, cx| {
-            for id in ids {
-                store.remove_worktree(id, cx);
-            }
-        });
-        // Local settings of the removed worktrees were cleared by the observer's WorktreeRemoved
-        // arm; user settings live in the global store and are reset to defaults here so the next
-        // client starts clean until its own UpdateUserSettings arrives. The observer entity is
-        // kept (it is subscribed under REMOTE_SERVER_PROJECT_ID).
-        SettingsStore::update_global(cx, |store, cx| {
-            // `{}` cannot fail to parse; the result only reports parse diagnostics.
-            let _parse_result = store.set_user_settings("{}", cx);
-        });
-        if dirty > 0 {
-            log::warn!("fresh session discarded {dirty} dirty buffer(s) of the previous client");
-        }
-        dirty
-    }
-
     pub async fn handle_open_buffer_by_path(
         this: Entity<Self>,
         message: TypedEnvelope<proto::OpenBufferByPath>,
         mut cx: AsyncApp,
     ) -> Result<proto::OpenBufferResponse> {
+        let peer_id = message.original_sender_id.unwrap_or(message.sender_id);
         let worktree_id = WorktreeId::from_proto(message.payload.worktree_id);
         let path = RelPath::from_unix_str(&message.payload.path)?.into();
         let (buffer_store, buffer) = this.update(&mut cx, |this, cx| {
@@ -958,7 +1084,7 @@ impl HeadlessProject {
         let buffer_id = buffer.read_with(&cx, |b, _| b.remote_id());
         buffer_store.update(&mut cx, |buffer_store, cx| {
             buffer_store
-                .create_buffer_for_peer(&buffer, REMOTE_SERVER_PEER_ID, cx)
+                .create_buffer_for_peer(&buffer, peer_id, cx)
                 .detach_and_log_err(cx);
         });
 
@@ -972,6 +1098,7 @@ impl HeadlessProject {
         message: TypedEnvelope<proto::OpenImageByPath>,
         mut cx: AsyncApp,
     ) -> Result<proto::OpenImageResponse> {
+        let peer_id = message.original_sender_id.unwrap_or(message.sender_id);
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let worktree_id = WorktreeId::from_proto(message.payload.worktree_id);
         let path = RelPath::from_unix_str(&message.payload.path)?;
@@ -1011,7 +1138,7 @@ impl HeadlessProject {
 
         session.send(proto::CreateImageForPeer {
             project_id,
-            peer_id: Some(REMOTE_SERVER_PEER_ID),
+            peer_id: Some(peer_id),
             variant: Some(Variant::State(state)),
         })?;
 
@@ -1019,7 +1146,7 @@ impl HeadlessProject {
         for chunk in content.chunks(CHUNK_SIZE) {
             session.send(proto::CreateImageForPeer {
                 project_id,
-                peer_id: Some(REMOTE_SERVER_PEER_ID),
+                peer_id: Some(peer_id),
                 variant: Some(Variant::Chunk(proto::ImageChunk {
                     image_id: image_id.to_proto(),
                     data: chunk.to_vec(),
@@ -1083,6 +1210,7 @@ impl HeadlessProject {
         message: TypedEnvelope<proto::DownloadFileByPath>,
         mut cx: AsyncApp,
     ) -> Result<proto::DownloadFileResponse> {
+        let peer_id = message.original_sender_id.unwrap_or(message.sender_id);
         log::debug!(
             "handle_download_file_by_path: received request: {:?}",
             message.payload
@@ -1136,7 +1264,7 @@ impl HeadlessProject {
         log::debug!("handle_download_file_by_path: sending State message");
         session.send(proto::CreateFileForPeer {
             project_id,
-            peer_id: Some(REMOTE_SERVER_PEER_ID),
+            peer_id: Some(peer_id),
             variant: Some(Variant::State(state)),
         })?;
 
@@ -1155,7 +1283,7 @@ impl HeadlessProject {
             );
             session.send(proto::CreateFileForPeer {
                 project_id,
-                peer_id: Some(REMOTE_SERVER_PEER_ID),
+                peer_id: Some(peer_id),
                 variant: Some(Variant::Chunk(proto::FileChunk {
                     file_id,
                     data: chunk.to_vec(),
@@ -1172,9 +1300,10 @@ impl HeadlessProject {
 
     pub async fn handle_open_new_buffer(
         this: Entity<Self>,
-        _message: TypedEnvelope<proto::OpenNewBuffer>,
+        message: TypedEnvelope<proto::OpenNewBuffer>,
         mut cx: AsyncApp,
     ) -> Result<proto::OpenBufferResponse> {
+        let peer_id = message.original_sender_id.unwrap_or(message.sender_id);
         let (buffer_store, buffer) = this.update(&mut cx, |this, cx| {
             let buffer_store = this.buffer_store.clone();
             let buffer = this.buffer_store.update(cx, |buffer_store, cx| {
@@ -1187,7 +1316,7 @@ impl HeadlessProject {
         let buffer_id = buffer.read_with(&cx, |b, _| b.remote_id());
         buffer_store.update(&mut cx, |buffer_store, cx| {
             buffer_store
-                .create_buffer_for_peer(&buffer, REMOTE_SERVER_PEER_ID, cx)
+                .create_buffer_for_peer(&buffer, peer_id, cx)
                 .detach_and_log_err(cx);
         });
 
@@ -1227,9 +1356,10 @@ impl HeadlessProject {
 
     async fn handle_open_server_settings(
         this: Entity<Self>,
-        _: TypedEnvelope<proto::OpenServerSettings>,
+        message: TypedEnvelope<proto::OpenServerSettings>,
         mut cx: AsyncApp,
     ) -> Result<proto::OpenBufferResponse> {
+        let peer_id = message.original_sender_id.unwrap_or(message.sender_id);
         let settings_path = paths::settings_file();
         let (worktree, path) = this
             .update(&mut cx, |this, cx| {
@@ -1266,7 +1396,7 @@ impl HeadlessProject {
 
             buffer_store.update(cx, |buffer_store, cx| {
                 buffer_store
-                    .create_buffer_for_peer(&buffer, REMOTE_SERVER_PEER_ID, cx)
+                    .create_buffer_for_peer(&buffer, peer_id, cx)
                     .detach_and_log_err(cx);
             });
 
@@ -1430,7 +1560,7 @@ impl HeadlessProject {
         let buffer_store = this.read_with(&cx, |this, _| this.buffer_store.clone());
         let handle = message.handle;
         let _buffer_store = buffer_store.clone();
-        let client = this.read_with(&cx, |this, _| this.session.clone());
+        let client = this.read_with(&cx, |this, _| this.session.for_peer(peer_id))?;
         let task = cx.spawn(async move |cx| {
             let results = this.update(cx, |this, cx| {
                 project::Search::local(
@@ -1472,7 +1602,7 @@ impl HeadlessProject {
             while let Some((buffer, _)) = new_matches.next().await {
                 let _ = buffer_store
                     .update(cx, |this, cx| {
-                        this.create_buffer_for_peer(&buffer, REMOTE_SERVER_PEER_ID, cx)
+                        this.create_buffer_for_peer(&buffer, peer_id, cx)
                     })
                     .await;
                 let buffer_id = buffer.read_with(cx, |this, _| this.remote_id().to_proto());
@@ -1713,6 +1843,7 @@ impl HeadlessProject {
         envelope: TypedEnvelope<proto::SpawnTerminal>,
         mut cx: AsyncApp,
     ) -> Result<proto::SpawnTerminalResponse> {
+        let peer = envelope.original_sender_id.unwrap_or(envelope.sender_id);
         let payload = envelope.payload;
         if let Some(title) = &payload.title {
             anyhow::ensure!(
@@ -1753,7 +1884,13 @@ impl HeadlessProject {
             task_id: payload.task_id,
             title: payload.title,
         };
-        let terminal_id = this.update(&mut cx, |this, _| this.pty_manager.spawn(options))?;
+        let terminal_id = this.update(&mut cx, |this, _| {
+            let id = this.pty_manager.spawn(options)?;
+            if let Some(hub) = &this.hub {
+                hub.own_terminal(id, peer);
+            }
+            anyhow::Ok(id)
+        })?;
         Ok(proto::SpawnTerminalResponse { terminal_id })
     }
 
@@ -1762,6 +1899,12 @@ impl HeadlessProject {
         envelope: TypedEnvelope<proto::TerminalInput>,
         mut cx: AsyncApp,
     ) -> Result<()> {
+        this.read_with(&cx, |this, _| {
+            this.check_terminal_peer(
+                envelope.payload.terminal_id,
+                envelope.original_sender_id.unwrap_or(envelope.sender_id),
+            )
+        })?;
         let proto::TerminalInput {
             terminal_id, data, ..
         } = envelope.payload;
@@ -1773,6 +1916,12 @@ impl HeadlessProject {
         envelope: TypedEnvelope<proto::AckTerminalOutput>,
         mut cx: AsyncApp,
     ) -> Result<()> {
+        this.read_with(&cx, |this, _| {
+            this.check_terminal_peer(
+                envelope.payload.terminal_id,
+                envelope.original_sender_id.unwrap_or(envelope.sender_id),
+            )
+        })?;
         let proto::AckTerminalOutput {
             terminal_id,
             offset,
@@ -1787,6 +1936,12 @@ impl HeadlessProject {
         envelope: TypedEnvelope<proto::ResizeTerminal>,
         mut cx: AsyncApp,
     ) -> Result<()> {
+        this.read_with(&cx, |this, _| {
+            this.check_terminal_peer(
+                envelope.payload.terminal_id,
+                envelope.original_sender_id.unwrap_or(envelope.sender_id),
+            )
+        })?;
         let proto::ResizeTerminal {
             terminal_id,
             cols,
@@ -1807,6 +1962,12 @@ impl HeadlessProject {
         envelope: TypedEnvelope<proto::CloseTerminal>,
         mut cx: AsyncApp,
     ) -> Result<()> {
+        this.read_with(&cx, |this, _| {
+            this.check_terminal_peer(
+                envelope.payload.terminal_id,
+                envelope.original_sender_id.unwrap_or(envelope.sender_id),
+            )
+        })?;
         let terminal_id = envelope.payload.terminal_id;
         // The client's `Drop` legitimately sends a close after the exit path
         // already removed the entry.
@@ -1818,10 +1979,17 @@ impl HeadlessProject {
 
     async fn handle_list_terminals(
         this: Entity<Self>,
-        _envelope: TypedEnvelope<proto::ListTerminals>,
+        envelope: TypedEnvelope<proto::ListTerminals>,
         mut cx: AsyncApp,
     ) -> Result<proto::ListTerminalsResponse> {
-        let terminals = this.update(&mut cx, |this, _| this.pty_manager.list());
+        let peer = envelope.original_sender_id.unwrap_or(envelope.sender_id);
+        let terminals = this.update(&mut cx, |this, _| {
+            this.pty_manager
+                .list()
+                .into_iter()
+                .filter(|terminal| this.check_terminal_peer(terminal.terminal_id, peer).is_ok())
+                .collect()
+        });
         Ok(proto::ListTerminalsResponse { terminals })
     }
 
@@ -1830,6 +1998,12 @@ impl HeadlessProject {
         envelope: TypedEnvelope<proto::AttachTerminal>,
         mut cx: AsyncApp,
     ) -> Result<proto::AttachTerminalResponse> {
+        this.read_with(&cx, |this, _| {
+            this.check_terminal_peer(
+                envelope.payload.terminal_id,
+                envelope.original_sender_id.unwrap_or(envelope.sender_id),
+            )
+        })?;
         let proto::AttachTerminal {
             terminal_id,
             from_offset,
@@ -1850,6 +2024,16 @@ impl HeadlessProject {
             end_offset: outcome.end_offset,
             exit: outcome.exit,
         })
+    }
+
+    fn check_terminal_peer(&self, terminal: u64, peer: proto::PeerId) -> Result<()> {
+        anyhow::ensure!(
+            self.hub
+                .as_ref()
+                .is_none_or(|hub| hub.owns_terminal(terminal, peer)),
+            "terminal belongs to another participant"
+        );
+        Ok(())
     }
 }
 

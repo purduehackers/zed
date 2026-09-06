@@ -73,7 +73,6 @@ function bootConfig(buildId) {
       wsUrl: params.get("ws") ?? "",
       token: sessionToken(),
       sessionId: params.get("session") ?? "",
-      takeover: params.get("takeover") === "1" || params.get("takeover") === "true",
     },
     workspace: { id: params.get("workspace") ?? "dev", paths },
     settingsJson: localStorage.getItem("zs.settings") ?? "",

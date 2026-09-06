@@ -47,9 +47,6 @@ pub struct ConnectInfo {
     pub token: String,
     /// Per-connect session id; never an identity or a persistence key.
     pub session_id: String,
-    /// Close any other attached client with 4001 and attach us (D3).
-    #[serde(default)]
-    pub takeover: bool,
     /// The server build the control plane expects us to meet.
     #[serde(default)]
     pub server_build: Option<String>,
@@ -64,7 +61,6 @@ impl std::fmt::Debug for ConnectInfo {
             .field("ws_url", &self.ws_url)
             .field("token", &"<redacted>")
             .field("session_id", &self.session_id)
-            .field("takeover", &self.takeover)
             .field("server_build", &self.server_build)
             .field("session_expires_at", &self.session_expires_at)
             .finish()
@@ -161,7 +157,7 @@ impl BootStage {
 /// The rejection payload of `start()`; `Stopped` details use the same code vocabulary.
 ///
 /// Codes: `bad_config`, `bad_host`, `bad_assets`, `runtime_missing`, `ctors_missing`,
-/// `settings`, `connect_failed`, `session_busy` (close 4005), `taken_over` (4001),
+/// `settings`, `connect_failed`, `connection_replaced` (close 4001),
 /// `incompatible_server` (4002 / 4006), `server_stopping` (1001), `unauthorized`
 /// (`RefreshError::Unauthorized`), `workspace_stopped` (`RefreshError::Stopped`),
 /// `reconnect_exhausted`, `database`, `window`, `boot_timeout`, `cancelled`, `quit`.
@@ -250,7 +246,6 @@ mod tests {
         assert_eq!(config.backend, Backend::Auto);
         assert_eq!(config.host_os, None);
         assert_eq!(config.origin, None);
-        assert!(!config.connect.takeover);
         assert!(config.workspace.paths.is_empty());
         assert_eq!(config.workspace.id, "ws_1");
         assert_eq!(config.connect.session_id, "con_1");
@@ -262,7 +257,7 @@ mod tests {
             r#"{
                 "buildId": "abc1234-0",
                 "connect": { "wsUrl": "wss://x/rpc", "token": "t", "sessionId": "con_1",
-                             "takeover": true, "serverBuild": "abc1234-0",
+                             "serverBuild": "abc1234-0",
                              "sessionExpiresAt": "2026-09-03T00:00:00Z" },
                 "workspace": { "id": "ws_1", "paths": ["/workspaces/repo"] },
                 "settingsJson": "{}", "keymapJson": "[]", "backend": "webgl", "hostOs": "windows",
@@ -270,7 +265,6 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert!(config.connect.takeover);
         assert_eq!(config.backend, Backend::WebGl);
         assert_eq!(config.host_os.as_deref(), Some("windows"));
         assert_eq!(config.origin.as_deref(), Some("https://zs.example.com"));

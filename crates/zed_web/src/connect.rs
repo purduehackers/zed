@@ -38,7 +38,6 @@ pub async fn connect(
         info.session_id.clone(),
         info.token.clone(),
     )
-    .with_takeover(info.takeover)
     .with_refresh(refresh);
 
     // The transport reports every dial through `set_status`: the first one is the boot's
@@ -167,9 +166,8 @@ pub fn observe(remote: Entity<RemoteClient>, store: Entity<ClientStateStore>, cx
 
 /// The `stopped` detail (also the boot-error code) for a terminal close, per D23's close
 /// codes as b1/b2 emit them; the second value says whether the outcome is terminal (as
-/// opposed to a failed first dial that a reload may fix). The names are CONTRACTS §8.4's
-/// (`taken_over`, `session_busy`, `incompatible_server`, `server_stopping`), which the shell
-/// accepts beside D23's `close_code_detail` spellings; the test hooks report these.
+/// opposed to a failed first dial that a reload may fix). The shell and test hooks
+/// use these same detail codes.
 pub(crate) fn close_code_detail(
     close: Option<&CloseInfo>,
     refresh: Option<RefreshErrorKind>,
@@ -180,10 +178,14 @@ pub(crate) fn close_code_detail(
         // D2: terminal; the transport synthesizes `CloseInfo { 4003 }`.
         (Some(RefreshErrorKind::Unauthorized), _) => ("unauthorized", true),
         (_, Some(websocket_wire::CLOSE_UNAUTHORIZED)) => ("unauthorized", true),
-        // D23: superseded by a takeover (or a stale epoch).
-        (_, Some(websocket_wire::CLOSE_TAKEN_OVER)) => ("taken_over", true),
-        // D23: session active, no takeover requested.
-        (_, Some(websocket_wire::CLOSE_SESSION_ACTIVE)) => ("session_busy", true),
+        // This participant reloaded elsewhere, or its replay epoch expired.
+        (_, Some(websocket_wire::CLOSE_TAKEN_OVER))
+            if close
+                .is_some_and(|close| close.reason == websocket_wire::CLOSE_REASON_STALE_EPOCH) =>
+        {
+            ("rejoin_required", true)
+        }
+        (_, Some(websocket_wire::CLOSE_TAKEN_OVER)) => ("connection_replaced", true),
         // D23: build mismatch or a malformed Hello.
         (_, Some(websocket_wire::CLOSE_BUILD_MISMATCH))
         | (_, Some(websocket_wire::CLOSE_BAD_HELLO)) => ("incompatible_server", true),

@@ -5,7 +5,7 @@ use dap::adapters::DebugAdapterName;
 use fs::Fs;
 use futures::StreamExt as _;
 use git::repository::DEFAULT_WORKTREE_DIRECTORY;
-use gpui::{AsyncApp, BorrowAppContext, Context, Entity, EventEmitter, Subscription, Task};
+use gpui::{App, AsyncApp, BorrowAppContext, Context, Entity, EventEmitter, Subscription, Task};
 use lsp::{DEFAULT_LSP_REQUEST_TIMEOUT_SECS, LanguageServerName};
 use paths::{
     EDITORCONFIG_NAME, debug_task_file_name, local_debug_file_relative_path,
@@ -1031,7 +1031,12 @@ impl SettingsObserver {
     ) {
         self.project_id = project_id;
         self.downstream_client = Some(downstream_client.clone());
+        self.send_initial_state(&downstream_client, cx);
+    }
 
+    /// Replay settings to a joining participant without replacing the shared observer.
+    pub fn send_initial_state(&self, downstream_client: &AnyProtoClient, cx: &App) {
+        let project_id = self.project_id;
         let store = cx.global::<SettingsStore>();
         for worktree in self.worktree_store.read(cx).worktrees() {
             let worktree_id = worktree.read(cx).id().to_proto();

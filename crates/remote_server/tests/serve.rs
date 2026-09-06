@@ -26,8 +26,8 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use remote::{
     protocol::{decode_envelope_frame, encode_envelope_frame},
     websocket_wire::{
-        CLOSE_GOING_AWAY, CLOSE_SESSION_ACTIVE, CLOSE_TAKEN_OVER, ClientKind, ControlFrame, Hello,
-        HelloAck, MAX_FRAME_BYTES, PROTOCOL_VERSION, SUBPROTOCOL,
+        CLOSE_GOING_AWAY, ClientKind, ControlFrame, Hello, HelloAck, MAX_FRAME_BYTES,
+        PROTOCOL_VERSION, SUBPROTOCOL,
     },
 };
 use rpc::proto::{self, Envelope, EnvelopedMessage as _};
@@ -79,6 +79,7 @@ struct Claims {
     sub: String,
     ws: String,
     sid: String,
+    pid: String,
     aud: String,
     iat: u64,
     exp: u64,
@@ -98,6 +99,7 @@ fn mint(sid: &str) -> String {
         sub: "user_1".into(),
         ws: WORKSPACE_ID.into(),
         sid: sid.into(),
+        pid: format!("p_{:032x}", sid.bytes().map(u64::from).sum::<u64>()),
         aud: AUDIENCE.into(),
         iat: now(),
         exp: now() + 3600,
@@ -117,6 +119,7 @@ fn mint_expired(sid: &str) -> String {
         sub: "user_1".into(),
         ws: WORKSPACE_ID.into(),
         sid: sid.into(),
+        pid: format!("p_{:032x}", sid.bytes().map(u64::from).sum::<u64>()),
         aud: AUDIENCE.into(),
         iat: now() - 7200,
         exp: now() - 3600,
@@ -324,7 +327,6 @@ impl Client {
         session_id: &str,
         instance: &str,
         reconnect: bool,
-        takeover: bool,
         epoch: Option<u64>,
     ) {
         let hello = Hello {
@@ -335,7 +337,6 @@ impl Client {
             identifier: format!("setup-{instance}"),
             instance: instance.into(),
             reconnect,
-            takeover,
             client: ClientKind::Web,
             epoch,
         };
@@ -370,8 +371,16 @@ impl Client {
             let frame = self.next_frame().await.expect("frame");
             match frame.opcode() {
                 OpCode::Binary => {
-                    return decode_envelope_frame(frame.payload(), MAX_FRAME_BYTES)
-                        .expect("envelope");
+                    let envelope =
+                        decode_envelope_frame(frame.payload(), MAX_FRAME_BYTES).expect("envelope");
+                    if envelope.responding_to.is_some()
+                        || matches!(
+                            envelope.payload,
+                            Some(proto::envelope::Payload::RemoteStarted(_))
+                        )
+                    {
+                        return envelope;
+                    }
                 }
                 OpCode::Close => panic!("socket closed while waiting for an envelope"),
                 _ => continue,
@@ -558,7 +567,7 @@ async fn serve_end_to_end() {
     // 3-6. Handshake.
     let token_1 = mint("ses_1");
     let mut first = Client::connect(server.public, &token_1).await;
-    first.hello("ses_1", "inst_1", false, false, None).await;
+    first.hello("ses_1", "inst_1", false, None).await;
     let ack = first.hello_ack().await;
     assert!(!ack.resumed);
     assert_eq!(ack.session_id, "ses_1");
@@ -666,61 +675,44 @@ async fn serve_end_to_end() {
         .await;
     assert_eq!(first.next_envelope().await.responding_to, Some(3));
 
-    // 10. Takeover, busy and stale epoch.
-    let token_2 = mint("ses_2");
-    let mut second = Client::connect(server.public, &token_2).await;
-    second.hello("ses_2", "inst_2", false, true, None).await;
+    // A second signed participant gets an independent replica and RPC sequence.
+    let mut second = Client::connect(server.public, &mint("ses_2")).await;
+    second.hello("ses_2", "inst_2", false, None).await;
     let second_ack = second.hello_ack().await;
     assert!(!second_ack.resumed);
-    assert!(second_ack.epoch > epoch_1);
+    assert_eq!(second_ack.replica_id, 9);
     assert_eq!(second.next_envelope().await.id, 0);
-    let (code, _) = first.wait_for_close().await;
-    assert_eq!(code, CLOSE_TAKEN_OVER);
-
-    let mut third = Client::connect(server.public, &mint("ses_3")).await;
-    third.hello("ses_3", "inst_3", false, false, None).await;
-    let (code, _) = third.wait_for_close().await;
-    assert_eq!(code, CLOSE_SESSION_ACTIVE);
-
-    let mut fourth = Client::connect(server.public, &mint("ses_4")).await;
-    fourth
-        .hello("ses_4", "inst_1", true, false, Some(epoch_1))
+    second
+        .send_envelope(&proto::RemoteStarted {}.into_envelope(0, None, None))
         .await;
-    let (code, reason) = fourth.wait_for_close().await;
-    assert_eq!(code, CLOSE_TAKEN_OVER);
-    assert_eq!(reason, "stale epoch");
-
+    assert_eq!(second.next_envelope().await.responding_to, Some(0));
+    first
+        .send_envelope(&proto::Ping {}.into_envelope(4, None, None))
+        .await;
     second
         .send_envelope(&proto::Ping {}.into_envelope(1, None, None))
         .await;
+    assert_eq!(first.next_envelope().await.responding_to, Some(4));
     assert_eq!(second.next_envelope().await.responding_to, Some(1));
 
-    // 11. ShutdownRemoteServer closes the session, not the process.
+    // A browser's shutdown request cannot terminate the shared host.
     second
         .send_envelope(&proto::ShutdownRemoteServer {}.into_envelope(2, None, None))
         .await;
-    let shutdown_ack = second.next_envelope().await;
-    assert_eq!(shutdown_ack.responding_to, Some(2));
-    let (code, _) = second.wait_for_close().await;
-    assert_eq!(code, 1000);
+    assert_eq!(second.next_envelope().await.responding_to, Some(2));
+    second
+        .send_envelope(&proto::Ping {}.into_envelope(3, None, None))
+        .await;
+    assert_eq!(second.next_envelope().await.responding_to, Some(3));
     assert_eq!(
         request(server.public, get("/health")).await.status,
         StatusCode::OK
     );
-
-    // 12. Reattach, then SIGTERM.
-    let mut fifth = Client::connect(server.public, &mint("ses_5")).await;
-    fifth
-        .hello("ses_5", "inst_2", true, false, Some(second_ack.epoch))
-        .await;
-    let resumed = fifth.hello_ack().await;
-    assert!(resumed.resumed);
-    assert_eq!(resumed.epoch, second_ack.epoch);
-    assert_eq!(resumed.session_id, "ses_5");
+    drop(first);
 
     let pid = server.child.id();
     unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-    let (code, _) = fifth.wait_for_close().await;
+    let (code, _) = second.wait_for_close().await;
     assert_eq!(code, CLOSE_GOING_AWAY);
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -751,8 +743,8 @@ async fn serve_end_to_end() {
     }
     assert!(
         logs.iter()
-            .any(|line| line.contains("\"session_id\":\"ses_5\"")),
-        "no log line carried the resumed session id"
+            .any(|line| line.contains("\"session_id\":\"ses_2\"")),
+        "no log line carried the participant session id"
     );
 }
 

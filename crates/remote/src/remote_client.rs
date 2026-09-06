@@ -30,6 +30,7 @@ use gpui::{
     EventEmitter, FutureExt, Global, Task, TaskExt, WeakEntity,
 };
 use parking_lot::Mutex;
+use prost::Message as _;
 
 use release_channel::ReleaseChannel;
 use rpc::{
@@ -44,7 +45,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Weak,
-        atomic::{AtomicU32, AtomicU64, Ordering::SeqCst},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::SeqCst},
     },
     time::Duration,
 };
@@ -54,6 +55,9 @@ use util::{
 };
 // `std::time::Instant::now()` panics on wasm; `web_time` re-exports `std` on native.
 use web_time::Instant;
+
+mod server_hub;
+pub use server_hub::ServerHub;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RemoteOs {
@@ -1244,12 +1248,8 @@ impl RemoteClient {
         let opts = MockConnectionOptions {
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
         };
-        let (server_client, connect_guard) = MockConnection::new_with_opts_and_remote_pty(
-            opts.clone(),
-            true,
-            client_cx,
-            server_cx,
-        );
+        let (server_client, connect_guard) =
+            MockConnection::new_with_opts_and_remote_pty(opts.clone(), true, client_cx, server_cx);
         (opts.into(), server_client, connect_guard)
     }
 
@@ -1813,6 +1813,10 @@ pub struct OpenWslPath {
 
 #[async_trait(?Send)]
 pub trait RemoteConnection: Send + Sync {
+    /// SSH has one remote replica; a sandbox hub assigns a distinct collaborative one.
+    fn replica_id(&self) -> u16 {
+        1
+    }
     fn start_proxy(
         &self,
         unique_identifier: String,
@@ -1879,10 +1883,7 @@ pub trait RemoteConnection: Send + Sync {
 
 /// Resolves with whichever future completes first, dropping the other. Replaces
 /// `smol::future::or`, which the browser build's `smol` shim does not provide.
-async fn first_to_finish<T>(
-    left: impl Future<Output = T>,
-    right: impl Future<Output = T>,
-) -> T {
+async fn first_to_finish<T>(left: impl Future<Output = T>, right: impl Future<Output = T>) -> T {
     let left = std::pin::pin!(left);
     let right = std::pin::pin!(right);
     match futures::future::select(left, right).await {
@@ -1892,7 +1893,8 @@ async fn first_to_finish<T>(
     }
 }
 
-type ResponseChannels = Mutex<HashMap<MessageId, oneshot::Sender<(Envelope, oneshot::Sender<()>)>>>;
+type ResponseChannels =
+    Arc<Mutex<HashMap<MessageId, oneshot::Sender<(Envelope, oneshot::Sender<()>)>>>>;
 type StreamResponseChannels =
     Arc<Mutex<HashMap<MessageId, UnboundedSender<(Result<Envelope>, oneshot::Sender<()>)>>>>;
 
@@ -1942,7 +1944,19 @@ pub struct ServerChannel {
     client: Arc<ChannelClient>,
 }
 
+impl fmt::Debug for ServerChannel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerChannel")
+            .field("peer", &self.client.peer_id)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ServerChannel {
+    /// An overflowed participant must take a new snapshot, never replay a gap.
+    pub fn replay_healthy(&self) -> bool {
+        !self.client.replay_overflow.load(SeqCst)
+    }
     /// The client as the `AnyProtoClient` the headless project is built on.
     pub fn proto_client(&self) -> AnyProtoClient {
         self.client.clone().into()
@@ -1956,8 +1970,16 @@ impl ServerChannel {
         let Some(index) = buffer.iter().position(|envelope| envelope.id == id) else {
             return false;
         };
+        self.client
+            .replay_bytes
+            .fetch_sub(buffer[index].encoded_len(), SeqCst);
         match replacement {
-            Some(replacement) => buffer[index] = replacement,
+            Some(replacement) => {
+                self.client
+                    .replay_bytes
+                    .fetch_add(replacement.encoded_len(), SeqCst);
+                buffer[index] = replacement;
+            }
             None => {
                 buffer.remove(index);
             }
@@ -1980,7 +2002,12 @@ impl ServerChannel {
         // makes their late responses drop instead of reaching the new client's requests,
         // whose ids restart at 0 and would otherwise collide.
         client.generation.fetch_add(1, SeqCst);
-        client.buffer.lock().clear();
+        {
+            let mut buffer = client.buffer.lock();
+            buffer.clear();
+            client.replay_bytes.store(0, SeqCst);
+            client.replay_overflow.store(false, SeqCst);
+        }
         client.max_received.store(0, SeqCst);
         client.response_channels.lock().clear();
         client.stream_response_channels.lock().clear();
@@ -1996,9 +2023,13 @@ pub(crate) struct ChannelClient {
     next_message_id: AtomicU32,
     outgoing_tx: Mutex<mpsc::UnboundedSender<Envelope>>,
     buffer: Mutex<VecDeque<Envelope>>,
+    replay_bytes: AtomicUsize,
+    replay_overflow: AtomicBool,
     response_channels: ResponseChannels,
     stream_response_channels: StreamResponseChannels,
-    message_handlers: Mutex<ProtoMessageHandlerSet>,
+    message_handlers: Arc<Mutex<ProtoMessageHandlerSet>>,
+    /// Authenticated sender assigned by the sandbox hub, never by the wire envelope.
+    peer_id: Option<PeerId>,
     max_received: AtomicU32,
     /// Bumped by `ServerChannel::begin_fresh_session`; a handler dispatched under an older
     /// generation answers a client that is gone, so its response is dropped.
@@ -2096,6 +2127,26 @@ impl ChannelClient {
         name: &'static str,
         has_wsl_interop: bool,
     ) -> Arc<Self> {
+        Self::new_for_peer(
+            incoming_rx,
+            outgoing_tx,
+            cx,
+            name,
+            has_wsl_interop,
+            None,
+            Arc::default(),
+        )
+    }
+
+    fn new_for_peer(
+        incoming_rx: mpsc::UnboundedReceiver<Envelope>,
+        outgoing_tx: mpsc::UnboundedSender<Envelope>,
+        cx: &App,
+        name: &'static str,
+        has_wsl_interop: bool,
+        peer_id: Option<PeerId>,
+        message_handlers: Arc<Mutex<ProtoMessageHandlerSet>>,
+    ) -> Arc<Self> {
         Arc::new_cyclic(|this| Self {
             outgoing_tx: Mutex::new(outgoing_tx),
             next_message_id: AtomicU32::new(0),
@@ -2103,8 +2154,11 @@ impl ChannelClient {
             generation: AtomicU64::new(0),
             response_channels: ResponseChannels::default(),
             stream_response_channels: StreamResponseChannels::default(),
-            message_handlers: Default::default(),
+            message_handlers,
+            peer_id,
             buffer: Mutex::new(VecDeque::new()),
+            replay_bytes: AtomicUsize::new(0),
+            replay_overflow: AtomicBool::new(false),
             name,
             executor: cx.background_executor().clone(),
             task: Mutex::new(Self::start_handling_messages(
@@ -2209,14 +2263,19 @@ impl ChannelClient {
             };
 
             let peer_id = PeerId { owner_id: 0, id: 0 };
-            while let Some(incoming) = incoming_rx.next().await {
+            while let Some(mut incoming) = incoming_rx.next().await {
                 let Some(this) = this.upgrade() else {
                     return anyhow::Ok(());
                 };
+                if let Some(peer) = this.peer_id {
+                    incoming.original_sender_id = Some(peer);
+                }
                 if let Some(ack_id) = incoming.ack_id {
                     let mut buffer = this.buffer.lock();
                     while buffer.front().is_some_and(|msg| msg.id <= ack_id) {
-                        buffer.pop_front();
+                        if let Some(envelope) = buffer.pop_front() {
+                            this.replay_bytes.fetch_sub(envelope.encoded_len(), SeqCst);
+                        }
                     }
                 }
                 if let Some(proto::envelope::Payload::FlushBufferedMessages(_)) = &incoming.payload
@@ -2292,7 +2351,7 @@ impl ChannelClient {
                         }
                     }
                 } else if let Some(envelope) =
-                    build_typed_envelope(peer_id, Instant::now(), incoming)
+                    build_typed_envelope(this.peer_id.unwrap_or(peer_id), Instant::now(), incoming)
                 {
                     #[cfg(target_family = "wasm")]
                     let envelope = match this.hold_until_handlers_exist(envelope) {
@@ -2440,6 +2499,11 @@ impl ChannelClient {
         let mut response_channels_lock = self.response_channels.lock();
         response_channels_lock.insert(MessageId(envelope.id), tx);
         drop(response_channels_lock);
+        let response_channels = self.response_channels.clone();
+        let message_id = MessageId(envelope.id);
+        let cleanup = util::defer(move || {
+            response_channels.lock().remove(&message_id);
+        });
 
         let result = if use_buffer {
             self.send_buffered(envelope)
@@ -2447,6 +2511,7 @@ impl ChannelClient {
             self.send_unbuffered(envelope)
         };
         async move {
+            let _cleanup = cleanup;
             if let Err(error) = &result {
                 log::error!("failed to send message: {error}");
                 anyhow::bail!("failed to send message: {error}");
@@ -2516,7 +2581,22 @@ impl ChannelClient {
 
     fn send_buffered(&self, mut envelope: proto::Envelope) -> Result<()> {
         envelope.ack_id = Some(self.max_received.load(SeqCst));
-        self.buffer.lock().push_back(envelope.clone());
+        let mut buffer = self.buffer.lock();
+        let bytes = envelope.encoded_len();
+        if self.peer_id.is_some_and(|peer| peer.id >= 8) {
+            // Bound disconnected/slow participants independently. The broker closes only
+            // this peer and refuses warm replay until a fresh snapshot resets its channel.
+            if self.replay_overflow.load(SeqCst)
+                || buffer.len() >= 4096
+                || self.replay_bytes.load(SeqCst).saturating_add(bytes) > 16 * 1024 * 1024
+            {
+                self.replay_overflow.store(true, SeqCst);
+                anyhow::bail!("participant replay buffer full; fresh snapshot required");
+            }
+        }
+        self.replay_bytes.fetch_add(bytes, SeqCst);
+        buffer.push_back(envelope.clone());
+        drop(buffer);
         // ignore errors on send (happen while we're reconnecting)
         // assume that the global "disconnected" overlay is sufficient.
         self.outgoing_tx.lock().unbounded_send(envelope).ok();

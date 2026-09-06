@@ -43,6 +43,7 @@ fn init_test(cx: &mut TestAppContext) {
 
 fn hello_ack(resumed: bool, epoch: u64) -> HelloAck {
     HelloAck {
+        replica_id: 8,
         protocol: PROTOCOL_VERSION,
         build: "dev-fake-server".into(),
         os: "linux".into(),
@@ -486,8 +487,7 @@ fn options_for(server: &FakeServer, session_id: &str, token: &str) -> WebSocketC
 
 #[test]
 fn options_identity_serialization_and_debug() {
-    let a = WebSocketConnectionOptions::new("wss://a.example/rpc", "ws_1", "sess_1", "secret-a")
-        .with_takeover(true);
+    let a = WebSocketConnectionOptions::new("wss://a.example/rpc", "ws_1", "sess_1", "secret-a");
     let b = WebSocketConnectionOptions::new("wss://b.example/rpc", "ws_1", "sess_2", "secret-b");
     let c = WebSocketConnectionOptions::new("wss://a.example/rpc", "ws_2", "sess_1", "secret-a");
     assert_eq!(a, b);
@@ -505,13 +505,11 @@ fn options_identity_serialization_and_debug() {
     assert!(json.contains("ws_1"), "{json}");
     assert!(!json.contains("sess_1"), "{json}");
     assert!(!json.contains("secret-a"), "{json}");
-    assert!(!json.contains("takeover"), "{json}");
     assert!(!json.contains("refresh"), "{json}");
     let restored: WebSocketConnectionOptions = serde_json::from_str(&json).unwrap();
     assert_eq!(restored.workspace_id, "ws_1");
     assert!(restored.session_id.is_empty());
     assert!(restored.token.is_empty());
-    assert!(!restored.takeover);
     assert!(restored.refresh.is_none());
     assert!(restored.state.is_none());
 
@@ -712,10 +710,9 @@ fn close_code_mapping() {
     };
     assert_eq!(exit_code_for_close(&close(1001)).unwrap(), 90);
     assert_eq!(exit_code_for_close(&close(4001)).unwrap(), 91);
-    assert_eq!(exit_code_for_close(&close(4005)).unwrap(), 91);
     assert_eq!(exit_code_for_close(&close(4002)).unwrap(), 92);
     assert_eq!(exit_code_for_close(&close(4006)).unwrap(), 92);
-    for code in [1000, 1006, 1008, 1009, 4003, 4004, 4999] {
+    for code in [1000, 1006, 1008, 1009, 4003, 4004, 4005, 4999] {
         assert!(exit_code_for_close(&close(code)).is_err(), "{code}");
     }
     // D23 folds the stale-epoch refusal into 4001; only the reason tells it apart, and it
@@ -744,6 +741,12 @@ fn close_code_mapping() {
         Some(90)
     );
     let mut wrong_protocol = hello_ack(true, 1);
+    wrong_protocol.replica_id = 1;
+    assert_eq!(
+        exit_code_for_hello_ack("b", false, &wrong_protocol),
+        Some(92)
+    );
+    wrong_protocol.replica_id = 8;
     wrong_protocol.protocol = 2;
     assert_eq!(
         exit_code_for_hello_ack("b", false, &wrong_protocol),
@@ -770,7 +773,6 @@ fn hello_composition() {
         "ws_1",
         "setup-1".into(),
         false,
-        true,
         "build-1".into(),
     )
     .unwrap();
@@ -778,7 +780,6 @@ fn hello_composition() {
     assert_eq!(hello.instance, state.instance);
     assert_eq!(hello.workspace_id, "ws_1");
     assert_eq!(hello.session_id, "sess_1");
-    assert!(hello.takeover);
     assert!(!hello.reconnect);
     assert_eq!(hello.epoch, None);
     assert_eq!(hello.protocol, PROTOCOL_VERSION);
@@ -795,7 +796,6 @@ fn hello_composition() {
         "ws_1",
         "setup-1".into(),
         true,
-        false,
         "build-1".into(),
     )
     .unwrap();
@@ -808,7 +808,6 @@ fn hello_composition() {
         other_tab.state.as_ref().unwrap(),
         "ws_1",
         "setup-1".into(),
-        false,
         false,
         "build-1".into(),
     )
@@ -988,7 +987,6 @@ async fn test_handshake_and_token_placement(cx: &mut TestAppContext) {
     let hello = fake_connection.expect_hello().await;
     assert_eq!(hello.protocol, PROTOCOL_VERSION);
     assert!(!hello.reconnect);
-    assert!(!hello.takeover);
     assert_eq!(hello.epoch, None);
     assert_eq!(hello.workspace_id, "ws_1");
     assert_eq!(hello.session_id, "sess_1");
@@ -1188,12 +1186,6 @@ async fn assert_terminal_close(cx: &mut TestAppContext, code: u16, reason: &str)
 async fn test_superseded_is_terminal(cx: &mut TestAppContext) {
     init_test(cx);
     assert_terminal_close(cx, 4001, "taken over").await;
-}
-
-#[gpui::test]
-async fn test_session_active_is_terminal(cx: &mut TestAppContext) {
-    init_test(cx);
-    assert_terminal_close(cx, 4005, "session active").await;
 }
 
 #[gpui::test]

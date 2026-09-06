@@ -36,6 +36,9 @@ pub const MAX_TOKEN_BYTES: usize = 4096;
 /// deserialization; only `ws`, `aud`, `iss`, `exp` and `iat` are validated.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Claims {
+    /// Stable, signed anonymous participant identity. Older app releases omit it.
+    #[serde(default)]
+    pub pid: Option<String>,
     /// Issuer; must equal `--issuer`.
     pub iss: String,
     /// User id.

@@ -33,7 +33,7 @@ pub const CLOSE_GOING_AWAY: u16 = 1001;
 pub const CLOSE_POLICY_VIOLATION: u16 = 1008;
 /// Frame over [`MAX_FRAME_BYTES`].
 pub const CLOSE_FRAME_TOO_LARGE: u16 = 1009;
-/// Superseded: another client attached with `takeover = true`, a same-instance redial replaced
+/// Superseded: the participant reloaded, a same-instance redial replaced
 /// this socket, or the server rejected a stale epoch (reason [`CLOSE_REASON_STALE_EPOCH`]).
 pub const CLOSE_TAKEN_OVER: u16 = 4001;
 /// Close reason the server sends with [`CLOSE_TAKEN_OVER`] when it refuses a reconnect whose
@@ -46,8 +46,6 @@ pub const CLOSE_BUILD_MISMATCH: u16 = 4002;
 /// Unauthorized after the upgrade. Also synthesized client-side after
 /// `RefreshError::Unauthorized`; the client refreshes and redials on a server-sent one.
 pub const CLOSE_UNAUTHORIZED: u16 = 4003;
-/// Attach refused: another client instance is attached and `takeover = false`.
-pub const CLOSE_SESSION_ACTIVE: u16 = 4005;
 /// No or malformed `Hello` within the server's hello timeout, or a protocol mismatch.
 pub const CLOSE_BAD_HELLO: u16 = 4006;
 
@@ -154,14 +152,11 @@ pub struct Hello {
     pub session_id: String,
     /// The `RemoteClient` unique identifier (`setup-N` / `workspace-N`); informational.
     pub identifier: String,
-    /// Per-boot client-instance nonce (D25). Session arbitration keys on
-    /// `(workspace_id, instance)`: a redial from the same instance supersedes its own
-    /// half-open socket, a different instance without `takeover` is refused with 4005.
+    /// Per-boot nonce within one signed participant. Reloading replaces only that
+    /// participant's connection; other participants have independent brokers.
     pub instance: String,
     /// `start_proxy`'s `reconnect` flag: `true` when resuming an existing session.
     pub reconnect: bool,
-    /// Ask the server to close any other attached client with 4001 and attach us.
-    pub takeover: bool,
     /// Which kind of client this is.
     pub client: ClientKind,
     /// On `reconnect`, the [`HelloAck::epoch`] of the attachment being resumed. The server
@@ -183,6 +178,8 @@ pub enum ClientKind {
 /// The server's first frame after a successful [`Hello`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HelloAck {
+    /// The sandbox-assigned Zed CRDT replica for this participant.
+    pub replica_id: u16,
     /// [`PROTOCOL_VERSION`].
     pub protocol: u32,
     /// The server build id.
@@ -268,7 +265,6 @@ mod tests {
             identifier: "setup-1".into(),
             instance: "1a2b-1".into(),
             reconnect: false,
-            takeover: false,
             client: ClientKind::Web,
             epoch: None,
         });
@@ -279,6 +275,7 @@ mod tests {
         assert_eq!(serde_json::from_str::<ControlFrame>(&json).unwrap(), hello);
 
         let ack = ControlFrame::HelloAck(HelloAck {
+            replica_id: 8,
             protocol: PROTOCOL_VERSION,
             build: "abc-1".into(),
             os: "linux".into(),
@@ -315,10 +312,10 @@ mod tests {
 
         assert!(serde_json::from_str::<ControlFrame>(r#"{"type":"bogus"}"#).is_err());
 
-        let without_workspace_id = r#"{"type":"hello","protocol":1,"build":"b","session_id":"s","identifier":"i","instance":"n","reconnect":false,"takeover":false,"client":"desktop","epoch":null}"#;
+        let without_workspace_id = r#"{"type":"hello","protocol":1,"build":"b","session_id":"s","identifier":"i","instance":"n","reconnect":false,"client":"desktop","epoch":null}"#;
         assert!(serde_json::from_str::<ControlFrame>(without_workspace_id).is_err());
 
-        let with_epoch = r#"{"type":"hello","protocol":1,"build":"b","workspace_id":"w","session_id":"s","identifier":"i","instance":"n","reconnect":true,"takeover":false,"client":"desktop","epoch":7}"#;
+        let with_epoch = r#"{"type":"hello","protocol":1,"build":"b","workspace_id":"w","session_id":"s","identifier":"i","instance":"n","reconnect":true,"client":"desktop","epoch":7}"#;
         match serde_json::from_str::<ControlFrame>(with_epoch).unwrap() {
             ControlFrame::Hello(hello) => assert_eq!(hello.epoch, Some(7)),
             other => panic!("unexpected frame {other:?}"),
@@ -339,7 +336,6 @@ mod tests {
         assert_eq!(CLOSE_TAKEN_OVER, 4001);
         assert_eq!(CLOSE_BUILD_MISMATCH, 4002);
         assert_eq!(CLOSE_UNAUTHORIZED, 4003);
-        assert_eq!(CLOSE_SESSION_ACTIVE, 4005);
         assert_eq!(CLOSE_BAD_HELLO, 4006);
         assert_eq!(HEARTBEAT_INTERVAL_SECS, 5);
         assert_eq!(MAX_FRAME_BYTES, 16 * 1024 * 1024);

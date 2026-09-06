@@ -242,6 +242,7 @@ pub fn install() {
     hook1(&hooks, "bufferText", buffer_text);
     hook1(&hooks, "bufferSyntax", buffer_syntax);
     hook0(&hooks, "commandPaletteVisible", command_palette_visible);
+    hook0(&hooks, "collaborationStatus", collaboration_status);
     hook0(&hooks, "activeBufferText", active_buffer_text);
     hook1(&hooks, "insertText", insert_text);
     hook0(&hooks, "moveCursorEnd", move_cursor_end);
@@ -774,6 +775,46 @@ async fn command_palette_visible() -> Result<JsValue> {
             .active_modal::<command_palette::CommandPalette>(cx)
             .is_some()
     })))
+}
+
+async fn collaboration_status() -> Result<JsValue> {
+    let (mut cx, window, workspace) = app_window()?;
+    let (replica, peers, selections) = window.update(&mut cx, |_, window, cx| {
+        let project = workspace.read(cx).project().clone();
+        let replica = project.read(cx).replica_id().as_u16();
+        let peers = project
+            .read(cx)
+            .collaborators()
+            .values()
+            .map(|peer| peer.replica_id.as_u16())
+            .collect::<Vec<_>>();
+        let selections = if let Ok(editor) = active_editor(&workspace, cx) {
+            let snapshot = editor.update(cx, |editor, cx| editor.snapshot(window, cx));
+            snapshot
+                .remote_selections_in_range(
+                    &(editor::Anchor::Min..editor::Anchor::Max),
+                    &project,
+                    cx,
+                )
+                .count()
+        } else {
+            0
+        };
+        (replica, peers, selections)
+    })?;
+    let result = Object::new();
+    set(&result, "replica", JsValue::from_f64(replica as f64));
+    let values = Array::new();
+    for peer in peers {
+        values.push(&JsValue::from_f64(peer as f64));
+    }
+    set(&result, "peers", values);
+    set(
+        &result,
+        "remoteSelections",
+        JsValue::from_f64(selections as f64),
+    );
+    Ok(result.into())
 }
 
 fn active_editor(workspace: &Entity<Workspace>, cx: &App) -> Result<Entity<Editor>> {

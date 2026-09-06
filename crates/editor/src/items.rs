@@ -1381,14 +1381,32 @@ impl SerializableItem for Editor {
 
                 match opened_buffer {
                     Some(opened_buffer) => window.spawn(cx, async move |cx| {
-                        let (_, buffer) = opened_buffer
+                        let (_, mut buffer) = opened_buffer
                             .await
                             .context("Failed to open path in project")?;
 
                         if let Some(contents) = contents {
-                            buffer.update(cx, |buffer, cx| {
-                                restore_serialized_buffer_contents(buffer, contents, mtime, cx);
-                            });
+                            if project.read_with(cx, |project, _| project.is_shared_sandbox()) {
+                                let recovered = project
+                                    .update(cx, |project, cx| {
+                                        project.restore_shared_buffer_snapshot(
+                                            buffer.clone(),
+                                            contents,
+                                            mtime,
+                                            cx,
+                                        )
+                                    })
+                                    .await?;
+                                if let Some(path) = recovered {
+                                    buffer = project
+                                        .update(cx, |project, cx| project.open_buffer(path, cx))
+                                        .await?;
+                                }
+                            } else {
+                                buffer.update(cx, |buffer, cx| {
+                                    restore_serialized_buffer_contents(buffer, contents, mtime, cx);
+                                });
+                            }
                         }
 
                         cx.update(|window, cx| {

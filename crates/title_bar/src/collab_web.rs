@@ -1,19 +1,39 @@
-//! Browser stand-ins for the collaboration surface of the title bar. Calls, channels and
-//! screen sharing are desktop-only (BUILD-SPEC 3.2), so the browser build renders nothing
-//! where the desktop draws the collaborator list and call controls.
+//! Anonymous sandbox participants. No account, call or channel service is involved.
 
 use gpui::{AnyElement, Context, Empty, IntoElement, Window};
+use ui::prelude::*;
 
 use crate::TitleBar;
 
 impl TitleBar {
-    /// No collaborators in the browser: renders nothing.
+    /// Keep presence inside Zed's title bar, without restoring the HTML status strip.
     pub(crate) fn render_collaborator_list(
         &self,
         _: &mut Window,
-        _: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        Empty
+        let project = self.project.read(cx);
+        let mut participants = project.collaborators().values().collect::<Vec<_>>();
+        participants.sort_by_key(|peer| peer.replica_id);
+        let own = project.replica_id();
+        let count = participants.len();
+        h_flex()
+            .gap_2()
+            .children(participants.into_iter().take(5).map(|peer| {
+                let index = peer.replica_id.as_u16().saturating_sub(8) as u32;
+                Label::new(format!(
+                    "Guest {}{}",
+                    index + 1,
+                    if peer.replica_id == own { " (you)" } else { "" }
+                ))
+                .size(LabelSize::Small)
+                .color(Color::Custom(
+                    cx.theme().players().color_for_participant(index).cursor,
+                ))
+            }))
+            .when(count > 5, |row| {
+                row.child(Label::new(format!("+{}", count - 5)).size(LabelSize::Small))
+            })
     }
 
     /// No call controls in the browser: renders nothing.

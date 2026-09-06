@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod files;
 pub mod http;
+mod multiplayer;
 pub mod session;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -24,7 +25,7 @@ use gpui_tokio::Tokio;
 use http_client::{HttpClient, HttpClientWithUrl};
 use language::Buffer;
 use project::{buffer_store::BufferStoreEvent, worktree_store::WorktreeStoreEvent};
-use remote::{RemoteClient, ServerChannel, json_log::LogRecord};
+use remote::{ServerChannel, ServerHub, json_log::LogRecord};
 use reqwest_client::ReqwestClient;
 use rpc::AnyProtoClient;
 use util::ResultExt as _;
@@ -39,9 +40,7 @@ use http::{
     CONTROL_EXTENSIONS_PATH, CONTROL_LIFECYCLE_PATH, CONTROL_PORTS_PATH, ControlRequest,
     ControlResponse, ControlRoutes, ServeConfig, ServeState,
 };
-use session::{
-    BrokerCommand, LOG_FRAME_MAX_LEVEL, ServeHooks, SessionBroker, SessionKind, SessionMeta,
-};
+use session::{BrokerCommand, LOG_FRAME_MAX_LEVEL, SessionKind};
 
 pub use crate::ports::DEFAULT_SUPERVISOR_URL;
 /// Default bind address of the loopback control listener (D21).
@@ -109,18 +108,18 @@ pub struct ServeArgs {
 /// Commands the tokio side sends to the gpui foreground task.
 #[derive(Debug)]
 pub enum GpuiCommand {
-    /// Broker, fresh attach: reset the project and hand the channel client a new pair.
-    ResetForFreshSession {
-        /// Receives the broker's new channel ends.
+    JoinParticipant {
+        peer: rpc::proto::PeerId,
+        participant: String,
+        done: futures::channel::oneshot::Sender<(ServerChannel, remote::ChannelEnds)>,
+    },
+    ResetParticipant {
+        peer: rpc::proto::PeerId,
+        channel: ServerChannel,
         done: futures::channel::oneshot::Sender<remote::ChannelEnds>,
     },
-    /// Broker, after every attach.
-    SessionAttached {
-        /// How the session attached.
-        kind: SessionKind,
-    },
-    /// Broker, after every session-task exit.
-    SessionDetached,
+    ParticipantAttached(rpc::proto::PeerId),
+    ParticipantDetached(rpc::proto::PeerId),
     /// `/files` upload, after its renames: absolute paths under the workspace root.
     FilesUploaded(Vec<PathBuf>),
     /// `/extensions/{id}/assets/{rel}`: resolve an installed extension's asset path.
@@ -603,51 +602,6 @@ fn init_logging_serve(args: &ServeArgs) -> Result<()> {
     Ok(())
 }
 
-/// `ServeHooks` over the gpui command channel. The replay buffer is edited directly through
-/// the `ServerChannel` handle (its locks are plain mutexes), so no gpui round trip is needed.
-struct GpuiHooks {
-    tx: mpsc::UnboundedSender<GpuiCommand>,
-    channel: ServerChannel,
-}
-
-impl ServeHooks for GpuiHooks {
-    fn begin_fresh_session(&self) -> BoxFuture<'static, Result<remote::ChannelEnds>> {
-        let (done_tx, done_rx) = futures::channel::oneshot::channel();
-        let sent = self
-            .tx
-            .unbounded_send(GpuiCommand::ResetForFreshSession { done: done_tx })
-            .is_ok();
-        async move {
-            anyhow::ensure!(
-                sent,
-                "gpui command loop is gone; a fresh session cannot reset the project"
-            );
-            done_rx
-                .await
-                .context("gpui command loop dropped the fresh-session reply")
-        }
-        .boxed()
-    }
-
-    fn session_attached(&self, meta: &SessionMeta) {
-        self.tx
-            .unbounded_send(GpuiCommand::SessionAttached { kind: meta.kind })
-            .ok();
-    }
-
-    fn session_detached(&self, _meta: &SessionMeta) {
-        self.tx.unbounded_send(GpuiCommand::SessionDetached).ok();
-    }
-
-    fn replace_buffered(&self, id: u32, replacement: Option<rpc::proto::Envelope>) {
-        self.channel.replace_buffered(id, replacement);
-    }
-
-    fn request_quit(&self) {
-        self.tx.unbounded_send(GpuiCommand::Quit).ok();
-    }
-}
-
 /// Asks the broker to flush and close, then quit; if the broker is gone the quit goes to the
 /// gpui loop directly, so SIGTERM never turns into a no-op that only the supervisor's
 /// SIGKILL resolves.
@@ -673,7 +627,7 @@ async fn shutdown_via_broker(
 /// `ServerChannel::begin_fresh_session`.
 fn spawn_gpui_command_loop(
     project: Entity<HeadlessProject>,
-    server_channel: ServerChannel,
+    hub: Arc<ServerHub>,
     pty: Arc<dyn PtyHooks>,
     project_hooks: Box<dyn ProjectHooks>,
     mut rx: mpsc::UnboundedReceiver<GpuiCommand>,
@@ -682,19 +636,33 @@ fn spawn_gpui_command_loop(
     cx.spawn(async move |cx| {
         while let Some(command) = rx.next().await {
             match command {
-                GpuiCommand::ResetForFreshSession { done } => {
-                    let discarded =
-                        project.update(cx, |project, cx| project.reset_for_new_client(cx));
-                    log::info!(
-                        "project reset for a fresh session ({discarded} dirty buffers discarded)"
-                    );
-                    let ends = server_channel.begin_fresh_session(cx);
-                    done.send(ends).ok();
+                GpuiCommand::JoinParticipant {
+                    peer,
+                    participant,
+                    done,
+                } => {
+                    let joined = cx.update(|cx| {
+                        project.update(cx, |project, cx| {
+                            project.add_participant(peer, &participant, cx)
+                        });
+                        hub.add_peer(peer, cx)
+                    });
+                    done.send(joined).ok();
                 }
-                GpuiCommand::SessionAttached { kind } => {
-                    cx.update(|cx| project_hooks.on_session_attached(&project, kind, cx));
+                GpuiCommand::ResetParticipant {
+                    peer,
+                    channel,
+                    done,
+                } => {
+                    project.update(cx, |project, cx| project.reset_participant(peer, cx));
+                    done.send(channel.begin_fresh_session(cx)).ok();
                 }
-                GpuiCommand::SessionDetached => pty.detach_all(),
+                GpuiCommand::ParticipantAttached(peer) => {
+                    project.update(cx, |project, cx| project.participant_attached(peer, cx));
+                }
+                GpuiCommand::ParticipantDetached(peer) => {
+                    project.update(cx, |project, cx| project.participant_detached(peer, cx));
+                }
                 GpuiCommand::FilesUploaded(paths) => {
                     cx.update(|cx| project_hooks.files_uploaded(&project, paths, cx));
                 }
@@ -779,14 +747,11 @@ fn start_serve(
     broker_rx: tokio::sync::mpsc::UnboundedReceiver<BrokerCommand>,
     gpui_tx: mpsc::UnboundedSender<GpuiCommand>,
     cx: &mut App,
-) -> Result<(AnyProtoClient, ServerChannel, tokio::net::TcpListener)> {
-    let (incoming_tx, incoming_rx) = mpsc::unbounded();
-    let (outgoing_tx, outgoing_rx) = mpsc::unbounded();
+) -> Result<(AnyProtoClient, Arc<ServerHub>, tokio::net::TcpListener)> {
     // `has_wsl_interop` is false by construction: serve only ever runs inside the Linux
     // sandbox, never under WSL, so `run`'s interop probe is not repeated here.
-    let server_channel =
-        RemoteClient::server_channel_from_channels(incoming_rx, outgoing_tx, cx, "server", false);
-    let session = server_channel.proto_client();
+    let hub = ServerHub::new(cx);
+    let session: AnyProtoClient = hub.clone().into();
 
     let public = bind_listener(args.listen, "the public listener")?;
     let control = bind_listener(args.control_listen, "the control listener")?;
@@ -821,24 +786,15 @@ fn start_serve(
         stdout.flush().context("flushing stdout")?;
     }
 
-    let broker = SessionBroker::new(
-        incoming_tx,
-        outgoing_rx,
-        broker_rx,
-        state.clone(),
-        Arc::new(GpuiHooks {
-            tx: gpui_tx.clone(),
-            channel: server_channel.clone(),
-        }),
-    );
+    let broker = multiplayer::run(broker_rx, state.clone(), gpui_tx.clone());
     Tokio::spawn(
         cx,
         http::serve_http(public, state.clone()).map(|result| result.log_err()),
     )
     .detach();
-    Tokio::spawn(cx, broker.run()).detach();
+    Tokio::spawn(cx, broker).detach();
     Tokio::spawn(cx, signal_task(state.broker_tx.clone(), gpui_tx)).detach();
-    Ok((session, server_channel, control))
+    Ok((session, hub, control))
 }
 
 fn count_dirty_buffers(buffer_store: &Entity<project::buffer_store::BufferStore>, cx: &App) -> u32 {
@@ -993,7 +949,7 @@ pub fn execute_serve(args: ServeArgs) -> Result<()> {
         install_log_state(&state);
         log::debug!("gpui app started, initializing serve");
         let listeners_bound_at = SystemTime::now();
-        let (session, server_channel, control_listener) =
+        let (session, hub, control_listener) =
             start_serve(&args, state.clone(), broker_rx, gpui_tx, cx)?;
         init_telemetry_forwarding(session.clone(), cx);
         project::trusted_worktrees::init(collections::HashMap::default(), cx);
@@ -1017,6 +973,7 @@ pub fn execute_serve(args: ServeArgs) -> Result<()> {
             }
         });
         project.update(cx, |project, _| {
+            project.hub = Some(hub.clone());
             project.set_shutdown_request_handler(on_shutdown)
         });
 
@@ -1070,7 +1027,7 @@ pub fn execute_serve(args: ServeArgs) -> Result<()> {
         observe_project_for_health(&project, state, cx);
         spawn_gpui_command_loop(
             project.clone(),
-            server_channel,
+            hub,
             pty,
             Box::new(SandboxProjectHooks),
             gpui_rx,
@@ -1207,12 +1164,18 @@ mod tests {
             resolve_extension_asset(&extensions_dir, "theme-x", "/etc/passwd"),
             None
         );
-        assert_eq!(resolve_extension_asset(&extensions_dir, "..", "secret.txt"), None);
+        assert_eq!(
+            resolve_extension_asset(&extensions_dir, "..", "secret.txt"),
+            None
+        );
         assert_eq!(
             resolve_extension_asset(&extensions_dir, "theme-x/..", "loose.json"),
             None
         );
-        assert_eq!(resolve_extension_asset(&extensions_dir, "missing", "x"), None);
+        assert_eq!(
+            resolve_extension_asset(&extensions_dir, "missing", "x"),
+            None
+        );
 
         #[cfg(unix)]
         {

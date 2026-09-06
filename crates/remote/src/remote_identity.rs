@@ -217,7 +217,6 @@ mod tests {
 
         let left = RemoteConnectionOptions::WebSocket(
             WebSocketConnectionOptions::new("wss://a.example/rpc", "ws_1", "sess_1", "token-a")
-                .with_takeover(true)
                 .with_refresh(Arc::new(NoRefresh)),
         );
         let right = RemoteConnectionOptions::WebSocket(WebSocketConnectionOptions::new(

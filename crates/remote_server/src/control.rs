@@ -54,7 +54,7 @@ pub struct ControlChannel {
     pending_resumed: AtomicBool,
     /// Versions of accepted saves tagged `stopping`, from the server-side
     /// `ClientStateStore`: the only saves that end a stopping wait.
-    stopping_saves: watch::Receiver<u64>,
+    participant_saves: Mutex<collections::HashMap<proto::PeerId, watch::Receiver<u64>>>,
     /// The stopping wait in progress, if any: later `stopping` requests join it instead of
     /// each pinning a router task for up to [`STOPPING_FLUSH_TIMEOUT`].
     stopping_wait: Mutex<Option<StoppingWait>>,
@@ -163,14 +163,11 @@ pub struct ExtensionsBody {
 }
 
 impl ControlChannel {
-    /// A channel sending to `session`, authenticated with `secret`, watching
-    /// `stopping_saves` (`ClientStateStore::stopping_saved_versions`) for the stopping
-    /// flush and timing it on `executor`. The receiver carries the events the gpui side
-    /// drains.
+    /// A channel sending to `session`, authenticated with `secret`. Registered
+    /// participant saves complete the stopping flush; the receiver feeds the gpui side.
     pub fn new(
         session: AnyProtoClient,
         secret: Vec<u8>,
-        stopping_saves: watch::Receiver<u64>,
         executor: BackgroundExecutor,
     ) -> (Arc<Self>, mpsc::UnboundedReceiver<ControlEvent>) {
         let (events_tx, events_rx) = mpsc::unbounded();
@@ -180,7 +177,7 @@ impl ControlChannel {
                 secret,
                 last_ports: Mutex::new(None),
                 pending_resumed: AtomicBool::new(false),
-                stopping_saves,
+                participant_saves: Mutex::default(),
                 stopping_wait: Mutex::new(None),
                 events_tx,
                 executor,
@@ -212,6 +209,22 @@ impl ControlChannel {
                 Err(error) => ControlResponse::BadRequest(error.to_string()),
             },
             _ => ControlResponse::NotFound,
+        }
+    }
+
+    pub fn set_participant_saves(
+        &self,
+        peer: proto::PeerId,
+        versions: Option<watch::Receiver<u64>>,
+    ) {
+        let mut peers = self
+            .participant_saves
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(versions) = versions {
+            peers.insert(peer, versions);
+        } else {
+            peers.remove(&peer);
         }
     }
 
@@ -301,13 +314,16 @@ impl ControlChannel {
             match slot.as_ref() {
                 Some(wait) => wait.clone(),
                 None => {
-                    let wait = stopping_wait(
-                        self.session.clone(),
-                        self.stopping_saves.clone(),
-                        self.executor.clone(),
-                    )
-                    .boxed()
-                    .shared();
+                    let saves = self
+                        .participant_saves
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .values()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let wait = stopping_wait(self.session.clone(), saves, self.executor.clone())
+                        .boxed()
+                        .shared();
                     *slot = Some(wait.clone());
                     wait
                 }
@@ -375,7 +391,8 @@ impl ControlChannel {
         {
             return ControlResponse::BadRequest(format!("invalid extension id {invalid:?}"));
         }
-        let mut install: Vec<String> = Vec::with_capacity(body.install.len().min(MAX_INSTALL_REQUEST_IDS));
+        let mut install: Vec<String> =
+            Vec::with_capacity(body.install.len().min(MAX_INSTALL_REQUEST_IDS));
         for id in body.install {
             if !install.contains(&id) {
                 install.push(id);
@@ -414,35 +431,32 @@ fn send_notice(session: &AnyProtoClient, kind: proto::LifecycleKind, seconds: u3
 /// The body of one stopping wait; `'static` so concurrent requests can share it.
 async fn stopping_wait(
     session: AnyProtoClient,
-    mut versions: watch::Receiver<u64>,
+    versions: Vec<watch::Receiver<u64>>,
     executor: BackgroundExecutor,
 ) {
-    let before = *versions.borrow();
-    send_notice(&session, proto::LifecycleKind::Stopping, 0);
-    let mut timeout = Box::pin(executor.timer(STOPPING_FLUSH_TIMEOUT));
-    loop {
-        // Scoped so the `changed` future's borrow of `versions` ends before `borrow()`.
-        let outcome = {
-            let changed = Box::pin(versions.changed());
-            match futures::future::select(changed, timeout).await {
-                Either::Left((changed, remaining_timeout)) => Some((changed, remaining_timeout)),
-                Either::Right(((), _changed)) => None,
+    let waits = versions
+        .into_iter()
+        .map(|mut versions| {
+            let before = *versions.borrow();
+            async move {
+                while *versions.borrow() <= before {
+                    if versions.changed().await.is_err() {
+                        break;
+                    }
+                }
             }
-        };
-        let Some((changed, remaining_timeout)) = outcome else {
-            log::warn!(
-                "no client-state stopping flush within {STOPPING_FLUSH_TIMEOUT:?} of the stopping notice"
-            );
-            break;
-        };
-        timeout = remaining_timeout;
-        if changed.is_err() {
-            log::warn!("client-state store is gone; ending the stopping wait");
-            break;
-        }
-        if *versions.borrow() > before {
-            break;
-        }
+        })
+        .collect::<Vec<_>>();
+    send_notice(&session, proto::LifecycleKind::Stopping, 0);
+    if matches!(
+        futures::future::select(
+            Box::pin(futures::future::join_all(waits)),
+            Box::pin(executor.timer(STOPPING_FLUSH_TIMEOUT))
+        )
+        .await,
+        Either::Right(_)
+    ) {
+        log::warn!("not every participant saved client state within {STOPPING_FLUSH_TIMEOUT:?}");
     }
 }
 
@@ -691,6 +705,37 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn stopping_waits_for_every_participant(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let (_harness, control) = harness(cx, server_cx).await;
+        let (mut a_tx, a_rx) = watch::channel(10);
+        let (mut b_tx, b_rx) = watch::channel(3);
+        control.set_participant_saves(proto::PeerId { owner_id: 0, id: 8 }, Some(a_rx));
+        control.set_participant_saves(proto::PeerId { owner_id: 0, id: 9 }, Some(b_rx));
+        let mut stopping = server_cx.background_executor.spawn(async move {
+            control
+                .handle(request(
+                    LIFECYCLE_PATH,
+                    r#"{"kind":"stopping"}"#,
+                    Some(SECRET),
+                    true,
+                ))
+                .await
+        });
+        cx.run_until_parked();
+        a_tx.send(11).unwrap();
+        cx.run_until_parked();
+        assert!(
+            (&mut stopping).now_or_never().is_none(),
+            "one participant cannot finish everybody's flush"
+        );
+        b_tx.send(4).unwrap();
+        assert_eq!(stopping.await, ControlResponse::NoContent);
+    }
+
+    #[gpui::test]
     async fn stopping_waits_for_save(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
         let (harness, control) = harness(cx, server_cx).await;
         let notices = harness.lifecycle_notices(cx);
@@ -831,7 +876,6 @@ mod tests {
         let (control, mut events) = ControlChannel::new(
             session,
             SECRET.as_bytes().to_vec(),
-            watch::Receiver::constant(0),
             server_cx.background_executor.clone(),
         );
 
@@ -893,6 +937,9 @@ mod tests {
                 .await,
             ControlResponse::BadRequest(_)
         ));
-        assert!(events.try_recv().is_err(), "an over-long list emits nothing");
+        assert!(
+            events.try_recv().is_err(),
+            "an over-long list emits nothing"
+        );
     }
 }

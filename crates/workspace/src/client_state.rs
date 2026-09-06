@@ -388,18 +388,36 @@ pub fn restore_unsaved_buffers(
                     continue;
                 }
             };
-            buffer.update(cx, |buffer, cx| {
-                if buffer.text() == row.text {
-                    return;
+            let collaborative = project.read_with(cx, |project, _| project.is_shared_sandbox());
+            let mut project_path = project_path;
+            if collaborative {
+                if let Some(recovered) = project
+                    .update(cx, |project, cx| {
+                        project.restore_shared_buffer_snapshot(
+                            buffer.clone(),
+                            row.text.clone(),
+                            row.mtime,
+                            cx,
+                        )
+                    })
+                    .await?
+                {
+                    project_path = recovered;
                 }
-                if row.mtime.is_some() {
-                    buffer.did_reload(buffer.version(), buffer.line_ending(), row.mtime, cx);
-                }
-                buffer.set_text(row.text.clone(), cx);
-                if let Some(entry) = buffer.peek_undo_stack() {
-                    buffer.forget_transaction(entry.transaction_id());
-                }
-            });
+            } else {
+                buffer.update(cx, |buffer, cx| {
+                    if buffer.text() == row.text {
+                        return;
+                    }
+                    if row.mtime.is_some() {
+                        buffer.did_reload(buffer.version(), buffer.line_ending(), row.mtime, cx);
+                    }
+                    buffer.set_text(row.text.clone(), cx);
+                    if let Some(entry) = buffer.peek_undo_stack() {
+                        buffer.forget_transaction(entry.transaction_id());
+                    }
+                });
+            }
             // A dirty buffer must be visible to be saved or discarded; the tab is added
             // without stealing the active item.
             let open = workspace.update_in(cx, |workspace, window, cx| {
