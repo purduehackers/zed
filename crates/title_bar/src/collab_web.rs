@@ -1,7 +1,8 @@
 //! Anonymous sandbox participants. No account, call or channel service is involved.
 
-use gpui::{AnyElement, Context, Empty, IntoElement, Window};
-use ui::prelude::*;
+use gpui::{AnyElement, Context, Empty, IntoElement, MouseButton, Window};
+use project::anonymous_participant;
+use ui::{Avatar, Tooltip, prelude::*};
 
 use crate::TitleBar;
 
@@ -14,25 +15,52 @@ impl TitleBar {
     ) -> impl IntoElement {
         let project = self.project.read(cx);
         let mut participants = project.collaborators().values().collect::<Vec<_>>();
-        participants.sort_by_key(|peer| peer.replica_id);
         let own = project.replica_id();
+        participants.sort_by_key(|peer| (peer.replica_id != own, peer.replica_id));
         let count = participants.len();
+        let overflow = participants
+            .iter()
+            .skip(5)
+            .map(|peer| anonymous_participant::identity(peer.replica_id).0)
+            .collect::<Vec<_>>()
+            .join("\n");
         h_flex()
-            .gap_2()
+            .id("web-collaborators")
+            .flex_shrink_0()
+            .gap_1()
             .children(participants.into_iter().take(5).map(|peer| {
                 let index = peer.replica_id.as_u16().saturating_sub(8) as u32;
-                Label::new(format!(
-                    "Guest {}{}",
-                    index + 1,
-                    if peer.replica_id == own { " (you)" } else { "" }
-                ))
-                .size(LabelSize::Small)
-                .color(Color::Custom(
-                    cx.theme().players().color_for_participant(index).cursor,
-                ))
+                let (name, image) = anonymous_participant::identity(peer.replica_id);
+                let label = if peer.replica_id == own {
+                    format!("{name} (you)")
+                } else {
+                    name.to_owned()
+                };
+                div()
+                    .id(("anonymous-participant", peer.user_id))
+                    .flex_shrink_0()
+                    .child(
+                        Avatar::new(image)
+                            .size(px(24.))
+                            .border_color(cx.theme().players().color_for_participant(index).cursor),
+                    )
+                    .tooltip(Tooltip::text(label))
+                    .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    })
             }))
             .when(count > 5, |row| {
-                row.child(Label::new(format!("+{}", count - 5)).size(LabelSize::Small))
+                row.child(
+                    h_flex()
+                        .id("anonymous-participant-overflow")
+                        .size(px(26.))
+                        .justify_center()
+                        .rounded_full()
+                        .bg(cx.theme().colors().element_background)
+                        .child(Label::new(format!("+{}", count - 5)).size(LabelSize::Small))
+                        .tooltip(Tooltip::text(overflow)),
+                )
             })
     }
 

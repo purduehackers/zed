@@ -1,5 +1,6 @@
 pub mod agent_registry_store;
 pub mod agent_server_store;
+pub mod anonymous_participant;
 pub mod bookmark_store;
 pub mod buffer_store;
 pub mod color_extractor;

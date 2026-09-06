@@ -361,6 +361,7 @@ impl Render for TitleBar {
                 .into_any_element(),
         );
 
+        #[cfg(not(target_family = "wasm"))]
         children.push(self.render_collaborator_list(window, cx).into_any_element());
 
         if title_bar_settings.show_onboarding_banner {
@@ -418,6 +419,9 @@ impl Render for TitleBar {
                 })
                 .when(TitleBarSettings::get_global(cx).show_user_menu, |this| {
                     this.child(self.render_user_menu_button(cx))
+                })
+                .when(cfg!(target_family = "wasm"), |this| {
+                    this.child(self.render_collaborator_list(window, cx))
                 })
                 .into_any_element(),
         );

@@ -29,19 +29,17 @@ pub const WEB_SETTINGS_OVERRIDES: &str = r#"{
 /// for the browser to work: it is taste, and the user's own `settings.json` still wins over
 /// all of it.
 ///
-/// Deliberately absent, because the bundle does not ship the assets they name: `ui_font_family`
-/// and `buffer_font_family` (the tarball carries Lilex and IBM Plex Sans, plus Lilex Nerd
-/// Font Mono for the terminal) and the
-/// `Bearded Icons` icon theme. Font *sizes* carry over, so the proportions match even though
-/// the faces differ. The theme is Ayu Dark, which the bundle does pack (`one`, `ayu` and
-/// `gruvbox`); the operator's `Kintsugi` family is an extension and is not there.
+/// Kintsugi and the operator's Ioskeley fonts are bundled; Bearded Icons is not.
 /// Language server, formatter, proxy and SSH settings are desktop concerns and stay out.
 pub const WEB_LAYOUT_DEFAULTS: &str = r#"{
   // AI off for the whole editor: no agent panel, no edit predictions, no registry fetches.
   "disable_ai": true,
-  "theme": { "mode": "dark", "dark": "Ayu Dark", "light": "Ayu Light" },
+  "theme": { "mode": "dark", "dark": "Kintsugi Dark Flared", "light": "Kintsugi Light Flared" },
+  "ui_font_family": "Ioskeley Mono",
   "ui_font_size": 15,
+  "buffer_font_family": "IoskeleyMono Nerd Font",
   "buffer_font_size": 14,
+  "buffer_font_features": { "aalt": true },
   "buffer_line_height": "comfortable",
   "vim_mode": true,
   // A browser tab can be closed at any moment; saving on focus change is the desktop setting
@@ -88,7 +86,7 @@ pub const WEB_LAYOUT_DEFAULTS: &str = r#"{
   "outline_panel": { "dock": "left" },
   "collaboration_panel": { "button": false, "dock": "left" },
   "terminal": {
-    "font_family": "Lilex Nerd Font Mono",
+    "font_family": "IoskeleyMono Nerd Font",
     "dock": "right",
     "show_count_badge": false,
     "toolbar": { "breadcrumbs": true }
@@ -174,17 +172,19 @@ mod tests {
     #[test]
     fn terminal_font_contains_nerd_glyphs_in_every_face() {
         let fonts: [&[u8]; 4] = [
-            include_bytes!("../../../assets/fonts/lilex-nerd/LilexNerdFontMono-Regular.ttf"),
-            include_bytes!("../../../assets/fonts/lilex-nerd/LilexNerdFontMono-Bold.ttf"),
-            include_bytes!("../../../assets/fonts/lilex-nerd/LilexNerdFontMono-Italic.ttf"),
-            include_bytes!("../../../assets/fonts/lilex-nerd/LilexNerdFontMono-BoldItalic.ttf"),
+            include_bytes!("../../../assets/fonts/ioskeley-nerd/IoskeleyMonoNerdFont-Regular.ttf"),
+            include_bytes!("../../../assets/fonts/ioskeley-nerd/IoskeleyMonoNerdFont-Bold.ttf"),
+            include_bytes!("../../../assets/fonts/ioskeley-nerd/IoskeleyMonoNerdFont-Italic.ttf"),
+            include_bytes!(
+                "../../../assets/fonts/ioskeley-nerd/IoskeleyMonoNerdFont-BoldItalic.ttf"
+            ),
         ];
         for bytes in fonts {
             let face = ttf_parser::Face::parse(bytes, 0).unwrap();
             assert!(
                 face.names()
                     .into_iter()
-                    .any(|name| { name.to_string().as_deref() == Some("Lilex Nerd Font Mono") })
+                    .any(|name| { name.to_string().as_deref() == Some("IoskeleyMono Nerd Font") })
             );
             for glyph in ['A', '\u{e0b0}', '\u{e0a0}', '\u{f07b}', '\u{f308}'] {
                 assert!(face.glyph_index(glyph).is_some(), "missing glyph {glyph:?}");
@@ -213,9 +213,12 @@ mod tests {
         assert_eq!(merged["vim_mode"], serde_json::json!(true));
         assert_eq!(merged["theme"]["mode"], serde_json::json!("dark"));
         assert_eq!(merged["project_panel"]["dock"], serde_json::json!("left"));
-        assert_eq!(merged["project_panel"]["starts_open"], serde_json::json!(false));
+        assert_eq!(
+            merged["project_panel"]["starts_open"],
+            serde_json::json!(false)
+        );
         assert_eq!(merged["terminal"]["dock"], serde_json::json!("right"));
-        assert_eq!(merged["terminal"]["font_family"], "Lilex Nerd Font Mono");
+        assert_eq!(merged["terminal"]["font_family"], "IoskeleyMono Nerd Font");
         // The tab is the window: the machine and project name go, the git identity stays.
         assert_eq!(
             merged["title_bar"]["show_project_items"],
@@ -231,10 +234,11 @@ mod tests {
         );
         assert_eq!(merged["title_bar"]["show_menus"], serde_json::json!(false));
         // Both theme names must be ones the asset tarball actually packs.
-        assert_eq!(merged["theme"]["dark"], serde_json::json!("Ayu Dark"));
-        assert_eq!(merged["theme"]["light"], serde_json::json!("Ayu Light"));
-        // The bundle ships neither of the operator's fonts, so the faces stay as shipped.
-        assert_ne!(merged["ui_font_family"], serde_json::json!("Ioskeley Mono"));
+        assert_eq!(merged["theme"]["dark"], "Kintsugi Dark Flared");
+        assert_eq!(merged["theme"]["light"], "Kintsugi Light Flared");
+        assert_eq!(merged["ui_font_family"], "Ioskeley Mono");
+        assert_eq!(merged["buffer_font_family"], "IoskeleyMono Nerd Font");
+        assert_eq!(merged["buffer_font_features"]["aalt"], true);
         for key in original.as_object().unwrap().keys() {
             assert!(
                 merged.get(key).is_some(),
