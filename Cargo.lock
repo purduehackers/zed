@@ -7848,16 +7848,19 @@ dependencies = [
  "tree-sitter-cpp",
  "tree-sitter-css",
  "tree-sitter-diff",
+ "tree-sitter-dockerfile",
  "tree-sitter-gitcommit",
  "tree-sitter-go",
  "tree-sitter-gomod",
  "tree-sitter-gowork",
+ "tree-sitter-html",
  "tree-sitter-jsdoc",
  "tree-sitter-json",
  "tree-sitter-md",
  "tree-sitter-python",
  "tree-sitter-regex",
  "tree-sitter-rust",
+ "tree-sitter-toml-ng",
  "tree-sitter-typescript",
  "tree-sitter-yaml",
  "util",
@@ -19254,6 +19257,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-dockerfile"
+version = "0.2.0"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-elixir"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -19322,8 +19333,6 @@ dependencies = [
 [[package]]
 name = "tree-sitter-html"
 version = "0.23.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "261b708e5d92061ede329babaaa427b819329a9d427a1d710abb0f67bbef63ee"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -19393,6 +19402,16 @@ dependencies = [
 [[package]]
 name = "tree-sitter-rust"
 version = "0.24.2"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-toml-ng"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9adc2c898ae49730e857d75be403da3f92bb81d8e37a2f918a08dd10de5ebb1"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -23407,6 +23426,7 @@ dependencies = [
  "serde_json",
  "serde_json_lenient",
  "settings",
+ "ttf-parser",
  "web-time",
 ]
 

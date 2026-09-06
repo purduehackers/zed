@@ -240,6 +240,8 @@ pub fn install() {
     hook1(&hooks, "openFile", open_file);
     hook0(&hooks, "openItems", open_items);
     hook1(&hooks, "bufferText", buffer_text);
+    hook1(&hooks, "bufferSyntax", buffer_syntax);
+    hook0(&hooks, "commandPaletteVisible", command_palette_visible);
     hook0(&hooks, "activeBufferText", active_buffer_text);
     hook1(&hooks, "insertText", insert_text);
     hook0(&hooks, "moveCursorEnd", move_cursor_end);
@@ -729,6 +731,49 @@ async fn buffer_text(path: JsValue) -> Result<JsValue> {
     let buffer = task.await?;
     let text = cx.update(|cx| buffer.read(cx).text());
     Ok(JsValue::from_str(&text))
+}
+
+async fn buffer_syntax(path: JsValue) -> Result<JsValue> {
+    let path = string_arg(&path, "path")?;
+    let (cx, _, workspace) = app_window()?;
+    let buffer = cx
+        .update(|cx| open_buffer_for(&workspace, &path, cx))?
+        .await?;
+    let (name, highlighted) = cx.update(|cx| {
+        let snapshot = buffer.read(cx).snapshot();
+        let name = snapshot
+            .language()
+            .map(|language| language.name().to_string());
+        let highlighted = snapshot
+            .chunks(
+                0..snapshot.len(),
+                language::LanguageAwareStyling {
+                    tree_sitter: true,
+                    diagnostics: false,
+                },
+            )
+            .filter(|chunk| chunk.syntax_highlight_id.is_some())
+            .count();
+        (name, highlighted)
+    });
+    let result = Object::new();
+    set(&result, "language", opt_str(name.as_deref()));
+    set(
+        &result,
+        "highlightedChunks",
+        JsValue::from_f64(highlighted as f64),
+    );
+    Ok(result.into())
+}
+
+async fn command_palette_visible() -> Result<JsValue> {
+    let (cx, _, workspace) = app_window()?;
+    Ok(JsValue::from_bool(cx.update(|cx| {
+        workspace
+            .read(cx)
+            .active_modal::<command_palette::CommandPalette>(cx)
+            .is_some()
+    })))
 }
 
 fn active_editor(workspace: &Entity<Workspace>, cx: &App) -> Result<Entity<Editor>> {

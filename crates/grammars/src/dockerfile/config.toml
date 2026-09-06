@@ -1,0 +1,6 @@
+name = "Dockerfile"
+grammar = "dockerfile"
+path_suffixes = ["Dockerfile", "Containerfile", "dockerfile", "containerfile"]
+first_line_pattern = '^\s*(?i:FROM)\s+'
+line_comments = ["# "]
+tab_size = 2

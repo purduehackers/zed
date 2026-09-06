@@ -31,6 +31,8 @@ mod tailwind;
 mod tailwindcss;
 mod typescript;
 mod vtsls;
+#[cfg(feature = "web-languages")]
+mod web_languages;
 mod yaml;
 
 pub(crate) use package_json::{PackageJson, PackageJsonData};
@@ -95,6 +97,23 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
     let yaml_lsp_adapter = Arc::new(yaml::YamlLspAdapter::new(node));
 
     let built_in_languages = [
+        #[cfg(feature = "web-languages")]
+        LanguageInfo {
+            name: "dockerfile",
+            adapters: vec![Arc::new(web_languages::InstalledLsp::DOCKERFILE)],
+            ..Default::default()
+        },
+        #[cfg(feature = "web-languages")]
+        LanguageInfo {
+            name: "html",
+            adapters: vec![Arc::new(web_languages::InstalledLsp::HTML)],
+            ..Default::default()
+        },
+        #[cfg(feature = "web-languages")]
+        LanguageInfo {
+            name: "toml",
+            ..Default::default()
+        },
         LanguageInfo {
             name: "bash",
             context: Some(Arc::new(bash::bash_task_context())),

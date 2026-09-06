@@ -21,6 +21,7 @@ default = ["serve"]
 debug-embed = ["dep:rust-embed"]
 test-support = ["fs/test-support"]
 serve = [
+    "languages/web-languages",
     "dep:bytes",
     "dep:http-body-util",
     "dep:hyper",

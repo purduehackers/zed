@@ -23,6 +23,9 @@ tree-sitter-c = { workspace = true, optional = true }
 tree-sitter-cpp = { workspace = true, optional = true }
 tree-sitter-css = { workspace = true, optional = true }
 tree-sitter-diff = { workspace = true, optional = true }
+tree-sitter-dockerfile = { workspace = true, optional = true }
+tree-sitter-html = { workspace = true, optional = true }
+tree-sitter-toml-ng = { workspace = true, optional = true }
 tree-sitter-gitcommit = { workspace = true, optional = true }
 tree-sitter-go = { workspace = true, optional = true }
 tree-sitter-go-mod = { workspace = true, optional = true }
@@ -37,6 +40,7 @@ tree-sitter-typescript = { workspace = true, optional = true }
 tree-sitter-yaml = { workspace = true, optional = true }
 
 [features]
+web-languages = ["load-grammars", "tree-sitter-dockerfile", "tree-sitter-html", "tree-sitter-toml-ng"]
 load-grammars = [
     "tree-sitter",
     "tree-sitter-bash",

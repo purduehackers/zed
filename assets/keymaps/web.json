@@ -31,6 +31,11 @@
   {
     "context": "Workspace",
     "bindings": {
+      // VS Code/Codespaces fallback: Firefox owns Cmd/Ctrl+Shift+P.
+      "f1": "command_palette::Toggle",
+      "alt-shift-p": "command_palette::Toggle",
+      "alt-p": "file_finder::Toggle",
+      "ctrl-`": "terminal_panel::Toggle",
       // Shift+N — one window per tab
       "ctrl-shift-n": null, // workspace::NewWindow (default-linux.json)
       "cmd-shift-n": null, // workspace::NewWindow (default-macos.json)

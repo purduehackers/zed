@@ -1,0 +1,13 @@
+[package]
+name = "tree-sitter-dockerfile"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/camdencheek/tree-sitter-dockerfile"
+build = "build.rs"
+
+[dependencies]
+tree-sitter-language = "0.1"
+
+[build-dependencies]
+cc = "1"

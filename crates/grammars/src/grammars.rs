@@ -24,6 +24,12 @@ pub fn native_grammars() -> Vec<(&'static str, tree_sitter::Language)> {
         ("cpp", tree_sitter_cpp::LANGUAGE.into()),
         ("css", tree_sitter_css::LANGUAGE.into()),
         ("diff", tree_sitter_diff::LANGUAGE.into()),
+        #[cfg(feature = "web-languages")]
+        ("dockerfile", tree_sitter_dockerfile::LANGUAGE.into()),
+        #[cfg(feature = "web-languages")]
+        ("html", tree_sitter_html::LANGUAGE.into()),
+        #[cfg(feature = "web-languages")]
+        ("toml", tree_sitter_toml_ng::LANGUAGE.into()),
         ("go", tree_sitter_go::LANGUAGE.into()),
         ("gomod", tree_sitter_go_mod::LANGUAGE.into()),
         ("gowork", tree_sitter_gowork::LANGUAGE.into()),
@@ -97,4 +103,41 @@ pub fn load_queries(name: &str) -> LanguageQueries {
         };
         Some(QueryFileContents::new(query_file, contents))
     }))
+}
+
+#[cfg(all(test, feature = "web-languages"))]
+mod web_language_tests {
+    use super::*;
+
+    #[test]
+    fn bundled_web_languages_parse_and_highlight() {
+        for (name, example) in [
+            ("dockerfile", "FROM node:24\nRUN echo hello\n"),
+            ("html", "<!DOCTYPE html><main class=\"app\">Hello</main>"),
+            ("toml", "[package]\nname = \"demo\"\nversion = \"1.0.0\"\n"),
+        ] {
+            let (_, grammar) = native_grammars()
+                .into_iter()
+                .find(|(n, _)| *n == name)
+                .unwrap();
+            let config = load_config(name);
+            assert_eq!(config.grammar.as_deref(), Some(name));
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&grammar).unwrap();
+            let tree = parser.parse(example, None).unwrap();
+            assert!(
+                !tree.root_node().has_error(),
+                "{name}: {}",
+                tree.root_node().to_sexp()
+            );
+            for query_name in ["highlights", "injections"] {
+                if let Some(file) = get_file(&format!("{name}/{query_name}.scm")) {
+                    let query =
+                        tree_sitter::Query::new(&grammar, std::str::from_utf8(&file.data).unwrap())
+                            .unwrap();
+                    assert!(query.pattern_count() > 0, "empty {name}/{query_name}");
+                }
+            }
+        }
+    }
 }

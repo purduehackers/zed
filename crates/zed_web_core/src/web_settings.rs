@@ -30,7 +30,8 @@ pub const WEB_SETTINGS_OVERRIDES: &str = r#"{
 /// all of it.
 ///
 /// Deliberately absent, because the bundle does not ship the assets they name: `ui_font_family`
-/// and `buffer_font_family` (the tarball carries Lilex and IBM Plex Sans only) and the
+/// and `buffer_font_family` (the tarball carries Lilex and IBM Plex Sans, plus Lilex Nerd
+/// Font Mono for the terminal) and the
 /// `Bearded Icons` icon theme. Font *sizes* carry over, so the proportions match even though
 /// the faces differ. The theme is Ayu Dark, which the bundle does pack (`one`, `ayu` and
 /// `gruvbox`); the operator's `Kintsugi` family is an extension and is not there.
@@ -84,7 +85,12 @@ pub const WEB_LAYOUT_DEFAULTS: &str = r#"{
   },
   "outline_panel": { "dock": "left" },
   "collaboration_panel": { "button": false, "dock": "left" },
-  "terminal": { "dock": "right", "show_count_badge": false, "toolbar": { "breadcrumbs": true } },
+  "terminal": {
+    "font_family": "Lilex Nerd Font Mono",
+    "dock": "right",
+    "show_count_badge": false,
+    "toolbar": { "breadcrumbs": true }
+  },
   "agent": { "dock": "right", "enabled": false }
 }"#;
 
@@ -144,6 +150,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn web_keymap_has_browser_safe_entry_points() {
+        let sections: serde_json::Value =
+            serde_json_lenient::from_str(include_str!("../../../assets/keymaps/web.json")).unwrap();
+        let bindings = &sections
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|section| section["context"] == "Workspace")
+            .unwrap()["bindings"];
+        for (key, action) in [
+            ("f1", "command_palette::Toggle"),
+            ("alt-shift-p", "command_palette::Toggle"),
+            ("alt-p", "file_finder::Toggle"),
+            ("ctrl-`", "terminal_panel::Toggle"),
+        ] {
+            assert_eq!(bindings[key], action, "{key}");
+        }
+    }
+
+    #[test]
+    fn terminal_font_contains_nerd_glyphs_in_every_face() {
+        let fonts: [&[u8]; 4] = [
+            include_bytes!("../../../assets/fonts/lilex-nerd/LilexNerdFontMono-Regular.ttf"),
+            include_bytes!("../../../assets/fonts/lilex-nerd/LilexNerdFontMono-Bold.ttf"),
+            include_bytes!("../../../assets/fonts/lilex-nerd/LilexNerdFontMono-Italic.ttf"),
+            include_bytes!("../../../assets/fonts/lilex-nerd/LilexNerdFontMono-BoldItalic.ttf"),
+        ];
+        for bytes in fonts {
+            let face = ttf_parser::Face::parse(bytes, 0).unwrap();
+            assert!(
+                face.names()
+                    .into_iter()
+                    .any(|name| { name.to_string().as_deref() == Some("Lilex Nerd Font Mono") })
+            );
+            for glyph in ['A', '\u{e0b0}', '\u{e0a0}', '\u{f07b}', '\u{f308}'] {
+                assert!(face.glyph_index(glyph).is_some(), "missing glyph {glyph:?}");
+            }
+        }
+    }
+
+    #[test]
     fn merge_keeps_default_keys() {
         let defaults = settings::default_settings();
         let merged = merge_web_defaults(&defaults).unwrap();
@@ -165,6 +212,7 @@ mod tests {
         assert_eq!(merged["theme"]["mode"], serde_json::json!("dark"));
         assert_eq!(merged["project_panel"]["dock"], serde_json::json!("left"));
         assert_eq!(merged["terminal"]["dock"], serde_json::json!("right"));
+        assert_eq!(merged["terminal"]["font_family"], "Lilex Nerd Font Mono");
         // The tab is the window: the machine and project name go, the git identity stays.
         assert_eq!(
             merged["title_bar"]["show_project_items"],

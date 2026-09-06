@@ -269,7 +269,7 @@ members = [
 ]
 default-members = ["crates/zed"]
 # Vendored third-party crates (D31): path `[patch]` entries, not workspace members.
-exclude = ["vendor/yawc", "vendor/lsp-types", "vendor/agent-client-protocol", "vendor/alacritty_terminal", "vendor/wasm_thread", "vendor/pet-fs", "vendor/tree-sitter-python", "vendor/tree-sitter-rust", "vendor/tree-sitter-bash", "vendor/tree-sitter-cpp", "vendor/tree-sitter-yaml", "vendor/tree-sitter-md", "vendor/async-tar", "vendor/pet-conda", "vendor/pet-hatch", "vendor/pet-uv", "vendor/pet-env-var-path", "vendor/pet-pyenv", "vendor/pet-virtualenvwrapper", "vendor/pet-venv", "vendor/pet", "vendor/futures-util"]
+exclude = ["vendor/yawc", "vendor/lsp-types", "vendor/agent-client-protocol", "vendor/alacritty_terminal", "vendor/wasm_thread", "vendor/pet-fs", "vendor/tree-sitter-python", "vendor/tree-sitter-rust", "vendor/tree-sitter-bash", "vendor/tree-sitter-cpp", "vendor/tree-sitter-yaml", "vendor/tree-sitter-md", "vendor/async-tar", "vendor/pet-conda", "vendor/pet-hatch", "vendor/pet-uv", "vendor/pet-env-var-path", "vendor/pet-pyenv", "vendor/pet-virtualenvwrapper", "vendor/pet-venv", "vendor/pet", "vendor/futures-util", "vendor/tree-sitter-dockerfile", "vendor/tree-sitter-html"]
 
 [workspace.package]
 publish = false
@@ -873,6 +873,8 @@ tree-sitter-c = "0.24.1"
 tree-sitter-cpp = { git = "https://github.com/tree-sitter/tree-sitter-cpp", rev = "5cb9b693cfd7bfacab1d9ff4acac1a4150700609" }
 tree-sitter-css = "0.23"
 tree-sitter-diff = "0.1.0"
+tree-sitter-dockerfile = { git = "https://github.com/camdencheek/tree-sitter-dockerfile", rev = "868e44ce378deb68aac902a9db68ff82d2299dd0" }
+tree-sitter-toml-ng = "=0.7.0"
 tree-sitter-elixir = "0.3"
 tree-sitter-embedded-template = "0.23.0"
 tree-sitter-gitcommit = { git = "https://github.com/zed-industries/tree-sitter-git-commit", rev = "88309716a69dd13ab83443721ba6e0b491d37ee9" }
@@ -1007,6 +1009,7 @@ features = [
 lsp-types = { path = "vendor/lsp-types" }
 
 [patch.crates-io]
+tree-sitter-html = { path = "vendor/tree-sitter-html" }
 # Zed Codespaces: Shared's browser waker mutex must use the D42-aware parker too.
 # Native std and no-std behavior are unchanged; vendor/README.md records provenance.
 futures-util = { path = "vendor/futures-util" }
@@ -1161,6 +1164,9 @@ pet = { path = "vendor/pet" }
 # include path, so scanner.c stops reaching the wasi sysroot's stdio.h). A git dependency
 # carries no version requirement, so the vendored 0.23.4 satisfies it; vendor/README.md
 # records the diff and the git-patch form this entry becomes once a fork exists.
+[patch."https://github.com/camdencheek/tree-sitter-dockerfile"]
+tree-sitter-dockerfile = { path = "vendor/tree-sitter-dockerfile" }
+
 [patch."https://github.com/tree-sitter/tree-sitter-cpp"]
 tree-sitter-cpp = { path = "vendor/tree-sitter-cpp" }
 

@@ -9,6 +9,7 @@ license = "GPL-3.0-or-later"
 workspace = true
 
 [features]
+web-languages = ["load-grammars", "grammars/web-languages"]
 test-support = [
     "load-grammars"
 ]

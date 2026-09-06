@@ -245,7 +245,11 @@ impl Render for PlatformTitleBar {
             .map(|this| {
                 let show_left_controls = !(sidebar.open && sidebar.side == SidebarSide::Left);
 
-                if window.is_fullscreen() || window.is_simple_fullscreen() {
+                // Browser windows have no native traffic lights to reserve space for.
+                if cfg!(target_family = "wasm")
+                    || window.is_fullscreen()
+                    || window.is_simple_fullscreen()
+                {
                     this.pl_2()
                 } else if self.platform_style == PlatformStyle::Mac && show_left_controls {
                     this.pl(px(TRAFFIC_LIGHT_PADDING))

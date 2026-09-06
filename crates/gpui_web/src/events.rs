@@ -704,7 +704,7 @@ impl WebWindowInner {
                 }));
             }
 
-            let key = dom_key_to_gpui_key(&event);
+            let key = dom_key_to_gpui_key(&event, this.is_mac);
 
             if is_modifier_only_key(&key) {
                 return;
@@ -769,7 +769,7 @@ impl WebWindowInner {
                 }));
             }
 
-            let key = dom_key_to_gpui_key(&event);
+            let key = dom_key_to_gpui_key(&event, this.is_mac);
 
             if is_modifier_only_key(&key) {
                 return;
@@ -1197,8 +1197,20 @@ impl WebWindowInner {
     }
 }
 
-fn dom_key_to_gpui_key(event: &web_sys::KeyboardEvent) -> String {
+fn dom_key_to_gpui_key(event: &web_sys::KeyboardEvent, is_mac: bool) -> String {
     let key = event.key();
+    // macOS reports Option+P as π, Option+W as ∑, and Option+N as Dead.
+    // Match shortcut keys using the platform's current US layout (WebKeyboardLayout),
+    // while compute_key_char retains the original composed text for unbound chords.
+    if is_mac && event.alt_key() && !event.is_composing() && (!key.is_ascii() || key == "Dead") {
+        let code = event.code();
+        if let Some(letter) = code.strip_prefix("Key")
+            && letter.len() == 1
+            && letter.as_bytes()[0].is_ascii_uppercase()
+        {
+            return letter.to_ascii_lowercase();
+        }
+    }
     match key.as_str() {
         "Enter" => "enter".to_string(),
         "Backspace" => "backspace".to_string(),
@@ -1351,7 +1363,7 @@ fn compute_key_char(
 
     let raw_key = event.key();
 
-    if raw_key.len() == 1 {
+    if raw_key.chars().count() == 1 {
         return Some(raw_key);
     }
 

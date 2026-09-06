@@ -21,5 +21,6 @@ serde_json_lenient.workspace = true
 web-time.workspace = true
 
 [dev-dependencies]
+ttf-parser = "0.25"
 gpui = { workspace = true, features = ["test-support"] }
 settings = { workspace = true, features = ["test-support"] }
