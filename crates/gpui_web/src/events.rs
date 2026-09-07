@@ -172,6 +172,15 @@ impl WebWindowInner {
         handles.extend(self.register_visibility_change());
         handles.extend(self.register_appearance_change());
         handles.extend(self.register_fullscreen_change());
+        let this = Rc::clone(self);
+        handles.push(EventListenerHandle::add(
+            self.browser_window.as_ref(),
+            "gpui-screen-reader-mode",
+            move |_| {
+                this.ime_mirror.screen_reader_mode_changed();
+                this.schedule_ime_mirror_sync();
+            },
+        ));
 
         WebEventListeners { _handles: handles }
     }
@@ -190,6 +199,30 @@ impl WebWindowInner {
         handler: impl FnMut(JsValue) + 'static,
     ) -> EventListenerHandle {
         EventListenerHandle::add(self.ime_mirror.event_target(), event_name, handler)
+    }
+
+    fn listen_keyboard(
+        self: &Rc<Self>,
+        event_name: &'static str,
+        mut handler: impl FnMut(JsValue) + 'static,
+    ) -> EventListenerHandle {
+        let document = self.browser_window.document().unwrap();
+        EventListenerHandle::add(document.as_ref(), event_name, move |event| {
+            let dom_event: &web_sys::Event = event.unchecked_ref();
+            let in_editor = dom_event
+                .target()
+                .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+                .and_then(|element| {
+                    element
+                        .closest("[data-gpui-input], [data-gpui-a11y]")
+                        .ok()
+                        .flatten()
+                })
+                .is_some();
+            if in_editor {
+                handler(event);
+            }
+        })
     }
 
     fn listen_non_passive(
@@ -691,8 +724,59 @@ impl WebWindowInner {
 
     fn register_key_down(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
-        self.listen_input("keydown", move |event: JsValue| {
+        self.listen_keyboard("keydown", move |event: JsValue| {
             let event: web_sys::KeyboardEvent = event.unchecked_into();
+
+            let semantic_target = event
+                .target()
+                .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+                .filter(|element| element.has_attribute("data-gpui-node"));
+            if event.key() == "Tab"
+                && (crate::accessibility::screen_reader_mode() || semantic_target.is_some())
+            {
+                return;
+            }
+            if let Some(target) = semantic_target
+                && !event.ctrl_key()
+                && !event.meta_key()
+                && !event.alt_key()
+            {
+                // A semantic button can be focused without GPUI moving its text
+                // caret. Never send ordinary typing/deletion to that old editor.
+                let key = event.key();
+                let navigation = matches!(
+                    target.get_attribute("role").as_deref(),
+                    Some(
+                        "tree"
+                            | "treeitem"
+                            | "listbox"
+                            | "option"
+                            | "menu"
+                            | "menuitem"
+                            | "tab"
+                            | "tablist"
+                            | "slider"
+                            | "spinbutton"
+                    )
+                );
+                if key.chars().count() == 1
+                    || matches!(key.as_str(), "Backspace" | "Delete")
+                    || (!navigation
+                        && matches!(
+                            key.as_str(),
+                            "ArrowLeft"
+                                | "ArrowRight"
+                                | "ArrowUp"
+                                | "ArrowDown"
+                                | "Home"
+                                | "End"
+                                | "PageUp"
+                                | "PageDown"
+                        ))
+                {
+                    return;
+                }
+            }
 
             let modifiers = modifiers_from_keyboard_event(&event, this.is_mac);
             let capslock = capslock_from_keyboard_event(&event);
@@ -702,6 +786,18 @@ impl WebWindowInner {
                     modifiers,
                     capslock,
                 }));
+            }
+
+            // Candidate selection belongs to the browser IME, not the editor's
+            // Enter/Escape/arrow bindings. AltGraph also produces text rather
+            // than a Control+Alt shortcut on international keyboards. Let the
+            // browser deliver both through composition/beforeinput/input.
+            if this.is_composing.get()
+                || event.is_composing()
+                || event.key_code() == 229
+                || event.get_modifier_state("AltGraph")
+            {
+                return;
             }
 
             let key = dom_key_to_gpui_key(&event, this.is_mac);
@@ -748,8 +844,7 @@ impl WebWindowInner {
                 }
             }
 
-            if this.is_composing.get() || event.is_composing() {
-                event.prevent_default();
+            if event.key() == "Dead" {
                 return;
             }
 
@@ -771,7 +866,7 @@ impl WebWindowInner {
 
     fn register_key_up(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
-        self.listen_input("keyup", move |event: JsValue| {
+        self.listen_keyboard("keyup", move |event: JsValue| {
             let event: web_sys::KeyboardEvent = event.unchecked_into();
 
             let modifiers = modifiers_from_keyboard_event(&event, this.is_mac);

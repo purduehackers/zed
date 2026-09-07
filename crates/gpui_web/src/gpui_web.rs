@@ -5,6 +5,7 @@
 //! force either backend with [`WebBackendPreference`]. Opening a second top-level window, or
 //! reopening one after it closes, returns [`WebWindowError`].
 
+mod accessibility;
 pub mod clipboard;
 mod dispatcher;
 mod display;
@@ -16,6 +17,7 @@ mod logging;
 mod platform;
 mod window;
 
+pub use accessibility::{set_text_input_label, toggle_screen_reader_mode};
 pub use dispatcher::WebDispatcher;
 pub use display::WebDisplay;
 pub use gpui_wgpu::WebBackendPreference;

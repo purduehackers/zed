@@ -25,6 +25,8 @@ use zed_web_core::HostOs;
 use crate::assets::WebAssets;
 use crate::{keymap, web_settings, window, workspace_chrome};
 
+gpui::actions!(web, [ToggleScreenReaderMode]);
+
 /// Compile-time identity of this bundle.
 pub struct BuildInfo {
     /// `ZS_BUILD_ID` (`<zed-commit>-<patch>`) or `"dev"`.
@@ -303,6 +305,46 @@ pub fn init_after_db(
     // 31. On desktop `collab_ui::init` calls this; `collab_ui` is excluded here.
     title_bar::init(cx);
     title_bar::init_web_updates(crate::bridge::update_action, cx);
+    cx.observe_new(|editor: &mut editor::Editor, window, cx| {
+        use gpui::Focusable;
+        let Some(window) = window else {
+            return;
+        };
+        let editor_handle = cx.entity().downgrade();
+        window
+            .on_focus_in(&editor.focus_handle(cx), cx, move |_, cx| {
+                editor_handle
+                    .update(cx, |editor, cx| {
+                        let label = editor
+                            .placeholder_text(cx)
+                            .filter(|label| !label.is_empty())
+                            .unwrap_or_else(|| format!("Editor — {}", editor.title(cx)));
+                        gpui_web::set_text_input_label(&label, editor.read_only(cx));
+                    })
+                    .ok();
+            })
+            .detach();
+    })
+    .detach();
+    cx.on_action(|_: &ToggleScreenReaderMode, cx| {
+        let enabled = gpui_web::toggle_screen_reader_mode();
+        workspace::notifications::show_app_notification(
+            workspace::notifications::NotificationId::unique::<ToggleScreenReaderMode>(),
+            cx,
+            move |cx| {
+                cx.new(|cx| {
+                    workspace::notifications::simple_message_notification::MessageNotification::new(
+                        if enabled {
+                            "Screen reader mode enabled. Tab moves focus; F1 opens commands."
+                        } else {
+                            "Screen reader mode disabled."
+                        },
+                        cx,
+                    )
+                })
+            },
+        );
+    });
 
     // 32. Window background and text rendering follow the settings; the server-URL
     //     reconnect branch is desktop-only.

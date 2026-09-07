@@ -1,3 +1,4 @@
+use crate::accessibility::WebAccessibility;
 use crate::display::WebDisplay;
 use crate::events::{
     ClickState, EventListenerHandle, TouchIds, WebEventListeners, is_mac_platform,
@@ -50,6 +51,7 @@ pub(crate) struct WebWindowInner {
     pub(crate) browser_window: web_sys::Window,
     pub(crate) canvas: web_sys::HtmlCanvasElement,
     pub(crate) ime_mirror: ImeMirror,
+    accessibility: RefCell<Option<WebAccessibility>>,
     pub(crate) has_device_pixel_support: bool,
     pub(crate) is_mac: bool,
     pub(crate) state: RefCell<WebWindowMutableState>,
@@ -194,6 +196,7 @@ impl WebWindow {
             browser_window,
             canvas,
             ime_mirror,
+            accessibility: RefCell::new(None),
             has_device_pixel_support,
             is_mac,
             state: RefCell::new(mutable_state),
@@ -559,6 +562,7 @@ impl Drop for WebWindow {
 
         let canvas: &web_sys::Element = self.inner.canvas.as_ref();
         canvas.remove();
+        self.inner.accessibility.borrow_mut().take();
         self.inner.ime_mirror.remove();
         self.active_window.borrow_mut().take();
         self.lifecycle.set(WebWindowLifecycle::Closed);
@@ -681,6 +685,9 @@ impl PlatformWindow for WebWindow {
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
         self.inner.state.borrow_mut().input_handler = Some(input_handler);
+        if crate::accessibility::screen_reader_mode() {
+            ImeMirror::schedule_sync(&self.inner);
+        }
     }
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
@@ -689,6 +696,10 @@ impl PlatformWindow for WebWindow {
 
     fn set_text_input_configuration(&mut self, configuration: TextInputConfiguration) {
         self.inner.ime_mirror.apply_configuration(&configuration);
+    }
+
+    fn text_input_state_changed(&self, _: gpui::TextInputStateChange) {
+        ImeMirror::schedule_sync(&self.inner);
     }
 
     fn prompt(
@@ -719,6 +730,9 @@ impl PlatformWindow for WebWindow {
 
     fn set_title(&mut self, title: &str) {
         self.inner.state.borrow_mut().title = title.to_owned();
+        self.inner
+            .ime_mirror
+            .set_label(&format!("Editor input — {title}"));
         if let Some(document) = self.inner.browser_window.document() {
             document.set_title(title);
         }
@@ -840,7 +854,26 @@ impl PlatformWindow for WebWindow {
         Some(self.inner.state.borrow().renderer.gpu_specs())
     }
 
-    fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}
+    fn update_ime_position(&self, bounds: Bounds<Pixels>) {
+        self.inner
+            .ime_mirror
+            .set_position(bounds, &self.inner.canvas);
+    }
+
+    fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
+        if let Some(document) = self.inner.browser_window.document() {
+            match WebAccessibility::new(&document, callbacks) {
+                Ok(adapter) => *self.inner.accessibility.borrow_mut() = Some(adapter),
+                Err(error) => log::error!("Browser accessibility initialization failed: {error:?}"),
+            }
+        }
+    }
+
+    fn a11y_tree_update(&self, tree: accesskit::TreeUpdate) {
+        if let Some(adapter) = self.inner.accessibility.borrow_mut().as_mut() {
+            adapter.update(tree, self.inner.state.borrow().scale_factor);
+        }
+    }
 
     fn request_decorations(&self, _decorations: WindowDecorations) {}
 

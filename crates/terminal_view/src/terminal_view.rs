@@ -894,8 +894,14 @@ impl TerminalView {
     }
 
     ///Attempt to paste the clipboard into the terminal
-    fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        self.terminal.update(cx, |term, _| term.copy(None));
+    fn copy(&mut self, _: &Copy, _window: &mut Window, cx: &mut Context<Self>) {
+        self.terminal.update(cx, |term, _cx| {
+            term.copy(None);
+            // Browser copy events lose their writable clipboard when the
+            // handler returns; drain the queued copy before the next frame.
+            #[cfg(target_family = "wasm")]
+            term.sync(_window, _cx);
+        });
         cx.notify();
     }
 

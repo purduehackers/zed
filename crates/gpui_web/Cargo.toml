@@ -18,6 +18,7 @@ path = "src/gpui_web.rs"
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 gpui.workspace = true
+accesskit.workspace = true
 scheduler.workspace = true
 parking_lot = { workspace = true, features = ["nightly"] }
 parking_lot_core.workspace = true
@@ -59,6 +60,7 @@ web-sys = { version = "0.3", features = [
     "File",
     "HtmlCanvasElement",
     "HtmlElement",
+    "HtmlCollection",
     "HtmlTextAreaElement",
     "IdleDeadline",
     "IdleRequestOptions",

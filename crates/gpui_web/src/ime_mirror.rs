@@ -17,7 +17,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use gpui::{Autocapitalize, TextInputAction, TextInputConfiguration};
+use gpui::{Autocapitalize, Bounds, Pixels, TextInputAction, TextInputConfiguration};
 use wasm_bindgen::JsCast;
 
 use crate::window::WebWindowInner;
@@ -81,6 +81,7 @@ pub(crate) struct ImeMirror {
     /// selection has moved; a rejected import means no import is coming,
     /// so the next sync must reassert the app's state instead of waiting.
     selection_import_rejected: Cell<bool>,
+    mode_changed: Cell<bool>,
 }
 
 /// Whether the device's primary pointer is coarse (a touch screen). The
@@ -107,11 +108,15 @@ impl ImeMirror {
             .map_err(|e| anyhow::anyhow!("Created element is not a textarea: {e:?}"))?;
         let style = element.style();
         element.set_attribute("data-gpui-input", "").ok();
+        element.set_attribute("aria-label", "Editor input").ok();
+        element.set_attribute("aria-description", "F1 opens the command palette. Enable screen reader mode for full-document reading and Tab navigation.").ok();
         style.set_property("position", "fixed").ok();
         style.set_property("top", "0").ok();
         style.set_property("left", "0").ok();
         style.set_property("width", "1px").ok();
         style.set_property("height", "1px").ok();
+        style.set_property("padding", "0").ok();
+        style.set_property("border", "0").ok();
         style.set_property("opacity", "0").ok();
         // Android Chrome zooms the visual viewport onto a focused text input
         // whose font is smaller than 16px; with page zoom disabled the user
@@ -136,11 +141,13 @@ impl ImeMirror {
             window_hint: Cell::new(0),
             sync_scheduled: Cell::new(false),
             selection_import_rejected: Cell::new(false),
+            mode_changed: Cell::new(false),
         };
         // Until an input handler asks otherwise, the element is an IME
         // conduit, not a form field: browser-side text assistance would
         // mutate it behind the app's back.
         this.apply_configuration(&TextInputConfiguration::default());
+        this.screen_reader_mode_changed();
         Ok(this)
     }
 
@@ -187,6 +194,47 @@ impl ImeMirror {
 
     pub(crate) fn event_target(&self) -> &web_sys::EventTarget {
         self.element.as_ref()
+    }
+
+    pub(crate) fn set_label(&self, label: &str) {
+        if self.element.get_attribute("aria-label").as_deref() != Some(label) {
+            self.element.set_attribute("aria-label", label).ok();
+        }
+    }
+
+    pub(crate) fn screen_reader_mode_changed(&self) {
+        self.mode_changed.set(true);
+        self.element.set_read_only(primary_pointer_is_coarse());
+        self.element.set_attribute("aria-description", if crate::accessibility::screen_reader_mode() {
+            "Screen reader mode. Full document text is available. Tab moves focus out of the editor. F1 opens the command palette."
+        } else {
+            "F1 opens the command palette. Enable screen reader mode for full-document reading and Tab navigation."
+        }).ok();
+    }
+
+    /// The candidate popup is anchored to the browser's focused textarea.
+    /// GPUI supplies logical canvas coordinates; DOM styles use CSS pixels.
+    pub(crate) fn set_position(&self, bounds: Bounds<Pixels>, canvas: &web_sys::HtmlCanvasElement) {
+        let rect = canvas.get_bounding_client_rect();
+        let style = self.element.style();
+        for (property, value) in [
+            (
+                "left",
+                format!("{}px", rect.left() + f64::from(f32::from(bounds.origin.x))),
+            ),
+            (
+                "top",
+                format!("{}px", rect.top() + f64::from(f32::from(bounds.origin.y))),
+            ),
+            (
+                "height",
+                format!("{}px", f32::from(bounds.size.height).max(1.0)),
+            ),
+        ] {
+            if style.get_property_value(property).ok().as_deref() != Some(&value) {
+                style.set_property(property, &value).ok();
+            }
+        }
     }
 
     pub(crate) fn focus(&self) {
@@ -322,6 +370,8 @@ impl ImeMirror {
                 return;
             }
             let mirror = &window.ime_mirror;
+            let screen_reader = crate::accessibility::screen_reader_mode();
+            let mode_changed = mirror.mode_changed.replace(false);
             // A live element selection that differs from the stored baseline
             // while the value still matches is an IME-driven selection move
             // whose `selectionchange` import hasn't dispatched yet (the event
@@ -330,7 +380,8 @@ impl ImeMirror {
             // an in-progress gesture, e.g. Android's slide-on-backspace
             // growing its selection. The import reconciles the two sides and
             // schedules a fresh sync when it cannot adopt the move.
-            if !mirror.selection_import_rejected.replace(false)
+            if !mode_changed
+                && !mirror.selection_import_rejected.replace(false)
                 && *mirror.text.borrow() == mirror.element.value()
             {
                 let live_start = mirror.selection_start().unwrap_or(0);
@@ -340,8 +391,18 @@ impl ImeMirror {
                 }
             }
             let selection = window
-                .with_input_handler(|handler| handler.selected_text_range(false))
+                .with_input_handler(|handler| handler.selected_text_range(screen_reader))
                 .flatten();
+            if screen_reader {
+                let accepts_text = window
+                    .with_input_handler(|handler| handler.selected_text_range(false))
+                    .flatten()
+                    .is_some();
+                mirror.element.set_read_only(
+                    !accepts_text
+                        || mirror.element.get_attribute("aria-readonly").as_deref() == Some("true"),
+                );
+            }
             let Some(selection) = selection else {
                 if !mirror.text.borrow().is_empty() {
                     mirror.element.set_value("");
@@ -359,12 +420,15 @@ impl ImeMirror {
                 .with_input_handler(|handler| handler.text_input_editable_range())
                 .flatten();
 
-            if is_consistent(
-                window,
-                &selection.range,
-                editable_range.as_ref(),
-                MIN_EDGE_CHARS,
-            ) {
+            if !screen_reader
+                && !mode_changed
+                && is_consistent(
+                    window,
+                    &selection.range,
+                    editable_range.as_ref(),
+                    MIN_EDGE_CHARS,
+                )
+            {
                 return;
             }
 
@@ -373,17 +437,24 @@ impl ImeMirror {
             // tap in a plain textarea. Rewriting the value restarts the IME
             // connection, which desynchronizes the keyboard's word model
             // right when it is about to act on the tapped word.
-            if move_selection_within_window(
-                window,
-                &selection.range,
-                editable_range.as_ref(),
-                MIN_EDGE_CHARS,
-            ) {
+            if !screen_reader
+                && !mode_changed
+                && move_selection_within_window(
+                    window,
+                    &selection.range,
+                    editable_range.as_ref(),
+                    MIN_EDGE_CHARS,
+                )
+            {
                 return;
             }
 
-            let mut window_range = selection.range.start.saturating_sub(CONTEXT_CHARS)
-                ..selection.range.end + CONTEXT_CHARS;
+            let mut window_range = if screen_reader {
+                0..usize::MAX
+            } else {
+                selection.range.start.saturating_sub(CONTEXT_CHARS)
+                    ..selection.range.end + CONTEXT_CHARS
+            };
             if let Some(editable_range) = &editable_range {
                 window_range.start = window_range.start.max(editable_range.start);
                 window_range.end = window_range
