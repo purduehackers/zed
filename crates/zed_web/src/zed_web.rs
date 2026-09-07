@@ -96,15 +96,3 @@ pub fn set_update_status(status_json: String) -> Result<(), JsValue> {
         .update(|cx| title_bar::set_web_update_status(status, cx));
     Ok(())
 }
-
-/// Media remains in the browser host; GPUI renders the existing call control style.
-#[wasm_bindgen]
-pub fn set_call_status(status_json: String) -> Result<(), JsValue> {
-    let status = serde_json::from_str(&status_json)
-        .map_err(anyhow::Error::from)
-        .map_err(bridge::boot_error("bad_config"))?;
-    boot::async_app()
-        .map_err(bridge::boot_error("runtime_missing"))?
-        .update(|cx| title_bar::collab::set_web_call_status(status, cx));
-    Ok(())
-}
