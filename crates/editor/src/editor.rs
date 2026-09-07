@@ -11631,9 +11631,7 @@ impl CollaborationHub for Entity<Project> {
                 .map(|peer| {
                     (
                         peer.user_id,
-                        project::anonymous_participant::identity(peer.replica_id)
-                            .0
-                            .into(),
+                        project::anonymous_participant::name(peer.replica_id).into(),
                     )
                 })
                 .collect();

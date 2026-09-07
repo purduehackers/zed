@@ -16,7 +16,7 @@
 //! `spawnTerminal(cwd?)`, `terminals()`, `terminalInput(id, text)`,
 //! `terminalScrollback(id)`, `lifecycleEvents()`, `completionsVisible()`, `contextMenu()`,
 //! `triggerCompletion()`, `clientStateVersion()`, `clientStateStatus()`,
-//! `clientStateEvents()`, `visibilityEvents()`, `aiKeys()`, `forceDisconnect()`,
+//! `clientStateEvents()`, `visibilityEvents()`, `forceDisconnect()`,
 //! `executorProbe()`, `sharedContentionProbe()`, `workspaceLayout()`, `closeDocks()`.
 //!
 //! The `*Events()` hooks are logs the wiring in `boot` and `connect` appends to as things
@@ -29,12 +29,10 @@ use std::{
     future::Future,
     path::PathBuf,
     rc::Rc,
-    sync::Arc,
     time::Duration,
 };
 
 use anyhow::{Context as _, Result};
-use credentials_provider::CredentialsProvider as _;
 use db::client_state::ClientStateEvent;
 use editor::{
     Editor,
@@ -43,7 +41,6 @@ use editor::{
 use gpui::{App, AsyncApp, Entity, WindowHandle};
 use js_sys::{Array, Object, Promise, Reflect};
 use language::Buffer;
-use language_model::LanguageModelRegistry;
 use project::lifecycle::LifecycleKind;
 use remote::{CloseInfo, ConnectionState, RemoteConnectionOptions};
 use task::RevealStrategy;
@@ -52,9 +49,9 @@ use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use wasm_bindgen::{JsValue, prelude::Closure};
 use wasm_bindgen_futures::future_to_promise;
 use workspace::{MultiWorkspace, SaveIntent, Workspace};
-use zed_web_core::{BootStage, HostOs, ai_proxy};
+use zed_web_core::{BootStage, HostOs};
 
-use crate::{ai::ProxyCredentialsProvider, boot, bridge, connect};
+use crate::{boot, bridge, connect};
 
 mod shared_contention;
 
@@ -110,20 +107,6 @@ thread_local! {
     static CLIENT_STATE: RefCell<Vec<ClientStateRecord>> = const { RefCell::new(Vec::new()) };
     static VISIBILITY: RefCell<Vec<VisibilityRecord>> = const { RefCell::new(Vec::new()) };
     static HOST_OS: Cell<Option<HostOs>> = const { Cell::new(None) };
-    static AI: RefCell<Option<(String, Arc<ProxyCredentialsProvider>)>> =
-        const { RefCell::new(None) };
-}
-
-/// Records the page origin and the AI-proxy credentials provider `ai::install` returned, so
-/// `aiKeys()` can probe the live one rather than a second instance; called from
-/// `init::init_before_connect`.
-pub fn record_ai_credentials(origin: &str, provider: Arc<ProxyCredentialsProvider>) {
-    AI.with(|ai| *ai.borrow_mut() = Some((origin.to_owned(), provider)));
-}
-
-fn ai_credentials() -> Result<(String, Arc<ProxyCredentialsProvider>)> {
-    AI.with(|ai| ai.borrow().clone())
-        .context("the AI proxy credentials provider is not installed yet")
 }
 
 /// Records a lifecycle notice for `lifecycleEvents()`; called from `boot::handle_lifecycle`.
@@ -261,7 +244,6 @@ pub fn install() {
     hook0(&hooks, "clientStateStatus", client_state_status);
     hook0(&hooks, "clientStateEvents", client_state_events);
     hook0(&hooks, "visibilityEvents", visibility_events);
-    hook0(&hooks, "aiKeys", ai_keys);
     hook0(&hooks, "forceDisconnect", force_disconnect);
     hook0(&hooks, "executorProbe", executor_probe);
     hook0(&hooks, "sharedContentionProbe", shared_contention::probe);
@@ -1305,56 +1287,6 @@ async fn executor_probe() -> Result<JsValue> {
         "backgroundThenForeground",
         hop.map(JsValue::from_f64).unwrap_or(JsValue::NULL),
     );
-    Ok(out.into())
-}
-
-/// `{ origin, configured, providers }` for the AI proxy (b11 §6.6):
-///
-/// - `configured` is every proxied provider id whose `<origin>/api/ai/<id>` URL the real
-///   [`ProxyCredentialsProvider`] answers a credential for. It goes through
-///   `read_credentials`, so it exercises the inventory request, the single-flight cache and
-///   the placeholder — the whole path a broken install ordering would silently disable.
-/// - `providers` is what `LanguageModelRegistry` holds after `language_models::init`, with
-///   each provider's `authenticated` flag: a test asserts a seeded provider reads
-///   authenticated, and that the `localhost` providers (`ollama`, `lmstudio`, `llama.cpp`)
-///   are absent on wasm, which no host test can observe.
-///
-/// Rejects until `init_before_connect` has run `ai::install`.
-async fn ai_keys() -> Result<JsValue> {
-    let (origin, credentials) = ai_credentials()?;
-    let cx = boot::async_app()?;
-
-    let configured = Array::new();
-    for id in ai_proxy::PROXIED_LANGUAGE_MODEL_PROVIDERS
-        .iter()
-        .chain(ai_proxy::PROXIED_EDIT_PREDICTION_PROVIDERS)
-    {
-        let url = ai_proxy::proxy_api_url(&origin, id);
-        if credentials.read_credentials(&url, &cx).await?.is_some() {
-            configured.push(&JsValue::from_str(id));
-        }
-    }
-
-    let providers = cx.update(|cx| {
-        LanguageModelRegistry::global(cx)
-            .read(cx)
-            .providers()
-            .into_iter()
-            .map(|provider| (provider.id().0.to_string(), provider.is_authenticated(cx)))
-            .collect::<Vec<_>>()
-    });
-    let provider_list = Array::new();
-    for (id, authenticated) in providers {
-        let entry = Object::new();
-        set(&entry, "id", id.as_str());
-        set(&entry, "authenticated", JsValue::from_bool(authenticated));
-        provider_list.push(&entry);
-    }
-
-    let out = Object::new();
-    set(&out, "origin", origin.as_str());
-    set(&out, "configured", configured);
-    set(&out, "providers", provider_list);
     Ok(out.into())
 }
 

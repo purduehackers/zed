@@ -546,24 +546,6 @@ fn options_identity_serialization_and_debug() {
 }
 
 #[gpui::test]
-async fn test_can_dial_needs_a_token_or_provider(cx: &mut TestAppContext) {
-    let restored = WebSocketConnectionOptions::new("", "ws_1", "", "");
-    assert!(!cx.update(|cx| restored.can_dial(cx)));
-    assert!(cx.update(|cx| {
-        WebSocketConnectionOptions::new("wss://a/rpc", "ws_1", "s", "t").can_dial(cx)
-    }));
-    assert!(cx.update(|cx| {
-        restored
-            .clone()
-            .with_refresh(StubRefresh::with_responses([]))
-            .can_dial(cx)
-    }));
-    cx.update(|cx| set_session_refresh_provider(cx, StubRefresh::with_responses([])));
-    assert!(cx.update(|cx| restored.can_dial(cx)));
-    assert!(cx.update(|cx| session_refresh_provider(cx).is_some()));
-}
-
-#[gpui::test]
 async fn test_new_validates_before_dialing(cx: &mut TestAppContext) {
     init_test(cx);
     let delegate: Arc<dyn RemoteClientDelegate> = Arc::new(WebSocketClientDelegate::silent());

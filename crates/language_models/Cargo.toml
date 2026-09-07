@@ -83,11 +83,6 @@ http_client = { workspace = true, features = ["test-support"] }
 language_model = { workspace = true, features = ["test-support"] }
 parking_lot.workspace = true
 settings = { workspace = true, features = ["test-support"] }
-# Test position only, so the b11 proxy tests assert against the browser half's own
-# constants instead of a hand-copy of them. `zed_web_core`'s own dependencies are
-# `anyhow`/`collections`/`serde*`/`web-time`, so this adds no cycle and no build edge for
-# the library itself.
-zed_web_core.workspace = true
 
 [package.metadata.cargo-shear]
 ignored = ["component"]

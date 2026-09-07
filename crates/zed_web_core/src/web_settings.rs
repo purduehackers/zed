@@ -1,11 +1,4 @@
-//! The browser's default-settings overrides (b7 §4.5), deep-merged over
-//! `assets/settings/default.json` before the `SettingsStore` is built, then the AI proxy
-//! overrides of [`crate::ai_proxy`] (b11 §4.3) on top, cached per control-plane origin.
-
-use std::{
-    collections::HashMap,
-    sync::{Mutex, OnceLock},
-};
+//! Browser defaults layered over upstream settings.
 
 /// JSONC overrides applied over the shipped defaults: telemetry off, in-canvas prompts and
 /// path pickers (no native dialogs in a tab), no updater, no session restore (the shell
@@ -107,26 +100,6 @@ pub fn merge_web_defaults(base_json: &str) -> anyhow::Result<String> {
         .map_err(|error| anyhow::anyhow!("web layout defaults are not valid JSONC: {error}"))?;
     deep_merge(&mut base, layout);
     Ok(serde_json::to_string_pretty(&base)?)
-}
-
-/// The complete web defaults for one control-plane origin: [`merge_web_defaults`] over
-/// `base_json`, then [`crate::ai_proxy::merge_ai_proxy_defaults`] with `origin`. Computed
-/// once per origin and leaked, so the `&'static str` the `SettingsStore` wants survives; a
-/// cache keyed on the origin (rather than a single `OnceLock`) keeps a second boot with a
-/// different origin in the same process — a test harness — from reading the first one's URLs.
-pub fn web_defaults_for_origin(origin: &str, base_json: &str) -> anyhow::Result<&'static str> {
-    static CACHE: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(Default::default);
-    let mut cache = cache
-        .lock()
-        .map_err(|_| anyhow::anyhow!("the web defaults cache is poisoned"))?;
-    if let Some(cached) = cache.get(origin) {
-        return Ok(cached);
-    }
-    let merged = crate::ai_proxy::merge_ai_proxy_defaults(&merge_web_defaults(base_json)?, origin)?;
-    let leaked: &'static str = Box::leak(merged.into_boxed_str());
-    cache.insert(origin.to_owned(), leaked);
-    Ok(leaked)
 }
 
 pub(crate) fn deep_merge(base: &mut serde_json::Value, overrides: serde_json::Value) {
@@ -259,28 +232,6 @@ mod tests {
         assert_eq!(
             telemetry.as_ref().and_then(|telemetry| telemetry.metrics),
             Some(false)
-        );
-    }
-
-    #[test]
-    fn defaults_are_cached_per_origin() {
-        let defaults = settings::default_settings();
-        let a = web_defaults_for_origin("https://a.example.com", &defaults).unwrap();
-        let b = web_defaults_for_origin("https://b.example.com", &defaults).unwrap();
-        let a_again = web_defaults_for_origin("https://a.example.com", &defaults).unwrap();
-        assert!(
-            std::ptr::eq(a, a_again),
-            "the same origin must hit the cache"
-        );
-        assert!(!std::ptr::eq(a, b));
-        assert!(a.contains("https://a.example.com/api/ai/openai"));
-        assert!(!a.contains("b.example.com"));
-        assert!(b.contains("https://b.example.com/api/ai/codestral"));
-        let parsed: serde_json::Value = serde_json::from_str(b).unwrap();
-        assert_eq!(parsed["telemetry"]["metrics"], serde_json::json!(false));
-        assert_eq!(
-            parsed["language_models"]["ollama"]["api_url"],
-            serde_json::json!("http://localhost:11434")
         );
     }
 

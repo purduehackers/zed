@@ -2,7 +2,7 @@
 
 use gpui::{AnyElement, Context, Empty, IntoElement, MouseButton, Window};
 use project::anonymous_participant;
-use ui::{Avatar, Tooltip, prelude::*};
+use ui::{Tooltip, prelude::*};
 
 use crate::TitleBar;
 
@@ -21,7 +21,7 @@ impl TitleBar {
         let overflow = participants
             .iter()
             .skip(5)
-            .map(|peer| anonymous_participant::identity(peer.replica_id).0)
+            .map(|peer| anonymous_participant::name(peer.replica_id))
             .collect::<Vec<_>>()
             .join("\n");
         h_flex()
@@ -30,7 +30,7 @@ impl TitleBar {
             .gap_1()
             .children(participants.into_iter().take(5).map(|peer| {
                 let index = peer.replica_id.as_u16().saturating_sub(8) as u32;
-                let (name, image) = anonymous_participant::identity(peer.replica_id);
+                let name = anonymous_participant::name(peer.replica_id);
                 let label = if peer.replica_id == own {
                     format!("{name} (you)")
                 } else {
@@ -40,9 +40,18 @@ impl TitleBar {
                     .id(("anonymous-participant", peer.user_id))
                     .flex_shrink_0()
                     .child(
-                        Avatar::new(image)
-                            .size(px(24.))
-                            .border_color(cx.theme().players().color_for_participant(index).cursor),
+                        h_flex()
+                            .size(px(26.))
+                            .justify_center()
+                            .rounded_full()
+                            .border_1()
+                            .border_color(cx.theme().players().color_for_participant(index).cursor)
+                            .bg(cx.theme().colors().element_disabled)
+                            .child(
+                                Icon::new(IconName::Person)
+                                    .color(Color::Muted)
+                                    .size(IconSize::Small),
+                            ),
                     )
                     .tooltip(Tooltip::text(label))
                     .on_mouse_down(MouseButton::Left, |_, window, cx| {

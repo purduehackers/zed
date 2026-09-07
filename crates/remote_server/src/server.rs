@@ -81,10 +81,6 @@ pub enum Commands {
         stdout_socket: PathBuf,
         #[arg(long)]
         stderr_socket: PathBuf,
-        /// Override the data and configuration directory (`paths::set_custom_data_dir`).
-        /// The client never passes it; tests and sandboxes with a read-only home do.
-        #[arg(long)]
-        user_data_dir: Option<PathBuf>,
     },
     Proxy {
         #[arg(long)]
@@ -108,14 +104,12 @@ pub fn run(command: Commands) -> anyhow::Result<()> {
             stdin_socket,
             stdout_socket,
             stderr_socket,
-            user_data_dir,
         } => execute_run(
             log_file,
             pid_file,
             stdin_socket,
             stdout_socket,
             stderr_socket,
-            user_data_dir,
         ),
         Commands::Proxy {
             identifier,
@@ -564,6 +558,7 @@ fn start_server(
 }
 
 /// Applies a `--user-data-dir` override before any path is resolved.
+#[cfg(feature = "serve")]
 pub(crate) fn set_user_data_dir(dir: Option<&Path>) -> anyhow::Result<()> {
     let Some(dir) = dir else {
         return Ok(());
@@ -600,9 +595,7 @@ pub fn execute_run(
     stdin_socket: PathBuf,
     stdout_socket: PathBuf,
     stderr_socket: PathBuf,
-    user_data_dir: Option<PathBuf>,
 ) -> Result<()> {
-    set_user_data_dir(user_data_dir.as_deref())?;
     init_paths()?;
 
     let startup_time = Instant::now();

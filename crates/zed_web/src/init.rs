@@ -23,7 +23,7 @@ use workspace::{AppState, WorkspaceDb, WorkspaceSettings, WorkspaceStore};
 use zed_web_core::HostOs;
 
 use crate::assets::WebAssets;
-use crate::{ai, keymap, web_edit_prediction, web_settings, window, workspace_chrome};
+use crate::{keymap, web_settings, window, workspace_chrome};
 
 /// Compile-time identity of this bundle.
 pub struct BuildInfo {
@@ -41,18 +41,12 @@ fn platform_style(host_os: HostOs) -> ui::PlatformStyle {
     }
 }
 
-/// Everything that must exist before the transport dials: fonts, the platform style, the
-/// settings store and keymaps, the filesystem, the extension proxy, the AI-proxy
-/// credentials provider and the `Client`. `origin` is the control plane's
-/// (`scheme://host[:port]`): the seeded `api_url`s and the keys routes hang off it.
-/// Returns the client and the proxy; the caller then connects and opens the database,
-/// because `trusted_worktrees::init` and `workspace::init` need the `AppDatabase`.
+/// Initializes the platform, settings and client before opening the remote database.
 pub fn init_before_connect(
     fs: Arc<dyn Fs>,
     assets: &WebAssets,
     host_os: HostOs,
     settings_json: &str,
-    origin: &str,
     build: &BuildInfo,
     cx: &mut App,
 ) -> Result<(Arc<Client>, Arc<ExtensionHostProxy>)> {
@@ -75,10 +69,8 @@ pub fn init_before_connect(
         AppCommitSha::set_global(commit_sha.clone(), cx);
     }
 
-    // 4. Settings from the shell document, over defaults that point every bring-your-own-key
-    //    model provider at `<origin>/api/ai/<provider>` (b11); `zlog_settings::init` is
-    //    desktop-only.
-    web_settings::init(fs.clone(), settings_json, origin, cx);
+    // 4. Apply the shell's settings over browser defaults.
+    web_settings::init(fs.clone(), settings_json, cx);
 
     // 5. Keymaps, watching the user keymap in the WasmFs.
     let (user_keymap_file_rx, user_keymap_watcher) = settings::watch_config_file(
@@ -103,15 +95,7 @@ pub fn init_before_connect(
     extension::init(cx);
     let extension_host_proxy = ExtensionHostProxy::global(cx);
 
-    // 8a. The AI-proxy credentials provider (the `zed_credentials_provider` global) and the
-    //     notice-raising HTTP client, before `Client::production` captures both (b11 §3.18).
-    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
-    let ai_credentials = ai::install(origin, cx);
-    #[cfg(feature = "test-hooks")]
-    crate::test_hooks::record_ai_credentials(origin, ai_credentials);
-
-    // 9. The collaboration client, transport-less in the browser: the base HTTP client is
-    //    the `fetch`-backed one from `application_with_web_backend` (wrapped in 8a).
+    // 9. The collaboration client uses the platform's fetch-backed HTTP client.
     //    Telemetry, ids and `authenticate` are skipped (telemetry is also off in the web
     //    defaults).
     let client = Client::production(cx);
@@ -126,17 +110,13 @@ pub fn init_before_connect(
     Ok((client, extension_host_proxy))
 }
 
-/// Everything after the client-state database is open: registries, stores, panels, actions
-/// and the workspace chrome. `origin` is the same control-plane origin as in
-/// [`init_before_connect`] (the proxied edit-prediction endpoints hang off it). Returns the
-/// `AppState`.
+/// Initializes registries, stores, panels and workspace chrome after the database opens.
 pub fn init_after_db(
     client: Arc<Client>,
     fs: Arc<dyn Fs>,
     assets: WebAssets,
     extension_host_proxy: Arc<ExtensionHostProxy>,
     session: Session,
-    origin: &str,
     cx: &mut App,
 ) -> Arc<AppState> {
     // 11. Trusted worktrees from the restored image.
@@ -231,19 +211,11 @@ pub fn init_after_db(
     );
     copilot_ui::init(&app_state, cx);
 
-    // 22. Language models: the API-key providers, whose `api_url`s were seeded to the proxy
-    //     in step 4 and whose keys the step-8a provider answers. Bedrock, the ChatGPT
-    //     subscription, extension providers and the `localhost` providers (Ollama, LM Studio,
-    //     llama.cpp — unreachable under the editor CSP) are gated out in `language_models`.
+    // 22. Upstream language-model registries; AI is disabled by the app's settings.
     language_model::init(cx);
     RefreshLlmTokenListener::register(app_state.client.clone(), app_state.user_store.clone(), cx);
     language_models::init(app_state.user_store.clone(), app_state.client.clone(), cx);
-    // 22a. An OpenCode model whose `custom_model_api_url` leaves the proxy is blocked by the
-    //      editor CSP; say so once when such a model is selected (b11 §7 item 4b).
-    ai::watch_default_model(origin, cx);
-
-    // 23. Tools. `zed::telemetry_log` and `zed::remote_debug` are `crates/zed` modules
-    //     (follow-up); `zed::edit_prediction_registry` has its browser form at step 30a.
+    // 23. Tools.
     acp_tools::init(cx);
     edit_prediction_ui::init(cx);
     web_search::init(cx);
@@ -325,14 +297,6 @@ pub fn init_after_db(
     settings_ui::init(cx);
     keymap_editor::init(cx);
     edit_prediction::init(cx);
-    // 30a. The browser edit-prediction registry (b11 §3.19), after `edit_prediction::init`
-    //      so the crate's globals exist before editors are observed.
-    web_edit_prediction::init(
-        app_state.client.clone(),
-        app_state.user_store.clone(),
-        origin,
-        cx,
-    );
     json_schema_store::init(cx);
     which_key::init(cx);
 

@@ -161,12 +161,6 @@ impl WebSocketConnectionOptions {
             .unwrap_or_else(|| self.workspace_id.clone())
     }
 
-    /// Whether a dial can be attempted: there is a token, a refresh callback, or a
-    /// process-wide refresh provider.
-    pub fn can_dial(&self, cx: &App) -> bool {
-        !self.token.is_empty() || self.refresh.is_some() || session_refresh_provider(cx).is_some()
-    }
-
     /// The server's last close frame, or the close synthesized after a terminal refresh error
     /// (4003 for `Unauthorized`, 1001 for `Stopped`).
     ///

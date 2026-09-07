@@ -26,12 +26,12 @@ use workspace::{
         NotificationId, show_app_notification, simple_message_notification::MessageNotification,
     },
 };
-use zed_web_core::{AssetPack, Backend, BootConfig, BootError, BootStage, ai_proxy};
+use zed_web_core::{AssetPack, Backend, BootConfig, BootError, BootStage};
 
 use crate::assets::WebAssets;
 use crate::bridge::{self, JsHost};
 use crate::init::{self, BuildInfo};
-use crate::{ai, connect, keymap, web_settings};
+use crate::{connect, keymap, web_settings};
 
 /// The whole boot must reach `ready` within this budget.
 const BOOT_TIMEOUT: Duration = Duration::from_secs(90);
@@ -218,16 +218,6 @@ async fn boot_in_app(
     log::info!("host os: {}", host_os.as_str());
     #[cfg(feature = "test-hooks")]
     crate::test_hooks::record_host_os(host_os);
-    // The control plane's origin: the shell's value when it passed one, else the page's.
-    // The AI proxy and the keys page hang off it (b11).
-    let origin = match &config.origin {
-        Some(origin) => ai_proxy::normalize_origin(origin)
-            .map_err(|error| BootError::new("bad_config", format!("origin: {error:#}")))?,
-        None => ai::page_origin()
-            .map_err(|error| BootError::new("bad_config", format!("page origin: {error:#}")))?,
-    };
-    log::info!("control-plane origin: {origin}");
-
     // 3a. Settings and keymap seeded into the in-memory filesystem (D11).
     bridge::progress(BootStage::Settings, "");
     let fs: Arc<WasmFs> = cx.update(|cx| WasmFs::new(cx.background_executor().clone()));
@@ -246,7 +236,6 @@ async fn boot_in_app(
                 &assets,
                 host_os,
                 &config.settings_json,
-                &origin,
                 &build,
                 cx,
             )
@@ -316,7 +305,6 @@ async fn boot_in_app(
             assets,
             extension_host_proxy,
             session,
-            &origin,
             cx,
         )
     });

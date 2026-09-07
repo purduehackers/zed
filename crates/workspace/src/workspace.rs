@@ -11130,7 +11130,7 @@ pub fn open_remote_project_with_existing_connection(
 }
 
 /// A remote project opened in a brand-new window by
-/// [`open_remote_project_in_new_window_with_client`] or [`open_remote_project_in_new_window`].
+/// [`open_remote_project_in_new_window_with_client`].
 pub struct OpenedRemoteProject {
     /// The new window.
     pub window: WindowHandle<MultiWorkspace>,
@@ -11179,66 +11179,6 @@ pub fn open_remote_project_in_new_window_with_client(
             cx,
         )
         .await
-    })
-}
-
-/// Desktop convenience for [`open_remote_project_in_new_window_with_client`]: builds the
-/// `RemoteClient` from an already-dialed connection with
-/// `ConnectionIdentifier::Workspace(workspace_id)`, then opens the window the same way.
-/// Resolves to `None` when `cancel_rx` fires before the client is ready.
-pub fn open_remote_project_in_new_window(
-    remote_connection: Arc<dyn RemoteConnection>,
-    cancel_rx: oneshot::Receiver<()>,
-    delegate: Arc<dyn RemoteClientDelegate>,
-    app_state: Arc<AppState>,
-    paths: Vec<PathBuf>,
-    window_options: WindowOptions,
-    cx: &mut App,
-) -> Task<Result<Option<OpenedRemoteProject>>> {
-    cx.spawn(async move |cx| {
-        let (workspace_id, serialized_workspace) =
-            deserialize_remote_project(remote_connection.connection_options(), paths.clone(), cx)
-                .await?;
-
-        let remote = match cx
-            .update(|cx| {
-                remote::RemoteClient::new(
-                    ConnectionIdentifier::Workspace(workspace_id.0),
-                    remote_connection,
-                    cancel_rx,
-                    delegate,
-                    cx,
-                )
-            })
-            .await?
-        {
-            Some(remote) => remote,
-            None => return Ok(None),
-        };
-
-        let project = cx.update(|cx| {
-            project::Project::remote(
-                remote,
-                app_state.client.clone(),
-                app_state.node_runtime.clone(),
-                app_state.user_store.clone(),
-                app_state.languages.clone(),
-                app_state.fs.clone(),
-                true,
-                cx,
-            )
-        });
-        open_remote_project_in_new_window_inner(
-            project,
-            paths,
-            workspace_id,
-            serialized_workspace,
-            app_state,
-            window_options,
-            cx,
-        )
-        .await
-        .map(Some)
     })
 }
 
@@ -12389,33 +12329,6 @@ mod tests {
             assert_eq!(project.worktrees(cx).count(), 1);
             assert!(workspace.database_id().is_some());
         });
-
-        // The connection-taking form resolves to `None` when cancelled before the client is
-        // ready, and opens no window.
-        let (opts, _server_client, connect_guard) = RemoteClient::fake_server(cx, server_cx);
-        drop(connect_guard);
-        let delegate: Arc<dyn remote::RemoteClientDelegate> = Arc::new(remote::MockDelegate);
-        let connection = remote::connect(opts, delegate.clone(), &mut cx.to_async())
-            .await
-            .unwrap();
-        let (cancel_tx, cancel_rx) = oneshot::channel();
-        drop(cancel_tx);
-        let cancelled = cx
-            .update(|cx| {
-                open_remote_project_in_new_window(
-                    connection,
-                    cancel_rx,
-                    delegate,
-                    app_state,
-                    vec![PathBuf::from("/workspaces/repo")],
-                    WindowOptions::default(),
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
-        assert!(cancelled.is_none());
-        assert_eq!(cx.update(|cx| cx.windows().len()), 1);
     }
 
     #[gpui::test]

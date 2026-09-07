@@ -9726,7 +9726,6 @@ dependencies = [
  "ui_input",
  "util",
  "x_ai",
- "zed_web_core",
 ]
 
 [[package]]
@@ -23306,12 +23305,10 @@ dependencies = [
  "chrono",
  "client",
  "clock",
- "codestral",
  "collections",
  "command_palette",
  "copilot_chat",
  "copilot_ui",
- "credentials_provider",
  "dap_adapters",
  "db",
  "debug_adapter_extension",

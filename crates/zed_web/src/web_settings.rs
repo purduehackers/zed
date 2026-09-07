@@ -4,7 +4,12 @@
 //! `settings.json`/`keymap.json` to the control plane (b6 §7 item 8: the only two documents
 //! stored in v0).
 
-use std::{cell::RefCell, path::Path, sync::Arc, time::Duration};
+use std::{
+    cell::RefCell,
+    path::Path,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use collections::HashMap;
 use fs::{Fs, WasmFs};
@@ -35,11 +40,13 @@ thread_local! {
     static IN_FLIGHT: RefCell<Vec<SaveTask>> = const { RefCell::new(Vec::new()) };
 }
 
-/// `assets/settings/default.json` with the web overrides and the AI-proxy `api_url`s for
-/// `origin` (b11 §4.3) merged in; computed once per origin.
-pub fn web_default_settings(origin: &str) -> &'static str {
-    zed_web_core::web_defaults_for_origin(origin, &settings::default_settings())
-        .expect("the shipped default settings must merge with the web overrides")
+/// Upstream defaults plus browser-only overrides, parsed once for the settings store.
+fn web_default_settings() -> &'static str {
+    static DEFAULTS: LazyLock<String> = LazyLock::new(|| {
+        zed_web_core::merge_web_defaults(&settings::default_settings())
+            .expect("the shipped default settings must merge with the web overrides")
+    });
+    &DEFAULTS
 }
 
 /// Creates `settings.json` and `keymap.json` under `paths::config_dir()` from the
@@ -67,12 +74,9 @@ pub fn seed_config_files(fs: &Arc<WasmFs>, settings_json: &str, keymap_json: &st
     log::debug!("seeded {} config file(s)", seeded.len());
 }
 
-/// `settings::init` with the web defaults for `origin` (the control plane the AI proxy lives
-/// at), the user document applied synchronously (boot never waits for a watcher tick), then
-/// the file watchers so the user, global and profile files stay live through the `WasmFs`
-/// watcher. A user's own `api_url` in `settings.json` still wins over the seeded default.
-pub fn init(fs: Arc<dyn Fs>, settings_json: &str, origin: &str, cx: &mut App) {
-    let store = SettingsStore::new(cx, web_default_settings(origin));
+/// Applies the shell document synchronously, then watches in-memory settings files.
+pub fn init(fs: Arc<dyn Fs>, settings_json: &str, cx: &mut App) {
+    let store = SettingsStore::new(cx, web_default_settings());
     cx.set_global(store);
     SettingsStore::observe_active_settings_profile_name(cx).detach();
 

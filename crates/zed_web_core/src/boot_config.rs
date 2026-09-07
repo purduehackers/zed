@@ -25,14 +25,6 @@ pub struct BootConfig {
     /// `"mac" | "windows" | "linux"`; `None` = detect from `navigator`.
     #[serde(default)]
     pub host_os: Option<String>,
-    /// The control-plane origin (`scheme://host[:port]`) the AI proxy (`/api/ai/*`) and the
-    /// keys page live at; `None` = `window.location.origin`, which is what the shell relies
-    /// on. In a browser any other value cannot work: the `zs_ai` cookie is sent same-origin
-    /// only and the editor CSP allows `connect-src 'self'`, so a foreign origin's requests
-    /// are refused before they leave the tab. The field exists for native and unit harnesses
-    /// that have no `window` (b11 §3.18).
-    #[serde(default)]
-    pub origin: Option<String>,
 }
 
 /// One `/connect` result (D26). `session_id` is minted per `/connect` and informational
@@ -245,7 +237,6 @@ mod tests {
         assert_eq!(config.keymap_json, "");
         assert_eq!(config.backend, Backend::Auto);
         assert_eq!(config.host_os, None);
-        assert_eq!(config.origin, None);
         assert!(config.workspace.paths.is_empty());
         assert_eq!(config.workspace.id, "ws_1");
         assert_eq!(config.connect.session_id, "con_1");
@@ -260,14 +251,12 @@ mod tests {
                              "serverBuild": "abc1234-0",
                              "sessionExpiresAt": "2026-09-03T00:00:00Z" },
                 "workspace": { "id": "ws_1", "paths": ["/workspaces/repo"] },
-                "settingsJson": "{}", "keymapJson": "[]", "backend": "webgl", "hostOs": "windows",
-                "origin": "https://zs.example.com"
+                "settingsJson": "{}", "keymapJson": "[]", "backend": "webgl", "hostOs": "windows"
             }"#,
         )
         .unwrap();
         assert_eq!(config.backend, Backend::WebGl);
         assert_eq!(config.host_os.as_deref(), Some("windows"));
-        assert_eq!(config.origin.as_deref(), Some("https://zs.example.com"));
         assert_eq!(config.workspace.paths, vec!["/workspaces/repo".to_string()]);
     }
 

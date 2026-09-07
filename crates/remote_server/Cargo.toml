@@ -17,7 +17,7 @@ doctest = false
 name = "remote_server"
 
 [features]
-default = ["serve"]
+default = []
 debug-embed = ["dep:rust-embed"]
 test-support = ["fs/test-support"]
 serve = [

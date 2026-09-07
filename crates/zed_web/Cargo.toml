@@ -64,7 +64,6 @@ assets.workspace = true
 client.workspace = true
 clock.workspace = true
 collections.workspace = true
-credentials_provider.workspace = true
 db.workspace = true
 extension.workspace = true
 feature_flags.workspace = true
@@ -101,9 +100,6 @@ activity_indicator.workspace = true
 breadcrumbs.workspace = true
 call_hierarchy.workspace = true
 channel.workspace = true
-# The Codestral edit-prediction delegate for the browser registry (b11 §3.19); already in the
-# closure through `edit_prediction_ui` and `settings_ui`.
-codestral.workspace = true
 command_palette.workspace = true
 copilot_chat.workspace = true
 copilot_ui.workspace = true

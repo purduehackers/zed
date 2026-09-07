@@ -11,7 +11,6 @@
 //! Every dependency but `zed_web_core` sits in the wasm target table and this root is
 //! `#![cfg(target_family = "wasm")]`, so native workspace commands see an empty crate.
 
-mod ai;
 mod assets;
 mod boot;
 mod bridge;
@@ -20,12 +19,10 @@ mod init;
 mod keymap;
 #[cfg(feature = "test-hooks")]
 mod test_hooks;
-mod web_edit_prediction;
 mod web_settings;
 mod window;
 mod workspace_chrome;
 
-pub use ai::{ManageAiKeys, ProxyCredentialsProvider};
 pub use bridge::{current_session, ensure_fresh_token};
 pub use zed_web_core::{BootConfig, BootError, BootStage, ConnectInfo, HostOs};
 
