@@ -1,39 +1,72 @@
+#[cfg(not(target_family = "wasm"))]
 mod native_kernel;
-use std::{fmt::Debug, future::Future, path::PathBuf};
+mod specifications;
+pub use specifications::*;
+#[cfg(target_family = "wasm")]
+mod web_kernel;
+#[cfg(not(target_family = "wasm"))]
+use std::future::Future;
+use std::{fmt::Debug, path::PathBuf};
+#[cfg(target_family = "wasm")]
+pub use web_kernel::*;
 
 use futures::{channel::mpsc, future::Shared};
-use gpui::{App, Entity, Task, Window};
+#[cfg(not(target_family = "wasm"))]
+use gpui::Entity;
+use gpui::{App, Task, Window};
+#[cfg(not(target_family = "wasm"))]
 use language::LanguageName;
+#[cfg(not(target_family = "wasm"))]
 use log;
+#[cfg(not(target_family = "wasm"))]
 pub use native_kernel::*;
 
+#[cfg(not(target_family = "wasm"))]
 mod remote_kernels;
+#[cfg(not(target_family = "wasm"))]
 use project::{Project, ProjectPath, Toolchains, WorktreeId};
+#[cfg(not(target_family = "wasm"))]
 use remote::RemoteConnectionOptions;
+#[cfg(not(target_family = "wasm"))]
 pub use remote_kernels::*;
 
+#[cfg(not(target_family = "wasm"))]
 mod ssh_kernel;
+#[cfg(not(target_family = "wasm"))]
 pub use ssh_kernel::*;
 
+#[cfg(not(target_family = "wasm"))]
 mod wsl_kernel;
+#[cfg(not(target_family = "wasm"))]
 pub use wsl_kernel::*;
 
+#[cfg(not(target_family = "wasm"))]
 use std::collections::HashMap;
 
+#[cfg(not(target_family = "wasm"))]
 use anyhow::Result;
+#[cfg(not(target_family = "wasm"))]
 use futures::{FutureExt, StreamExt};
-use gpui::{AppContext, AsyncWindowContext, Context};
-use jupyter_protocol::{JupyterKernelspec, JupyterMessageContent};
+use gpui::Context;
+#[cfg(not(target_family = "wasm"))]
+use gpui::{AppContext, AsyncWindowContext};
+use jupyter_protocol::JupyterKernelspec;
+#[cfg(not(target_family = "wasm"))]
+use jupyter_protocol::JupyterMessageContent;
+use jupyter_protocol::{ExecutionState, JupyterMessage, KernelInfoReply};
+#[cfg(not(target_family = "wasm"))]
 use runtimelib::{
     ClientControlConnection, ClientIoPubConnection, ClientShellConnection, ClientStdinConnection,
-    ExecutionState, JupyterMessage, KernelInfoReply,
 };
 use ui::{Icon, IconName, SharedString};
+#[cfg(not(target_family = "wasm"))]
 use util::rel_path::RelPath;
 
+#[cfg(not(target_family = "wasm"))]
 pub(crate) const VENV_DIR_NAMES: &[&str] = &[".venv", "venv", ".env", "env"];
 
 // Build a POSIX shell script that attempts to find and exec the best Python binary to run with the given arguments.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn build_python_exec_shell_script(
     python_args: &str,
     cd_command: &str,
@@ -87,6 +120,7 @@ pub(crate) fn build_python_discovery_shell_script() -> String {
     )
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub fn start_kernel_tasks<S: KernelSession + 'static>(
     session: Entity<S>,
     iopub_socket: ClientIoPubConnection,
@@ -244,6 +278,8 @@ impl PythonEnvKernelSpecification {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KernelSpecification {
+    #[cfg(target_family = "wasm")]
+    Web(WebKernelSpecification),
     JupyterServer(RemoteKernelSpecification),
     Jupyter(LocalKernelSpecification),
     PythonEnv(PythonEnvKernelSpecification),
@@ -298,6 +334,8 @@ impl Eq for WslKernelSpecification {}
 impl KernelSpecification {
     pub fn name(&self) -> SharedString {
         match self {
+            #[cfg(target_family = "wasm")]
+            Self::Web(spec) => spec.name.clone(),
             Self::Jupyter(spec) => spec.name.clone().into(),
             Self::PythonEnv(spec) => spec.name.clone().into(),
             Self::JupyterServer(spec) => spec.name.clone().into(),
@@ -308,6 +346,8 @@ impl KernelSpecification {
 
     pub fn type_name(&self) -> SharedString {
         match self {
+            #[cfg(target_family = "wasm")]
+            Self::Web(_) => "Sandbox".into(),
             Self::Jupyter(_) => "Jupyter".into(),
             Self::PythonEnv(spec) => SharedString::from(
                 spec.environment_kind
@@ -322,6 +362,8 @@ impl KernelSpecification {
 
     pub fn path(&self) -> SharedString {
         SharedString::from(match self {
+            #[cfg(target_family = "wasm")]
+            Self::Web(spec) => spec.python.clone().unwrap_or_default().to_string(),
             Self::Jupyter(spec) => spec.path.to_string_lossy().into_owned(),
             Self::PythonEnv(spec) => spec.path.to_string_lossy().into_owned(),
             Self::JupyterServer(spec) => spec.url.to_string(),
@@ -332,6 +374,8 @@ impl KernelSpecification {
 
     pub fn language(&self) -> SharedString {
         SharedString::from(match self {
+            #[cfg(target_family = "wasm")]
+            Self::Web(_) => "python".to_owned(),
             Self::Jupyter(spec) => spec.kernelspec.language.clone(),
             Self::PythonEnv(spec) => spec.kernelspec.language.clone(),
             Self::JupyterServer(spec) => spec.kernelspec.language.clone(),
@@ -342,6 +386,8 @@ impl KernelSpecification {
 
     pub fn has_ipykernel(&self) -> bool {
         match self {
+            #[cfg(target_family = "wasm")]
+            Self::Web(_) => true,
             Self::Jupyter(_) | Self::JupyterServer(_) | Self::SshRemote(_) | Self::WslRemote(_) => {
                 true
             }
@@ -351,6 +397,8 @@ impl KernelSpecification {
 
     pub fn environment_kind_label(&self) -> Option<SharedString> {
         match self {
+            #[cfg(target_family = "wasm")]
+            Self::Web(_) => Some("Sandbox".into()),
             Self::PythonEnv(spec) => spec
                 .environment_kind
                 .as_ref()
@@ -364,6 +412,8 @@ impl KernelSpecification {
 
     pub fn icon(&self, cx: &App) -> Icon {
         let lang_name = match self {
+            #[cfg(target_family = "wasm")]
+            Self::Web(_) => "python".to_owned(),
             Self::Jupyter(spec) => spec.kernelspec.language.clone(),
             Self::PythonEnv(spec) => spec.kernelspec.language.clone(),
             Self::JupyterServer(spec) => spec.kernelspec.language.clone(),
@@ -378,6 +428,7 @@ impl KernelSpecification {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn extract_environment_kind(toolchain_json: &serde_json::Value) -> Option<String> {
     let kind_str = toolchain_json.get("kind")?.as_str()?;
     let label = match kind_str {
@@ -405,6 +456,7 @@ fn extract_environment_kind(toolchain_json: &serde_json::Value) -> Option<String
     Some(label.to_string())
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub fn python_env_kernel_specifications(
     project: &Entity<Project>,
     worktree_id: WorktreeId,

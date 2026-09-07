@@ -22,22 +22,7 @@ use std::{
 
 use uuid::Uuid;
 
-use super::{KernelSession, RunningKernel, start_kernel_tasks};
-
-#[derive(Debug, Clone)]
-pub struct LocalKernelSpecification {
-    pub name: String,
-    pub path: PathBuf,
-    pub kernelspec: JupyterKernelspec,
-}
-
-impl PartialEq for LocalKernelSpecification {
-    fn eq(&self, other: &Self) -> bool {
-        self.name == other.name && self.path == other.path
-    }
-}
-
-impl Eq for LocalKernelSpecification {}
+use super::{KernelSession, LocalKernelSpecification, RunningKernel, start_kernel_tasks};
 
 impl LocalKernelSpecification {
     #[must_use]

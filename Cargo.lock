@@ -23369,6 +23369,7 @@ dependencies = [
  "recent_projects",
  "release_channel",
  "remote",
+ "repl",
  "search",
  "serde",
  "serde_json",

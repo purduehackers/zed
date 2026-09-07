@@ -1,7 +1,7 @@
 use futures::{SinkExt as _, channel::mpsc};
 use gpui::{App, AppContext as _, Entity, Task, Window};
 use http_client::{AsyncBody, HttpClient, Request};
-use jupyter_protocol::{ExecutionState, JupyterKernelspec, JupyterMessage, KernelInfoReply};
+use jupyter_protocol::{ExecutionState, JupyterMessage, KernelInfoReply};
 
 use async_tungstenite::tokio::connect_async;
 use async_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue};
@@ -9,21 +9,13 @@ use async_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValu
 use futures::StreamExt;
 use smol::io::AsyncReadExt as _;
 
-use super::{KernelSession, RunningKernel};
+use super::{KernelSession, RemoteKernelSpecification, RunningKernel};
 use anyhow::Result;
 use jupyter_websocket_client::{
     JupyterWebSocket, JupyterWebSocketReader, JupyterWebSocketWriter, KernelLaunchRequest,
     KernelSpecsResponse, ProtocolMode, RemoteServer,
 };
 use std::{fmt::Debug, sync::Arc};
-
-#[derive(Debug, Clone)]
-pub struct RemoteKernelSpecification {
-    pub name: String,
-    pub url: String,
-    pub token: String,
-    pub kernelspec: JupyterKernelspec,
-}
 
 pub async fn launch_remote_kernel(
     remote_server: &RemoteServer,
@@ -103,14 +95,6 @@ pub async fn list_remote_kernelspecs(
     anyhow::ensure!(!remote_kernelspecs.is_empty(), "No kernel specs found");
     Ok(remote_kernelspecs)
 }
-
-impl PartialEq for RemoteKernelSpecification {
-    fn eq(&self, other: &Self) -> bool {
-        self.name == other.name && self.url == other.url
-    }
-}
-
-impl Eq for RemoteKernelSpecification {}
 
 pub struct RemoteRunningKernel {
     remote_server: RemoteServer,

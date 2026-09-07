@@ -1,11 +1,14 @@
 use crate::components::KernelListItem;
+#[cfg(target_family = "wasm")]
+use crate::kernels::WebRunningKernel;
+#[cfg(not(target_family = "wasm"))]
+use crate::kernels::{
+    NativeRunningKernel, RemoteRunningKernel, SshRunningKernel, WslRunningKernel,
+};
 use crate::setup_editor_session_actions;
 use crate::{
     KernelStatus,
-    kernels::{
-        Kernel, KernelSession, KernelSpecification, NativeRunningKernel, RemoteRunningKernel,
-        SshRunningKernel, WslRunningKernel,
-    },
+    kernels::{Kernel, KernelSession, KernelSpecification},
     outputs::{
         ExecutionStatus, ExecutionView, ExecutionViewFinishedEmpty, ExecutionViewFinishedSmall,
         InputReplyEvent,
@@ -32,12 +35,12 @@ use futures::FutureExt as _;
 use gpui::{
     Context, Entity, EventEmitter, Render, Subscription, Task, WeakEntity, Window, div, prelude::*,
 };
-use language::Point;
-use project::Fs;
-use runtimelib::{
+use jupyter_protocol::{
     ExecuteRequest, ExecutionState, InputReply, InterruptRequest, JupyterMessage,
     JupyterMessageContent, KernelInfoRequest, ReplyStatus, ShutdownRequest,
 };
+use language::Point;
+use project::Fs;
 use settings::Settings as _;
 use std::{env::temp_dir, ops::Range, sync::Arc, time::Duration};
 use theme::ActiveTheme;
@@ -45,6 +48,7 @@ use ui::{IconButtonShape, Tooltip, prelude::*};
 use util::ResultExt as _;
 
 pub struct Session {
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     fs: Arc<dyn Fs>,
     editor: WeakEntity<Editor>,
     pub kernel: Kernel,
@@ -267,14 +271,16 @@ impl Session {
 
     fn start_kernel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let kernel_language = self.kernel_specification.language();
+        #[cfg(not(target_family = "wasm"))]
         let entity_id = self.editor.entity_id();
 
         // For WSL Remote kernels, use project root instead of potentially temporary working directory
         // which causes .venv/bin/python checks to fail
-        let is_remote_execution = matches!(
-            self.kernel_specification,
-            crate::KernelSpecification::WslRemote(_) | crate::KernelSpecification::SshRemote(_)
-        );
+        let is_remote_execution = cfg!(target_family = "wasm")
+            || matches!(
+                self.kernel_specification,
+                crate::KernelSpecification::WslRemote(_) | crate::KernelSpecification::SshRemote(_)
+            );
 
         let working_directory = if is_remote_execution {
             // For WSL Remote kernels, use project root instead of potentially temporary working directory
@@ -306,6 +312,14 @@ impl Session {
 
         let session_view = cx.entity();
 
+        #[cfg(target_family = "wasm")]
+        let kernel = match self.kernel_specification.clone() {
+            KernelSpecification::Web(spec) => {
+                WebRunningKernel::new(spec, working_directory, session_view, window, cx)
+            }
+            _ => Task::ready(Err(anyhow::anyhow!("Choose a sandbox Python kernel"))),
+        };
+        #[cfg(not(target_family = "wasm"))]
         let kernel = match self.kernel_specification.clone() {
             KernelSpecification::Jupyter(kernel_specification) => NativeRunningKernel::new(
                 kernel_specification,

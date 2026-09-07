@@ -137,6 +137,7 @@ project_panel.workspace = true
 project_symbols.workspace = true
 prompt_store.workspace = true
 recent_projects.workspace = true
+repl.workspace = true
 # ZS-TODO(b7): `repl` joins once its `jupyter-websocket-client` (tokio) and `runtimelib`
 # (aws-lc-rs) edges are gated for wasm; today they pull forbidden crates into the closure.
 search.workspace = true

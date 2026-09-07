@@ -7,6 +7,7 @@ use command_palette_hooks::CommandPaletteFilter;
 use gpui::{
     App, Context, Entity, EntityId, Global, SharedString, Subscription, Task, TaskExt, prelude::*,
 };
+#[cfg(not(target_family = "wasm"))]
 use jupyter_websocket_client::RemoteServer;
 use language::{Language, LanguageName};
 use project::{Fs, Project, ProjectPath, WorktreeId};
@@ -14,9 +15,10 @@ use remote::RemoteConnectionOptions;
 use settings::{Settings, SettingsStore};
 use util::rel_path::RelPath;
 
+use crate::kernels::{Kernel, PythonEnvKernelSpecification, python_env_kernel_specifications};
+#[cfg(not(target_family = "wasm"))]
 use crate::kernels::{
-    Kernel, PythonEnvKernelSpecification, list_remote_kernelspecs, local_kernel_specifications,
-    python_env_kernel_specifications, wsl_kernel_specifications,
+    list_remote_kernelspecs, local_kernel_specifications, wsl_kernel_specifications,
 };
 use crate::{JupyterSettings, KernelSpecification, Session};
 
@@ -214,6 +216,7 @@ impl ReplStore {
         })
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn get_remote_kernel_specifications(
         &self,
         cx: &mut Context<Self>,
@@ -252,29 +255,35 @@ impl ReplStore {
     }
 
     pub fn refresh_kernelspecs(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
-        let local_kernel_specifications = local_kernel_specifications(self.fs.clone());
-        let wsl_kernel_specifications = wsl_kernel_specifications(cx.background_executor().clone());
-        let remote_kernel_specifications = self.get_remote_kernel_specifications(cx);
+        #[cfg(not(target_family = "wasm"))]
+        let all_specs = {
+            let local_kernel_specifications = local_kernel_specifications(self.fs.clone());
+            let wsl_kernel_specifications =
+                wsl_kernel_specifications(cx.background_executor().clone());
+            let remote_kernel_specifications = self.get_remote_kernel_specifications(cx);
 
-        let all_specs = cx.background_spawn(async move {
-            let mut all_specs = local_kernel_specifications
-                .await?
-                .into_iter()
-                .map(KernelSpecification::Jupyter)
-                .collect::<Vec<_>>();
+            cx.background_spawn(async move {
+                let mut all_specs = local_kernel_specifications
+                    .await?
+                    .into_iter()
+                    .map(KernelSpecification::Jupyter)
+                    .collect::<Vec<_>>();
 
-            if let Ok(wsl_specs) = wsl_kernel_specifications.await {
-                all_specs.extend(wsl_specs);
-            }
+                if let Ok(wsl_specs) = wsl_kernel_specifications.await {
+                    all_specs.extend(wsl_specs);
+                }
 
-            if let Some(remote_task) = remote_kernel_specifications
-                && let Ok(remote_specs) = remote_task.await
-            {
-                all_specs.extend(remote_specs);
-            }
+                if let Some(remote_task) = remote_kernel_specifications
+                    && let Ok(remote_specs) = remote_task.await
+                {
+                    all_specs.extend(remote_specs);
+                }
 
-            anyhow::Ok(all_specs)
-        });
+                anyhow::Ok(all_specs)
+            })
+        };
+        #[cfg(target_family = "wasm")]
+        let all_specs = Task::ready(anyhow::Ok(Vec::new()));
 
         cx.spawn(async move |this, cx| {
             let all_specs = all_specs.await;
@@ -314,6 +323,10 @@ impl ReplStore {
         worktree_id: WorktreeId,
         spec: &KernelSpecification,
     ) -> bool {
+        #[cfg(target_family = "wasm")]
+        if let KernelSpecification::Web(spec) = spec {
+            return spec.python.is_none();
+        }
         if let Some(active_path) = self.active_python_toolchain_path(worktree_id) {
             spec.path().as_ref() == active_path.as_ref()
         } else {
@@ -334,6 +347,7 @@ impl ReplStore {
         let language_at_cursor = language_at_cursor?;
 
         // Prefer the recommended (active toolchain) kernel if it has ipykernel
+        #[cfg(not(target_family = "wasm"))]
         if let Some(active_path) = self.active_python_toolchain_path(worktree_id) {
             let recommended = self
                 .kernel_specifications_for_worktree(worktree_id)

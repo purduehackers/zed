@@ -34,6 +34,7 @@ pub struct JsHost {
     update_action: Function,
     download_project: Function,
     connect_debug_adapter: Function,
+    connect_kernel: Function,
     on_closed: Option<Function>,
 }
 
@@ -87,6 +88,7 @@ impl JsHost {
             update_action: required("updateAction")?,
             download_project: required("downloadProject")?,
             connect_debug_adapter: required("connectDebugAdapter")?,
+            connect_kernel: required("connectKernel")?,
             on_closed: optional("onClosed"),
             this: value,
         })
@@ -157,6 +159,28 @@ pub async fn connect_debug_adapter(launch: &str) -> Result<serde_json::Value> {
             .context("Missing debug connection")?,
     )
     .context("Invalid debug connection")
+}
+
+pub async fn connect_kernel(python: Option<&str>, cwd: &str) -> Result<serde_json::Value> {
+    let python = python.map(JsValue::from_str).unwrap_or(JsValue::NULL);
+    let promise = with_host(|host| {
+        host.connect_kernel
+            .call2(&host.this, &python, &JsValue::from_str(cwd))
+    })
+    .context("No browser host")?
+    .map_err(|error| anyhow!(describe_js_value(&error)))?
+    .dyn_into::<Promise>()
+    .map_err(|_| anyhow!("host.connectKernel did not return a promise"))?;
+    let result = JsFuture::from(promise)
+        .await
+        .map_err(|error| anyhow!(describe_js_value(&error)))?;
+    serde_json::from_str(
+        &js_sys::JSON::stringify(&result)
+            .map_err(|error| anyhow!(describe_js_value(&error)))?
+            .as_string()
+            .context("Missing kernel connection")?,
+    )
+    .context("Invalid kernel connection")
 }
 
 /// Reports a boot stage to the shell. `Ready` and `Reconnecting` also maintain the

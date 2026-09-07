@@ -1208,6 +1208,11 @@ impl DebugDelegate {
 impl PickerDelegate for DebugDelegate {
     type ListItem = ui::ListItem;
 
+    #[cfg(target_family = "wasm")]
+    fn web_accessible_match(&self, ix: usize, _: &App) -> Option<SharedString> {
+        Some(self.matches.get(ix)?.string.clone().into())
+    }
+
     fn name() -> &'static str {
         "debug scenario picker"
     }

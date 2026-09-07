@@ -305,6 +305,48 @@ impl Inventory {
         })
     }
 
+    /// Replay saved task definitions when a browser joins an already-scanned sandbox.
+    pub fn worktree_task_settings(
+        &self,
+        project_id: u64,
+    ) -> Vec<rpc::proto::UpdateWorktreeSettings> {
+        fn append<T: serde::Serialize>(
+            sources: &InventoryFor<T>,
+            kind: rpc::proto::LocalSettingsKind,
+            project_id: u64,
+            updates: &mut Vec<rpc::proto::UpdateWorktreeSettings>,
+        ) {
+            for (worktree, directories) in &sources.worktree {
+                for (path, definitions) in directories {
+                    if let Some(content) = serde_json::to_string(definitions).log_err() {
+                        updates.push(rpc::proto::UpdateWorktreeSettings {
+                            project_id,
+                            worktree_id: worktree.to_proto(),
+                            path: path.as_unix_str().to_owned(),
+                            content: Some(content),
+                            kind: Some(kind.into()),
+                            outside_worktree: Some(false),
+                        });
+                    }
+                }
+            }
+        }
+        let mut updates = Vec::new();
+        append(
+            &self.templates_from_settings,
+            rpc::proto::LocalSettingsKind::Tasks,
+            project_id,
+            &mut updates,
+        );
+        append(
+            &self.scenarios_from_settings,
+            rpc::proto::LocalSettingsKind::Debug,
+            project_id,
+            &mut updates,
+        );
+        updates
+    }
+
     pub fn scenario_scheduled(
         &mut self,
         scenario: DebugScenario,

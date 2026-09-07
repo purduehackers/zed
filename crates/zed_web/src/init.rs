@@ -241,8 +241,8 @@ pub fn init_after_db(
     );
     agent_settings::init_user_agents_md(app_state.fs.clone(), cx, |_, _| {});
 
-    // 25. `dev_container::init` is desktop-only. `repl::init` waits for its tokio and
-    //     aws-lc-rs edges (`jupyter-websocket-client`, `runtimelib`) to be gated for wasm.
+    // 25. Browser kernels run in the sandbox. Dev containers remain desktop-only.
+    repl::init(app_state.fs.clone(), cx);
     recent_projects::init(cx);
 
     // 26. Editor and viewers; `audio::init` is desktop-only.

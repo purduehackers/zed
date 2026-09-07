@@ -625,6 +625,9 @@ impl DebugPanel {
 
         let new_session_button = || {
             IconButton::new("debug-new-session", IconName::Plus)
+                .when(cfg!(target_family = "wasm"), |this| {
+                    this.aria_label("Start Debug Session")
+                })
                 .icon_size(IconSize::Small)
                 .on_click({
                     move |_, window, cx| window.dispatch_action(crate::Start.boxed_clone(), cx)
@@ -644,6 +647,9 @@ impl DebugPanel {
 
         let edit_debug_json_button = || {
             IconButton::new("debug-edit-debug-json", IconName::Code)
+                .when(cfg!(target_family = "wasm"), |this| {
+                    this.aria_label("Edit debug.json")
+                })
                 .icon_size(IconSize::Small)
                 .on_click(|_, window, cx| {
                     window.dispatch_action(zed_actions::OpenProjectDebugTasks.boxed_clone(), cx);
@@ -653,6 +659,9 @@ impl DebugPanel {
 
         let documentation_button = || {
             IconButton::new("debug-open-documentation", IconName::CircleHelp)
+                .when(cfg!(target_family = "wasm"), |this| {
+                    this.aria_label("Debugger Documentation")
+                })
                 .icon_size(IconSize::Small)
                 .on_click(move |_, _, cx| cx.open_url("https://zed.dev/docs/debugger"))
                 .tooltip(Tooltip::text("Open Documentation"))
@@ -660,6 +669,9 @@ impl DebugPanel {
 
         let logs_button = || {
             IconButton::new("debug-open-logs", IconName::Notepad)
+                .when(cfg!(target_family = "wasm"), |this| {
+                    this.aria_label("Debug Adapter Logs")
+                })
                 .icon_size(IconSize::Small)
                 .on_click(move |_, window, cx| {
                     window.dispatch_action(debugger_tools::OpenDebugAdapterLogs.boxed_clone(), cx)
@@ -670,6 +682,9 @@ impl DebugPanel {
         let close_bottom_panel_button = {
             h_flex().pl_0p5().gap_1().child(Divider::vertical()).child(
                 IconButton::new("debug-close-panel", IconName::Close)
+                    .when(cfg!(target_family = "wasm"), |this| {
+                        this.aria_label("Close Debug Panel")
+                    })
                     .icon_size(IconSize::Small)
                     .on_click(move |_, window, cx| {
                         window.dispatch_action(workspace::ToggleBottomDock.boxed_clone(), cx)
@@ -712,6 +727,9 @@ impl DebugPanel {
                                                     "debug-pause",
                                                     IconName::DebugPause,
                                                 )
+                                                .when(cfg!(target_family = "wasm"), |this| {
+                                                    this.aria_label("Pause Program")
+                                                })
                                                 .icon_size(IconSize::Small)
                                                 .on_click(window.listener_for(
                                                     running_state,
@@ -736,6 +754,9 @@ impl DebugPanel {
                                                 "debug-continue",
                                                 IconName::DebugContinue,
                                             )
+                                            .when(cfg!(target_family = "wasm"), |this| {
+                                                this.aria_label("Continue Program")
+                                            })
                                             .icon_size(IconSize::Small)
                                             .disabled(thread_status != ThreadStatus::Stopped)
                                             .on_click(window.listener_for(
@@ -766,6 +787,12 @@ impl DebugPanel {
                                                             "debug-continue-thread",
                                                             IconName::DebugContinueThread,
                                                         )
+                                                        .when(
+                                                            cfg!(target_family = "wasm"),
+                                                            |this| {
+                                                                this.aria_label("Continue Thread")
+                                                            },
+                                                        )
                                                         .icon_size(IconSize::Small)
                                                         .disabled(
                                                             thread_status != ThreadStatus::Stopped,
@@ -794,6 +821,9 @@ impl DebugPanel {
                                     })
                                     .child(
                                         IconButton::new("step-over", IconName::DebugStepOver)
+                                            .when(cfg!(target_family = "wasm"), |this| {
+                                                this.aria_label("Step Over")
+                                            })
                                             .icon_size(IconSize::Small)
                                             .on_click(window.listener_for(
                                                 running_state,
@@ -816,6 +846,9 @@ impl DebugPanel {
                                     )
                                     .child(
                                         IconButton::new("step-into", IconName::DebugStepInto)
+                                            .when(cfg!(target_family = "wasm"), |this| {
+                                                this.aria_label("Step In")
+                                            })
                                             .icon_size(IconSize::Small)
                                             .on_click(window.listener_for(
                                                 running_state,
@@ -838,6 +871,9 @@ impl DebugPanel {
                                     )
                                     .child(
                                         IconButton::new("step-out", IconName::DebugStepOut)
+                                            .when(cfg!(target_family = "wasm"), |this| {
+                                                this.aria_label("Step Out")
+                                            })
                                             .icon_size(IconSize::Small)
                                             .on_click(window.listener_for(
                                                 running_state,
@@ -861,6 +897,9 @@ impl DebugPanel {
                                     .child(Divider::vertical())
                                     .child(
                                         IconButton::new("debug-restart", IconName::RotateCcw)
+                                            .when(cfg!(target_family = "wasm"), |this| {
+                                                this.aria_label("Rerun Session")
+                                            })
                                             .icon_size(IconSize::Small)
                                             .on_click(window.listener_for(
                                                 running_state,
@@ -882,6 +921,18 @@ impl DebugPanel {
                                     )
                                     .child(
                                         IconButton::new("debug-stop", IconName::Power)
+                                            .when(cfg!(target_family = "wasm"), |this| {
+                                                this.aria_label(
+                                                    if capabilities
+                                                        .supports_terminate_threads_request
+                                                        .unwrap_or_default()
+                                                    {
+                                                        "Terminate Thread"
+                                                    } else {
+                                                        "Terminate All Threads"
+                                                    },
+                                                )
+                                            })
                                             .icon_size(IconSize::Small)
                                             .on_click(window.listener_for(
                                                 running_state,
@@ -930,6 +981,9 @@ impl DebugPanel {
                                                 "debug-disconnect",
                                                 IconName::DebugDetach,
                                             )
+                                            .when(cfg!(target_family = "wasm"), |this| {
+                                                this.aria_label("Detach Debugger")
+                                            })
                                             .disabled(
                                                 thread_status != ThreadStatus::Stopped
                                                     && thread_status != ThreadStatus::Running,

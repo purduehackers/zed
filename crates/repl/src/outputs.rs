@@ -35,9 +35,11 @@
 
 use editor::{Editor, MultiBuffer};
 use gpui::{AnyElement, ClipboardItem, Entity, EventEmitter, Render, WeakEntity};
+use jupyter_protocol::{
+    ExecutionState, JupyterMessage, JupyterMessageContent, MimeBundle, MimeType,
+};
 use language::Buffer;
 use menu;
-use runtimelib::{ExecutionState, JupyterMessage, JupyterMessageContent, MimeBundle, MimeType};
 use ui::{CommonAnimationExt, CopyButton, IconButton, Tooltip, prelude::*};
 
 mod image;
@@ -140,6 +142,7 @@ pub enum Output {
 }
 
 impl Output {
+    #[cfg(not(target_family = "wasm"))]
     pub fn to_nbformat(&self, cx: &App) -> Option<nbformat::v4::Output> {
         match self {
             Output::Stream { content } => {
@@ -593,7 +596,7 @@ impl ExecutionView {
             }
             JupyterMessageContent::ExecuteReply(reply) => {
                 for payload in reply.payload.iter() {
-                    if let runtimelib::Payload::Page { data, .. } = payload {
+                    if let jupyter_protocol::Payload::Page { data, .. } = payload {
                         let output = Output::new(data, None, window, cx);
                         self.outputs.push(output);
                     }

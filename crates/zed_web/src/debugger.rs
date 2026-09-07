@@ -32,6 +32,24 @@ pub fn init(cx: &mut App) {
     dap::transport::set_web_transport_factory(cx, |binary, cx| {
         cx.spawn(async move |cx| Ok(Box::new(connect(binary, cx).await?) as Box<dyn Transport>))
     });
+    repl::kernels::set_web_kernel_factory(cx, |spec, directory, cx| {
+        cx.spawn(async move |cx| {
+            let info =
+                crate::bridge::connect_kernel(spec.python.as_deref(), &directory.to_string_lossy())
+                    .await?;
+            let launch = info["launch"]
+                .as_str()
+                .context("Missing kernel launch")?
+                .to_owned();
+            let mut transport = open_socket(launch, info, None, cx).await?;
+            let (writer, reader) = transport.connect().await?;
+            Ok(repl::kernels::WebKernelConnection {
+                writer,
+                reader,
+                keep_alive: transport.task.take().context("Missing kernel transport")?,
+            })
+        })
+    });
 }
 
 struct BrowserTransport {
@@ -68,6 +86,15 @@ async fn connect(binary: DebugAdapterBinary, cx: &mut AsyncApp) -> Result<Browse
         "cwd": binary.cwd, "connection": binary.connection,
     }))?;
     let info = crate::bridge::connect_debug_adapter(&launch).await?;
+    open_socket(launch, info, binary.connection, cx).await
+}
+
+async fn open_socket(
+    launch: String,
+    info: serde_json::Value,
+    connection: Option<TcpArguments>,
+    cx: &mut AsyncApp,
+) -> Result<BrowserTransport> {
     let url = info["url"]
         .as_str()
         .context("Missing debug socket URL")?
@@ -157,7 +184,7 @@ async fn connect(binary: DebugAdapterBinary, cx: &mut AsyncApp) -> Result<Browse
             Box::new(Writer(outgoing)),
             Box::new(reads.into_async_read()),
         ))),
-        connection: binary.connection,
+        connection,
         task: Some(task),
     })
 }

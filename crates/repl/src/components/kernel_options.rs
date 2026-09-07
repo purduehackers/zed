@@ -48,6 +48,13 @@ fn build_grouped_entries(store: &ReplStore, worktree_id: WorktreeId) -> Vec<Kern
         }
 
         match spec {
+            #[cfg(target_family = "wasm")]
+            KernelSpecification::Web(_) => {
+                python_envs.push(KernelPickerEntry::Kernel {
+                    spec: spec.clone(),
+                    is_recommended,
+                });
+            }
             KernelSpecification::PythonEnv(_) => {
                 python_envs.push(KernelPickerEntry::Kernel {
                     spec: spec.clone(),
@@ -206,6 +213,14 @@ impl KernelPickerDelegate {
 impl PickerDelegate for KernelPickerDelegate {
     type ListItem = ListItem;
 
+    #[cfg(target_family = "wasm")]
+    fn web_accessible_match(&self, ix: usize, _: &App) -> Option<SharedString> {
+        match self.filtered_entries.get(ix)? {
+            KernelPickerEntry::Kernel { spec, .. } => Some(spec.name()),
+            KernelPickerEntry::SectionHeader(_) => None,
+        }
+    }
+
     fn name() -> &'static str {
         "kernel picker"
     }
@@ -339,6 +354,13 @@ impl PickerDelegate for KernelPickerDelegate {
                 let has_ipykernel = spec.has_ipykernel();
 
                 let subtitle = match spec {
+                    #[cfg(target_family = "wasm")]
+                    KernelSpecification::Web(spec) => Some(
+                        spec.python
+                            .as_deref()
+                            .unwrap_or("Bundled Python environment")
+                            .to_owned(),
+                    ),
                     KernelSpecification::Jupyter(_) => None,
                     KernelSpecification::WslRemote(_) => Some(spec.path().to_string()),
                     KernelSpecification::PythonEnv(_)

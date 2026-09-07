@@ -697,6 +697,14 @@ impl HeadlessProject {
         self.settings_observer
             .read(cx)
             .send_initial_state(&client, cx);
+        if let Some(inventory) = self.task_store.read(cx).task_inventory() {
+            for update in inventory
+                .read(cx)
+                .worktree_task_settings(REMOTE_SERVER_PROJECT_ID)
+            {
+                client.send(update).log_err();
+            }
+        }
         self.lsp_store
             .read(cx)
             .send_initial_state(REMOTE_SERVER_PROJECT_ID, &client);

@@ -1,6 +1,7 @@
 pub mod components;
 mod jupyter_settings;
 pub mod kernels;
+#[cfg(not(target_family = "wasm"))]
 pub mod notebook;
 mod outputs;
 mod repl_editor;
@@ -9,12 +10,17 @@ mod repl_settings;
 mod repl_store;
 mod session;
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
+#[cfg(not(target_family = "wasm"))]
+use std::time::Duration;
 
+#[cfg(not(target_family = "wasm"))]
 use async_dispatcher::{Dispatcher, Runnable, set_dispatcher};
-use gpui::{App, PlatformDispatcher, Priority, RunnableMeta};
+use gpui::App;
+#[cfg(not(target_family = "wasm"))]
+use gpui::{PlatformDispatcher, Priority, RunnableMeta};
+pub use jupyter_protocol::ExecutionState;
 use project::Fs;
-pub use runtimelib::ExecutionState;
 
 pub use crate::jupyter_settings::JupyterSettings;
 pub use crate::kernels::{Kernel, KernelSpecification, KernelStatus, PythonEnvKernelSpecification};
@@ -29,11 +35,13 @@ pub use crate::session::Session;
 pub const KERNEL_DOCS_URL: &str = "https://zed.dev/docs/repl#changing-kernels";
 
 pub fn init(fs: Arc<dyn Fs>, cx: &mut App) {
+    #[cfg(not(target_family = "wasm"))]
     set_dispatcher(zed_dispatcher(cx));
     repl_sessions_ui::init(cx);
     ReplStore::init(fs, cx);
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn zed_dispatcher(cx: &mut App) -> impl Dispatcher {
     struct ZedDispatcher {
         dispatcher: Arc<dyn PlatformDispatcher>,
