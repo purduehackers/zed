@@ -140,8 +140,20 @@ impl WebKeyboard {
             .borrow()
             .get(&(code.clone(), event.shift_key()))
             .cloned()
-            .or_else(|| self.keys.borrow().get(&code).cloned())
-            .or_else(|| self.observed.borrow().get(&(code, false)).cloned())
+            .or_else(|| {
+                self.keys
+                    .borrow()
+                    .get(&code)
+                    .cloned()
+                    .or_else(|| self.observed.borrow().get(&(code, false)).cloned())
+                    // getLayoutMap supplies unshifted legends only. Letters
+                    // keep a separate Shift modifier, but punctuation must be
+                    // observed with Shift: guessing its shifted form can invoke
+                    // the wrong binding on international layouts.
+                    .filter(|key| {
+                        !event.shift_key() || key.chars().all(|c| c.is_ascii_alphabetic())
+                    })
+            })
     }
 
     pub(crate) fn layout(&self) -> WebKeyboardLayout {
