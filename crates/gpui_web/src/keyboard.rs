@@ -38,9 +38,15 @@ impl WebKeyboard {
         let this = Rc::new(Self::default());
         let keyboard = js_sys::Reflect::get(&window.navigator(), &"keyboard".into())
             .ok()
-            .and_then(|value| value.dyn_into::<web_sys::EventTarget>().ok());
+            .filter(|value| !value.is_null() && !value.is_undefined());
         if let Some(keyboard) = keyboard {
-            for (target, event) in [(keyboard, "layoutchange"), (window.clone().into(), "focus")] {
+            // Shipped Chromium exposes getLayoutMap without Keyboard being an
+            // EventTarget yet. Read the map independently of layoutchange.
+            let mut targets = vec![(window.clone().into(), "focus")];
+            if let Ok(keyboard) = keyboard.dyn_into::<web_sys::EventTarget>() {
+                targets.push((keyboard, "layoutchange"));
+            }
+            for (target, event) in targets {
                 let weak = Rc::downgrade(&this);
                 this.listeners.borrow_mut().push(EventListenerHandle::add(
                     &target,

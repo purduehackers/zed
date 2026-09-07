@@ -1508,10 +1508,8 @@ fn compute_key_char(
         return None;
     }
 
-    if gpui_key == "space" {
-        return Some(" ".to_string());
-    }
-
+    // Shortcut normalization must not replace the text produced by Option
+    // (for example, Option+Space inserts a non-breaking space on macOS).
     let raw_key = event.key();
 
     if raw_key.chars().count() == 1 {
