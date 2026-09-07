@@ -812,7 +812,7 @@ impl<D: PickerDelegate> Picker<D> {
 
     pub fn set_hovered_index(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let match_count = self.delegate.match_count();
-        if match_count == 0 {
+        if match_count == 0 || (cfg!(target_family = "wasm") && ix >= match_count) {
             return;
         }
 
@@ -856,7 +856,7 @@ impl<D: PickerDelegate> Picker<D> {
         cx: &mut Context<Self>,
     ) {
         let match_count = self.delegate.match_count();
-        if match_count == 0 {
+        if match_count == 0 || (cfg!(target_family = "wasm") && ix >= match_count) {
             return;
         }
 
@@ -1154,6 +1154,10 @@ impl<D: PickerDelegate> Picker<D> {
     ) {
         cx.stop_propagation();
         window.prevent_default();
+        #[cfg(target_family = "wasm")]
+        if ix >= self.delegate.match_count() {
+            return;
+        }
         if !self.delegate.can_select(ix, window, cx) {
             return;
         }
@@ -1168,6 +1172,12 @@ impl<D: PickerDelegate> Picker<D> {
     }
 
     fn do_confirm(&mut self, secondary: bool, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(target_family = "wasm")]
+        if self.delegate.match_count() > 0
+            && self.delegate.selected_index() >= self.delegate.match_count()
+        {
+            return;
+        }
         if self.delegate.supports_multi_select() && self.delegate.selected_item_count() > 0 {
             self.select_instead_of_open = false;
             self.delegate.confirm_multi(secondary, window, cx);
@@ -1355,6 +1365,12 @@ impl<D: PickerDelegate> Picker<D> {
         }
     }
 
+    #[cfg(target_family = "wasm")]
+    fn web_match_is_current(&self, ix: usize, label: &Option<SharedString>, cx: &App) -> bool {
+        // DOM/AccessKit actions can arrive after asynchronous search replaces a row.
+        ix < self.delegate.match_count() && *label == self.delegate.web_accessible_match(ix, cx)
+    }
+
     fn render_element(
         &self,
         window: &mut Window,
@@ -1387,33 +1403,38 @@ impl<D: PickerDelegate> Picker<D> {
         let use_fallback_indicator =
             multi_select_active && selectable && item_with_checkbox.is_none();
         let focus_handle = self.focus_handle(cx);
+        #[cfg(target_family = "wasm")]
+        let rendered_match = self.delegate.web_accessible_match(ix, cx);
 
         div()
             .id(("item", ix))
             .map(|row| {
                 #[cfg(target_family = "wasm")]
-                let row =
-                    row.when_some(self.delegate.web_accessible_match(ix, cx), |row, label| {
-                        row.role(gpui::Role::ListBoxOption)
-                            .aria_label(label)
-                            .aria_selected(ix == self.delegate.selected_index())
-                            .aria_position_in_set(ix + 1)
-                            .aria_size_of_set(self.delegate.match_count())
-                            .on_a11y_action(gpui::AccessibleAction::Focus, {
-                                let picker = cx.entity().downgrade();
-                                move |_, window, cx| {
-                                    picker
-                                        .update(cx, |this, cx| {
-                                            this.set_selected_index(ix, None, true, window, cx);
-                                            window.focus(&this.focus_handle(cx), cx);
-                                        })
-                                        .ok();
-                                }
-                            })
-                            .when(ix == self.delegate.selected_index(), |row| {
-                                row.aria_active_descendant()
-                            })
-                    });
+                let row = row.when_some(rendered_match.clone(), |row, label| {
+                    row.role(gpui::Role::ListBoxOption)
+                        .aria_label(label.clone())
+                        .aria_selected(ix == self.delegate.selected_index())
+                        .aria_position_in_set(ix + 1)
+                        .aria_size_of_set(self.delegate.match_count())
+                        .on_a11y_action(gpui::AccessibleAction::Focus, {
+                            let picker = cx.entity().downgrade();
+                            move |_, window, cx| {
+                                picker
+                                    .update(cx, |this, cx| {
+                                        if !this.web_match_is_current(ix, &Some(label.clone()), cx)
+                                        {
+                                            return;
+                                        }
+                                        this.set_selected_index(ix, None, true, window, cx);
+                                        window.focus(&this.focus_handle(cx), cx);
+                                    })
+                                    .ok();
+                            }
+                        })
+                        .when(ix == self.delegate.selected_index(), |row| {
+                            row.aria_active_descendant()
+                        })
+                });
                 row
             })
             .when(selectable, |this| this.cursor_pointer())
@@ -1461,21 +1482,34 @@ impl<D: PickerDelegate> Picker<D> {
                     window.prevent_default();
                 })
             })
-            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                this.handle_click(ix, event.modifiers().secondary(), window, cx)
-            }))
+            .on_click({
+                #[cfg(target_family = "wasm")]
+                let rendered_match = rendered_match.clone();
+                cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    #[cfg(target_family = "wasm")]
+                    if !this.web_match_is_current(ix, &rendered_match, cx) {
+                        return;
+                    }
+                    this.handle_click(ix, event.modifiers().secondary(), window, cx)
+                })
+            })
             // As of this writing, GPUI intercepts `ctrl-[mouse-event]`s on macOS
             // and produces right mouse button events. This matches platforms norms
             // but means that UIs which depend on holding ctrl down (such as the tab
             // switcher) can't be clicked on. Hence, this handler.
-            .on_mouse_up(
-                MouseButton::Right,
+            .on_mouse_up(MouseButton::Right, {
+                #[cfg(target_family = "wasm")]
+                let rendered_match = rendered_match.clone();
                 cx.listener(move |this, event: &MouseUpEvent, window, cx| {
+                    #[cfg(target_family = "wasm")]
+                    if !this.web_match_is_current(ix, &rendered_match, cx) {
+                        return;
+                    }
                     // We specifically want to use the platform key here, as
                     // ctrl will already be held down for the tab switcher.
                     this.handle_click(ix, event.modifiers.platform, window, cx)
-                }),
-            )
+                })
+            })
             .when(self.delegate.select_on_hover(), |this| {
                 this.on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
                     if *hovered {
