@@ -140,6 +140,98 @@ impl WebAccessibility {
             "keydown",
             move |event| {
                 let event: web_sys::KeyboardEvent = event.unchecked_into();
+                if matches!(
+                    event.key().as_str(),
+                    "ArrowLeft" | "ArrowRight" | "Home" | "End"
+                ) && !event.alt_key()
+                    && !event.ctrl_key()
+                    && !event.meta_key()
+                {
+                    let target = event
+                        .target()
+                        .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+                        .filter(|target| target.get_attribute("role").as_deref() == Some("tab"));
+                    if let Some(target) = target
+                        && let Ok(Some(list)) = target.closest("[role=tablist]")
+                    {
+                        let descendants = list.get_elements_by_tag_name("div");
+                        let tabs = (0..descendants.length())
+                            .filter_map(|ix| descendants.item(ix))
+                            .filter(|element| {
+                                element.get_attribute("role").as_deref() == Some("tab")
+                            })
+                            .collect::<Vec<_>>();
+                        if let Some(current) = tabs.iter().position(|tab| *tab == target) {
+                            let next = match event.key().as_str() {
+                                "Home" => 0,
+                                "End" => tabs.len() - 1,
+                                "ArrowLeft" => (current + tabs.len() - 1) % tabs.len(),
+                                _ => (current + 1) % tabs.len(),
+                            };
+                            if let Some(id) = tabs[next]
+                                .get_attribute("data-gpui-node")
+                                .and_then(|id| id.parse().ok())
+                            {
+                                (action_callbacks.action)(ActionRequest {
+                                    action: Action::Click,
+                                    target_tree: TreeId::ROOT,
+                                    target_node: NodeId(id),
+                                    data: None,
+                                });
+                            }
+                            if let Some(tab) = tabs[next].dyn_ref::<web_sys::HtmlElement>() {
+                                tab.focus().ok();
+                            }
+                            event.prevent_default();
+                            event.stop_propagation();
+                            return;
+                        }
+                    }
+                }
+                if event.key() == "Tab"
+                    && !event.alt_key()
+                    && !event.ctrl_key()
+                    && !event.meta_key()
+                {
+                    let target = event
+                        .target()
+                        .and_then(|target| target.dyn_into::<web_sys::Element>().ok());
+                    if let Some(dialog) = target.and_then(|target| {
+                        target
+                            .closest("[role=dialog], [role=alertdialog]")
+                            .ok()
+                            .flatten()
+                    }) {
+                        let descendants = dialog.get_elements_by_tag_name("div");
+                        let buttons = (0..descendants.length())
+                            .filter_map(|ix| descendants.item(ix))
+                            .filter_map(|element| element.dyn_into::<web_sys::HtmlElement>().ok())
+                            .filter(|element| {
+                                element.tab_index() == 0 && element.has_attribute("data-gpui-click")
+                            })
+                            .collect::<Vec<_>>();
+                        let active = dialog
+                            .owner_document()
+                            .and_then(|document| document.active_element());
+                        let current = buttons
+                            .iter()
+                            .position(|button| active.as_ref() == Some(button.as_ref()));
+                        let next = if event.shift_key() {
+                            current
+                                .unwrap_or(0)
+                                .checked_sub(1)
+                                .unwrap_or(buttons.len().saturating_sub(1))
+                        } else {
+                            current.map_or(0, |ix| (ix + 1) % buttons.len())
+                        };
+                        if let Some(button) = buttons.get(next) {
+                            button.focus().ok();
+                        }
+                        event.prevent_default();
+                        event.stop_propagation();
+                        return;
+                    }
+                }
                 if !matches!(event.key().as_str(), "Enter" | " ")
                     || event.alt_key()
                     || event.ctrl_key()
@@ -214,6 +306,11 @@ impl WebAccessibility {
                 element
             };
             attr(&element, "role", role(node.role()));
+            attr(
+                &element,
+                "aria-modal",
+                matches!(node.role(), Role::Dialog | Role::AlertDialog).then_some("true"),
+            );
             attr(&element, "aria-label", node.label());
             attr(&element, "aria-description", node.description());
             attr(&element, "aria-keyshortcuts", node.keyboard_shortcut());
@@ -359,6 +456,27 @@ impl WebAccessibility {
                 false
             }
         });
+        // One tab stop per composite widget. Its query/arrows navigate the rows;
+        // opening a large project must not add thousands of Tab presses.
+        for (id, (node, element)) in &self.nodes {
+            match node.role() {
+                Role::ListBox | Role::ListBoxOption => element.set_tab_index(-1),
+                Role::TreeItem => element.set_tab_index(if *id == update.focus { 0 } else { -1 }),
+                Role::Tree => {
+                    let focused_child =
+                        self.nodes.get(&update.focus).is_some_and(|(node, child)| {
+                            node.role() == Role::TreeItem && element.contains(Some(child.as_ref()))
+                        });
+                    element.set_tab_index(if focused_child { -1 } else { 0 });
+                }
+                Role::Tab => element.set_tab_index(if node.is_selected() == Some(true) {
+                    0
+                } else {
+                    -1
+                }),
+                _ => {}
+            }
+        }
         // Picker keyboard focus stays in its query editor. Tell the browser
         // which option GPUI selected without moving DOM focus out of that input.
         if let Ok(Some(input)) = document.query_selector("[data-gpui-input]") {

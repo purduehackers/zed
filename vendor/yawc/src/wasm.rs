@@ -26,6 +26,7 @@ use crate::{
 pub struct Options {
     max_payload_read: Option<usize>,
     max_read_buffer: Option<usize>,
+    max_write_buffer: Option<usize>,
 }
 
 impl Options {
@@ -45,6 +46,12 @@ impl Options {
         self.max_read_buffer = Some(bytes);
         self
     }
+
+    /// Caps the browser-owned send queue; a stalled peer cannot grow it forever.
+    pub fn with_max_write_buffer(mut self, bytes: usize) -> Self {
+        self.max_write_buffer = Some(bytes);
+        self
+    }
 }
 
 /// A WebSocket wrapper for WASM applications that provides an async interface
@@ -58,6 +65,7 @@ pub struct WebSocket {
     /// Payload bytes currently queued in `receiver`; maintained by the message handler and
     /// by `poll_next`, and compared against `Options::max_read_buffer`.
     queued_bytes: Rc<Cell<usize>>,
+    max_write_buffer: Option<usize>,
 }
 
 /// Closes a browser socket that is still connecting when its `connect` future is dropped
@@ -165,6 +173,7 @@ impl WebSocket {
             stream: pending.take(),
             receiver: rx,
             queued_bytes,
+            max_write_buffer: options.max_write_buffer,
         })
     }
 
@@ -328,6 +337,12 @@ impl futures::Sink<Frame> for WebSocket {
     }
 
     fn start_send(self: Pin<&mut Self>, frame: Frame) -> Result<()> {
+        if self.max_write_buffer.is_some_and(|limit| {
+            (self.stream.buffered_amount() as usize).saturating_add(frame.payload().len()) > limit
+        }) {
+            let _ = self.stream.close();
+            return Err(WebSocketError::ConnectionClosed);
+        }
         match frame.opcode() {
             OpCode::Text => self
                 .stream

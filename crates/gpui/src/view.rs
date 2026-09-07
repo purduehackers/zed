@@ -321,7 +321,10 @@ impl<V: View> Element for ViewElement<V> {
         if let Some(entity_id) = self.entity_id {
             // Stateful path: create a reactive boundary.
             window.with_rendered_view(entity_id, |window| {
-                let caching_disabled = window.is_inspector_picking(cx);
+                // Cached prepaint does not replay AccessKit nodes. The browser
+                // needs the complete semantic tree on every accessible frame.
+                let caching_disabled = window.is_inspector_picking(cx)
+                    || (cfg!(target_family = "wasm") && window.is_a11y_active());
                 match self.cached_style.as_ref() {
                     Some(style) if !caching_disabled => {
                         let mut root_style = Style::default();
@@ -458,7 +461,8 @@ impl<V: View> Element for ViewElement<V> {
         if let Some(entity_id) = self.entity_id {
             // Stateful path.
             window.with_rendered_view(entity_id, |window| {
-                let caching_disabled = window.is_inspector_picking(cx);
+                let caching_disabled = window.is_inspector_picking(cx)
+                    || (cfg!(target_family = "wasm") && window.is_a11y_active());
                 if self.cached_style.is_some() && !caching_disabled {
                     window.with_element_state::<ViewElementState, _>(
                         global_id.unwrap(),

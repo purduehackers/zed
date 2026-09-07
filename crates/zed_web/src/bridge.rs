@@ -23,7 +23,7 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use zed_web_core::{BootError, BootStage, ConnectInfo, DocumentKind};
 
-/// The `ZsHost` object: five required callbacks plus the optional `onClosed`.
+/// The required browser host callbacks plus the optional `onClosed`.
 pub struct JsHost {
     this: JsValue,
     boot_progress: Function,
@@ -33,6 +33,7 @@ pub struct JsHost {
     on_lifecycle: Function,
     update_action: Function,
     download_project: Function,
+    connect_debug_adapter: Function,
     on_closed: Option<Function>,
 }
 
@@ -85,6 +86,7 @@ impl JsHost {
             on_lifecycle: required("onLifecycle")?,
             update_action: required("updateAction")?,
             download_project: required("downloadProject")?,
+            connect_debug_adapter: required("connectDebugAdapter")?,
             on_closed: optional("onClosed"),
             this: value,
         })
@@ -134,6 +136,27 @@ pub async fn download_project(path: &str, include_ignored: bool) -> Result<Strin
         .map_err(|error| anyhow!(describe_js_value(&error)))?
         .as_string()
         .context("Missing download result")
+}
+
+pub async fn connect_debug_adapter(launch: &str) -> Result<serde_json::Value> {
+    let promise = with_host(|host| {
+        host.connect_debug_adapter
+            .call1(&host.this, &JsValue::from_str(launch))
+    })
+    .context("No browser host")?
+    .map_err(|error| anyhow!(describe_js_value(&error)))?
+    .dyn_into::<Promise>()
+    .map_err(|_| anyhow!("host.connectDebugAdapter did not return a promise"))?;
+    let result = JsFuture::from(promise)
+        .await
+        .map_err(|error| anyhow!(describe_js_value(&error)))?;
+    serde_json::from_str(
+        &js_sys::JSON::stringify(&result)
+            .map_err(|error| anyhow!(describe_js_value(&error)))?
+            .as_string()
+            .context("Missing debug connection")?,
+    )
+    .context("Invalid debug connection")
 }
 
 /// Reports a boot stage to the shell. `Ready` and `Reconnecting` also maintain the

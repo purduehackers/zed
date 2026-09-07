@@ -383,6 +383,7 @@ pub fn init_after_db(
     workspace_chrome::init(app_state.clone(), cx);
     crate::clipboard::init(cx);
     crate::export::init(cx);
+    crate::debugger::init(cx);
 
     // 35.
     cx.activate(true);

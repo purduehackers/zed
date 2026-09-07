@@ -4,7 +4,12 @@ use super::{
     locators,
     session::{self, Session, SessionStateEvent},
 };
+#[cfg(not(target_family = "wasm"))]
+use dap::adapters::TcpArguments;
+#[cfg(not(target_family = "wasm"))]
 use remote::Interactive;
+#[cfg(not(target_family = "wasm"))]
+use std::net::{IpAddr, Ipv4Addr};
 
 use crate::{
     InlayHint, InlayHintLabel, ProjectEnvironment, ResolveState,
@@ -17,9 +22,7 @@ use async_trait::async_trait;
 use collections::HashMap;
 use dap::{
     Capabilities, DapRegistry, DebugRequest, EvaluateArgumentsContext, StackFrameId,
-    adapters::{
-        DapDelegate, DebugAdapterBinary, DebugAdapterName, DebugTaskDefinition, TcpArguments,
-    },
+    adapters::{DapDelegate, DebugAdapterBinary, DebugAdapterName, DebugTaskDefinition},
     client::SessionId,
     inline_value::VariableLookupKind,
     messages::Message,
@@ -47,7 +50,6 @@ use std::{
     borrow::Borrow,
     collections::BTreeMap,
     ffi::OsStr,
-    net::{IpAddr, Ipv4Addr},
     path::{Path, PathBuf},
     sync::{Arc, Once},
 };
@@ -314,53 +316,64 @@ impl DapStore {
                         worktree_id: worktree.read(cx).id().to_proto(),
                         definition: Some(definition.to_proto()),
                     });
+                #[cfg(not(target_family = "wasm"))]
                 let remote = remote.remote_client.clone();
 
                 cx.spawn(async move |_, cx| {
                     let response = request.await?;
                     let binary = DebugAdapterBinary::from_proto(response)?;
 
-                    let port_forwarding;
-                    let connection;
-                    if let Some(c) = binary.connection {
-                        let host = IpAddr::V4(Ipv4Addr::LOCALHOST);
-                        let port;
-                        if remote.read_with(cx, |remote, _cx| remote.shares_network_interface()) {
-                            port = c.port;
-                            port_forwarding = None;
-                        } else {
-                            port = dap::transport::TcpTransport::unused_port(host).await?;
-                            port_forwarding = Some((port, c.host.to_string(), c.port));
-                        }
-                        connection = Some(TcpArguments {
-                            port,
-                            host,
-                            timeout: c.timeout,
-                        })
-                    } else {
-                        port_forwarding = None;
-                        connection = None;
+                    #[cfg(target_family = "wasm")]
+                    {
+                        let _ = cx;
+                        return Ok(binary);
                     }
 
-                    let command = remote.read_with(cx, |remote, _cx| {
-                        remote.build_command(
-                            binary.command,
-                            &binary.arguments,
-                            &binary.envs,
-                            binary.cwd.map(|path| path.display().to_string()),
-                            port_forwarding,
-                            Interactive::No,
-                        )
-                    })?;
+                    #[cfg(not(target_family = "wasm"))]
+                    {
+                        let port_forwarding;
+                        let connection;
+                        if let Some(c) = binary.connection {
+                            let host = IpAddr::V4(Ipv4Addr::LOCALHOST);
+                            let port;
+                            if remote.read_with(cx, |remote, _cx| remote.shares_network_interface())
+                            {
+                                port = c.port;
+                                port_forwarding = None;
+                            } else {
+                                port = dap::transport::TcpTransport::unused_port(host).await?;
+                                port_forwarding = Some((port, c.host.to_string(), c.port));
+                            }
+                            connection = Some(TcpArguments {
+                                port,
+                                host,
+                                timeout: c.timeout,
+                            })
+                        } else {
+                            port_forwarding = None;
+                            connection = None;
+                        }
 
-                    Ok(DebugAdapterBinary {
-                        command: Some(command.program),
-                        arguments: command.args,
-                        envs: command.env,
-                        cwd: None,
-                        connection,
-                        request_args: binary.request_args,
-                    })
+                        let command = remote.read_with(cx, |remote, _cx| {
+                            remote.build_command(
+                                binary.command,
+                                &binary.arguments,
+                                &binary.envs,
+                                binary.cwd.map(|path| path.display().to_string()),
+                                port_forwarding,
+                                Interactive::No,
+                            )
+                        })?;
+
+                        Ok(DebugAdapterBinary {
+                            command: Some(command.program),
+                            arguments: command.args,
+                            envs: command.env,
+                            cwd: None,
+                            connection,
+                            request_args: binary.request_args,
+                        })
+                    }
                 })
             }
             DapStoreMode::Collab => {

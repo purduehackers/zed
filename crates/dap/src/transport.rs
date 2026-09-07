@@ -83,6 +83,21 @@ pub trait Transport: Send + Sync {
     }
 }
 
+#[cfg(target_family = "wasm")]
+type WebTransportFactory =
+    fn(DebugAdapterBinary, &mut AsyncApp) -> Task<Result<Box<dyn Transport>>>;
+
+#[cfg(target_family = "wasm")]
+struct WebTransportProvider(WebTransportFactory);
+#[cfg(target_family = "wasm")]
+impl gpui::Global for WebTransportProvider {}
+
+/// The browser host supplies authenticated sandbox I/O; DAP itself is unchanged.
+#[cfg(target_family = "wasm")]
+pub fn set_web_transport_factory(cx: &mut gpui::App, factory: WebTransportFactory) {
+    cx.set_global(WebTransportProvider(factory));
+}
+
 async fn start(
     binary: &DebugAdapterBinary,
     log_handlers: LogHandlers,
@@ -107,12 +122,16 @@ async fn start(
             StdioTransport::start(binary, log_handlers, cx).await?,
         ))
     }
-    // The browser can neither spawn a debug adapter nor open a raw TCP socket to one; only
-    // the fake transport of the test builds exists there.
     #[cfg(target_family = "wasm")]
     {
-        let _ = (binary, log_handlers, cx);
-        bail!("debug adapters cannot be started from the browser")
+        let _ = log_handlers;
+        let factory = cx
+            .update(|cx| {
+                cx.try_global::<WebTransportProvider>()
+                    .map(|provider| provider.0)
+            })
+            .context("No browser debug transport is configured")?;
+        factory(binary.clone(), cx).await
     }
 }
 

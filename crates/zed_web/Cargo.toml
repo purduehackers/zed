@@ -40,6 +40,9 @@ chrono = { workspace = true, features = ["wasmbind"] }
 # platform
 anyhow.workspace = true
 futures.workspace = true
+dap.workspace = true
+yawc.workspace = true
+url.workspace = true
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true

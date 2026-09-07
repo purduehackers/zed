@@ -802,7 +802,7 @@ pub enum SessionEvent {
     CapabilitiesLoaded,
     RunInTerminal {
         request: RunInTerminalRequestArguments,
-        sender: mpsc::Sender<Result<u32>>,
+        sender: mpsc::Sender<Result<Option<u32>>>,
     },
     DataBreakpointInfo,
     ConsoleOutput,
@@ -1213,7 +1213,7 @@ impl Session {
 
         let seq = request.seq;
 
-        let (tx, mut rx) = mpsc::channel::<Result<u32>>(1);
+        let (tx, mut rx) = mpsc::channel::<Result<Option<u32>>>(1);
         cx.emit(SessionEvent::RunInTerminal {
             request: request_args,
             sender: tx,
@@ -1232,7 +1232,7 @@ impl Session {
                     true,
                     serde_json::to_value(dap::RunInTerminalResponse {
                         process_id: None,
-                        shell_process_id: Some(pid as u64),
+                        shell_process_id: pid.map(u64::from),
                     })
                     .ok(),
                 ),

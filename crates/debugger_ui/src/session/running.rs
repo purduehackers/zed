@@ -1282,7 +1282,7 @@ impl RunningState {
     fn handle_run_in_terminal(
         &self,
         request: &RunInTerminalRequestArguments,
-        mut sender: mpsc::Sender<Result<u32>>,
+        mut sender: mpsc::Sender<Result<Option<u32>>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
@@ -1311,6 +1311,9 @@ impl RunningState {
                 envs.insert(key.clone(), value_str.clone());
             }
         }
+
+        #[cfg(target_family = "wasm")]
+        envs.insert("ZS_PRIVATE_SERVICE".into(), "debug".into());
 
         let mut args = request.args.clone();
         let command = if envs.contains_key("VSCODE_INSPECTOR_OPTIONS") {
@@ -1386,9 +1389,15 @@ impl RunningState {
             })?;
 
             terminal.read_with(cx, |terminal, _| {
+                // A browser terminal lives in the sandbox. DAP permits omitting
+                // the PID; never turn a successfully spawned remote PTY into an error.
+                #[cfg(target_family = "wasm")]
+                if terminal.is_remote_pty() {
+                    return Ok(None);
+                }
                 terminal
                     .pid()
-                    .map(|pid| pid.as_u32())
+                    .map(|pid| Some(pid.as_u32()))
                     .context("Terminal was spawned but PID was not available")
             })
         });

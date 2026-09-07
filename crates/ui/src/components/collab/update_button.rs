@@ -190,7 +190,7 @@ impl RenderOnce for UpdateButton {
             .h_full()
             .gap_1()
             .child(icon_element)
-            .child(Label::new(self.message).size(LabelSize::Small));
+            .child(Label::new(self.message.clone()).size(LabelSize::Small));
 
         h_flex()
             .mr_2()
@@ -199,6 +199,9 @@ impl RenderOnce for UpdateButton {
             .border_color(border_color)
             .child(
                 ButtonLike::new(button_id)
+                    .when(cfg!(target_family = "wasm"), |this| {
+                        this.aria_label(self.message)
+                    })
                     .child(label_row)
                     .when_some(tooltip, |this, tooltip| this.tooltip(tooltip))
                     .disabled(self.disabled)
@@ -208,6 +211,9 @@ impl RenderOnce for UpdateButton {
                 this.child(
                     div().border_l_1().border_color(border_color).child(
                         IconButton::new(dismiss_button_id, IconName::Close)
+                            .when(cfg!(target_family = "wasm"), |this| {
+                                this.aria_label("Dismiss update notification")
+                            })
                             .icon_size(IconSize::Indicator)
                             .when_some(self.on_dismiss, |this, handler| this.on_click(handler))
                             .tooltip(Tooltip::text("Dismiss")),
