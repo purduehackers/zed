@@ -52,6 +52,7 @@ pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action_renderer(|div, _, _, _| {
             div.capture_action(paste::<editor::actions::Paste>)
+                .capture_action(paste::<editor::actions::DiffClipboardWithSelection>)
                 .capture_action(paste::<terminal::Paste>)
                 .capture_action(paste::<terminal::PasteText>)
                 .capture_action(|action: &vim::WebPaste, window, cx| {

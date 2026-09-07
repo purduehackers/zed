@@ -108,6 +108,9 @@ impl ImeMirror {
             .map_err(|e| anyhow::anyhow!("Created element is not a textarea: {e:?}"))?;
         let style = element.style();
         element.set_attribute("data-gpui-input", "").ok();
+        // A one-pixel conduit must not become thousands of soft-wrapped lines
+        // in the browser's accessibility tree. Preserve the document's lines.
+        element.set_wrap("off");
         element.set_attribute("aria-label", "Editor input").ok();
         element.set_attribute("aria-description", "F1 opens the command palette. Enable screen reader mode for full-document reading and Tab navigation.").ok();
         style.set_property("position", "fixed").ok();

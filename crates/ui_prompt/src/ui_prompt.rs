@@ -113,6 +113,17 @@ impl Render for ZedPromptRenderer {
         let settings = ThemeSettings::get_global(cx);
 
         let dialog = v_flex()
+            .map(|dialog| {
+                #[cfg(target_family = "wasm")]
+                let dialog = dialog
+                    .id("prompt")
+                    .role(gpui::Role::Dialog)
+                    .aria_label(self.message.read(cx).source().clone())
+                    .when_some(self.detail.as_ref(), |dialog, detail| {
+                        dialog.aria_description(detail.read(cx).source().clone())
+                    });
+                dialog
+            })
             .key_context("Prompt")
             .cursor_default()
             .track_focus(&self.focus)

@@ -32,6 +32,7 @@ pub struct JsHost {
     report_error: Function,
     on_lifecycle: Function,
     update_action: Function,
+    download_project: Function,
     on_closed: Option<Function>,
 }
 
@@ -83,6 +84,7 @@ impl JsHost {
             report_error: required("reportError")?,
             on_lifecycle: required("onLifecycle")?,
             update_action: required("updateAction")?,
+            download_project: required("downloadProject")?,
             on_closed: optional("onClosed"),
             this: value,
         })
@@ -113,6 +115,25 @@ fn log_call_error(name: &str, result: Result<JsValue, JsValue>) {
     if let Err(error) = result {
         log::error!("host.{name} threw: {}", describe_js_value(&error));
     }
+}
+
+pub async fn download_project(path: &str, include_ignored: bool) -> Result<String> {
+    let promise = with_host(|host| {
+        host.download_project.call2(
+            &host.this,
+            &JsValue::from_str(path),
+            &JsValue::from_bool(include_ignored),
+        )
+    })
+    .context("No browser host")?
+    .map_err(|error| anyhow!(describe_js_value(&error)))?
+    .dyn_into::<Promise>()
+    .map_err(|_| anyhow!("host.downloadProject did not return a promise"))?;
+    JsFuture::from(promise)
+        .await
+        .map_err(|error| anyhow!(describe_js_value(&error)))?
+        .as_string()
+        .context("Missing download result")
 }
 
 /// Reports a boot stage to the shell. `Ready` and `Reconnecting` also maintain the

@@ -401,6 +401,17 @@ impl CommandPaletteDelegate {
 impl PickerDelegate for CommandPaletteDelegate {
     type ListItem = ListItem;
 
+    #[cfg(target_family = "wasm")]
+    fn web_accessible_match(&self, ix: usize, _: &App) -> Option<SharedString> {
+        Some(
+            self.commands
+                .get(self.matches.get(ix)?.candidate_id)?
+                .name
+                .clone()
+                .into(),
+        )
+    }
+
     fn name() -> &'static str {
         "command palette"
     }

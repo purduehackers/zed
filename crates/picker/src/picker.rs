@@ -210,6 +210,11 @@ pub trait PickerDelegate: Sized + 'static {
         true
     }
 
+    #[cfg(target_family = "wasm")]
+    fn web_accessible_match(&self, _ix: usize, _cx: &App) -> Option<SharedString> {
+        None
+    }
+
     // Allows binding some optional effect to when the selection changes.
     fn selected_index_changed(
         &self,
@@ -1385,6 +1390,32 @@ impl<D: PickerDelegate> Picker<D> {
 
         div()
             .id(("item", ix))
+            .map(|row| {
+                #[cfg(target_family = "wasm")]
+                let row =
+                    row.when_some(self.delegate.web_accessible_match(ix, cx), |row, label| {
+                        row.role(gpui::Role::ListBoxOption)
+                            .aria_label(label)
+                            .aria_selected(ix == self.delegate.selected_index())
+                            .aria_position_in_set(ix + 1)
+                            .aria_size_of_set(self.delegate.match_count())
+                            .on_a11y_action(gpui::AccessibleAction::Focus, {
+                                let picker = cx.entity().downgrade();
+                                move |_, window, cx| {
+                                    picker
+                                        .update(cx, |this, cx| {
+                                            this.set_selected_index(ix, None, true, window, cx);
+                                            window.focus(&this.focus_handle(cx), cx);
+                                        })
+                                        .ok();
+                                }
+                            })
+                            .when(ix == self.delegate.selected_index(), |row| {
+                                row.aria_active_descendant()
+                            })
+                    });
+                row
+            })
             .when(selectable, |this| this.cursor_pointer())
             .when(use_fallback_indicator, |this| {
                 this.hover(|s| s.bg(cx.theme().colors().ghost_element_hover))

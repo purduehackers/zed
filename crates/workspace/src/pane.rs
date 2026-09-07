@@ -2878,6 +2878,13 @@ impl Pane {
 
         let read_only_toggle = |toggleable: bool| {
             IconButton::new("toggle_read_only", IconName::FileLock)
+                .when(cfg!(target_family = "wasm"), |this| {
+                    this.aria_label(if toggleable {
+                        "Unlock Tab"
+                    } else {
+                        "Locked Tab"
+                    })
+                })
                 .size(ButtonSize::None)
                 .shape(IconButtonShape::Square)
                 .icon_color(Color::Muted)
@@ -2906,6 +2913,11 @@ impl Pane {
 
         let capability = item.capability(cx);
         let tab = Tab::new(ix)
+            .when(cfg!(target_family = "wasm"), |this| {
+                this.role(gpui::Role::Tab)
+                    .aria_label(item.tab_content_text(detail, cx))
+                    .aria_selected(is_active)
+            })
             .position(if is_first_item {
                 TabPosition::First
             } else if is_last_item {
@@ -3033,6 +3045,9 @@ impl Pane {
                             .detach_and_log_err(cx);
                     }))
                 }
+                .when(cfg!(target_family = "wasm"), |this| {
+                    this.aria_label(end_slot_tooltip_text)
+                })
                 .map(|this| {
                     if is_active {
                         let focus_handle = focus_handle.clone();
@@ -3472,6 +3487,9 @@ impl Pane {
         let focus_handle = self.focus_handle.clone();
 
         let navigate_backward = IconButton::new("navigate_backward", IconName::ArrowLeft)
+            .when(cfg!(target_family = "wasm"), |this| {
+                this.aria_label("Go Back")
+            })
             .icon_size(IconSize::Small)
             .on_click({
                 let entity = cx.entity();
@@ -3495,6 +3513,9 @@ impl Pane {
             });
 
         let navigate_forward = IconButton::new("navigate_forward", IconName::ArrowRight)
+            .when(cfg!(target_family = "wasm"), |this| {
+                this.aria_label("Go Forward")
+            })
             .icon_size(IconSize::Small)
             .on_click({
                 let entity = cx.entity();
@@ -4329,7 +4350,11 @@ fn default_render_tab_bar_buttons(
         .child(
             PopoverMenu::new("pane-tab-bar-popover-menu")
                 .trigger_with_tooltip(
-                    IconButton::new("plus", IconName::Plus).icon_size(IconSize::Small),
+                    IconButton::new("plus", IconName::Plus)
+                        .when(cfg!(target_family = "wasm"), |this| {
+                            this.aria_label("New File or Terminal")
+                        })
+                        .icon_size(IconSize::Small),
                     Tooltip::text("New…"),
                 )
                 .anchor(Anchor::TopRight)
@@ -4354,6 +4379,9 @@ fn default_render_tab_bar_buttons(
             PopoverMenu::new("pane-tab-bar-split")
                 .trigger_with_tooltip(
                     IconButton::new("split", IconName::Split)
+                        .when(cfg!(target_family = "wasm"), |this| {
+                            this.aria_label("Split Pane")
+                        })
                         .icon_size(IconSize::Small)
                         .disabled(!can_clone && !can_split_move),
                     Tooltip::text("Split Pane"),
@@ -4381,6 +4409,9 @@ fn default_render_tab_bar_buttons(
         .child({
             let zoomed = pane.is_zoomed();
             IconButton::new("toggle_zoom", IconName::Maximize)
+                .when(cfg!(target_family = "wasm"), |this| {
+                    this.aria_label(if zoomed { "Zoom Out" } else { "Zoom In" })
+                })
                 .icon_size(IconSize::Small)
                 .toggle_state(zoomed)
                 .selected_icon(IconName::Minimize)

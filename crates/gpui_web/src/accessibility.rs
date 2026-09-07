@@ -187,6 +187,10 @@ impl WebAccessibility {
             self.root_id = tree.root;
         }
         let document = self.root.owner_document().unwrap();
+        let active = document.active_element();
+        let had_semantic_focus = active
+            .as_ref()
+            .is_some_and(|active| self.root.contains(Some(active.as_ref())));
         for (id, node) in update.nodes {
             let element = if let Some((previous, element)) = self.nodes.get(&id) {
                 if *previous == node {
@@ -231,19 +235,28 @@ impl WebAccessibility {
             );
             attr(&element, "aria-selected", node.is_selected().map(bool_str));
             attr(&element, "aria-expanded", node.is_expanded().map(bool_str));
-            attr(
-                &element,
-                "aria-checked",
-                node.toggled().map(|value| match value {
-                    accesskit::Toggled::True => "true",
-                    accesskit::Toggled::False => "false",
-                    accesskit::Toggled::Mixed => "mixed",
-                }),
-            );
+            let toggled = node.toggled().map(|value| match value {
+                accesskit::Toggled::True => "true",
+                accesskit::Toggled::False => "false",
+                accesskit::Toggled::Mixed => "mixed",
+            });
+            let button = role(node.role()) == Some("button");
+            attr(&element, "aria-pressed", toggled.filter(|_| button));
+            attr(&element, "aria-checked", toggled.filter(|_| !button));
             attr(
                 &element,
                 "aria-level",
                 node.level().map(|level| level.to_string()).as_deref(),
+            );
+            attr(
+                &element,
+                "aria-posinset",
+                node.position_in_set().map(|n| n.to_string()).as_deref(),
+            );
+            attr(
+                &element,
+                "aria-setsize",
+                node.size_of_set().map(|n| n.to_string()).as_deref(),
             );
             attr(
                 &element,
@@ -346,14 +359,46 @@ impl WebAccessibility {
                 false
             }
         });
-        if self.focus != update.focus {
+        // Picker keyboard focus stays in its query editor. Tell the browser
+        // which option GPUI selected without moving DOM focus out of that input.
+        if let Ok(Some(input)) = document.query_selector("[data-gpui-input]") {
+            let controlled = self
+                .nodes
+                .get(&update.focus)
+                .filter(|(node, _)| node.role() == Role::ListBoxOption)
+                .and_then(|(_, option)| Some((option, option.closest("[role=listbox]").ok()??)));
+            for (name, value) in [
+                (
+                    "aria-controls",
+                    controlled.as_ref().map(|(_, list)| list.id()),
+                ),
+                (
+                    "aria-activedescendant",
+                    controlled.as_ref().map(|(option, _)| option.id()),
+                ),
+            ] {
+                if let Some(value) = value {
+                    if input.get_attribute(name).as_deref() != Some(value.as_str()) {
+                        input.set_attribute(name, &value).ok();
+                    }
+                } else {
+                    input.remove_attribute(name).ok();
+                }
+            }
+        }
+        let focused_node_removed =
+            had_semantic_focus && active.as_ref().is_some_and(|active| !active.is_connected());
+        if self.focus != update.focus || focused_node_removed {
             self.focus = update.focus;
             // Follow GPUI focus only while the user is navigating this semantic
             // tree. Never steal focus from the browser chrome or host forms.
-            if document
-                .active_element()
-                .is_some_and(|active| self.root.contains(Some(active.as_ref())))
-            {
+            if active.is_some_and(|active| {
+                had_semantic_focus
+                    || (active.has_attribute("data-gpui-input")
+                        && self.nodes.get(&update.focus).is_some_and(|(node, _)| {
+                            matches!(node.role(), Role::Dialog | Role::AlertDialog)
+                        }))
+            }) {
                 let target = self
                     .nodes
                     .get(&update.focus)

@@ -1267,36 +1267,44 @@ impl WebWindowInner {
 
     fn register_focus(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
-        self.listen_input("focus", move |_event: JsValue| {
-            if this.suppress_focus_status_events.get() {
-                return;
-            }
-            {
-                let mut state = this.state.borrow_mut();
-                state.is_active = true;
-            }
-            this.with_callback(
-                |callbacks| &mut callbacks.active_status_change,
-                |callback| callback(true),
-            );
-        })
+        EventListenerHandle::add(
+            this.browser_window.clone().as_ref(),
+            "focus",
+            move |_event| {
+                if this.suppress_focus_status_events.get() {
+                    return;
+                }
+                {
+                    let mut state = this.state.borrow_mut();
+                    state.is_active = true;
+                }
+                this.with_callback(
+                    |callbacks| &mut callbacks.active_status_change,
+                    |callback| callback(true),
+                );
+            },
+        )
     }
 
     fn register_blur(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
-        self.listen_input("blur", move |_event: JsValue| {
-            if this.suppress_focus_status_events.get() {
-                return;
-            }
-            {
-                let mut state = this.state.borrow_mut();
-                state.is_active = false;
-            }
-            this.with_callback(
-                |callbacks| &mut callbacks.active_status_change,
-                |callback| callback(false),
-            );
-        })
+        EventListenerHandle::add(
+            this.browser_window.clone().as_ref(),
+            "blur",
+            move |_event| {
+                if this.suppress_focus_status_events.get() {
+                    return;
+                }
+                {
+                    let mut state = this.state.borrow_mut();
+                    state.is_active = false;
+                }
+                this.with_callback(
+                    |callbacks| &mut callbacks.active_status_change,
+                    |callback| callback(false),
+                );
+            },
+        )
     }
 
     fn register_pointer_enter(self: &Rc<Self>) -> EventListenerHandle {

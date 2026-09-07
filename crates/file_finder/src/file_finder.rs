@@ -1783,6 +1783,18 @@ fn full_path_budget(
 impl PickerDelegate for FileFinderDelegate {
     type ListItem = ListItem;
 
+    #[cfg(target_family = "wasm")]
+    fn web_accessible_match(&self, ix: usize, cx: &App) -> Option<SharedString> {
+        Some(
+            self.matches
+                .get(ix)?
+                .abs_path(&self.project, cx)?
+                .to_string_lossy()
+                .into_owned()
+                .into(),
+        )
+    }
+
     fn name() -> &'static str {
         "file finder"
     }

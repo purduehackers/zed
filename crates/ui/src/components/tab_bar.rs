@@ -129,6 +129,9 @@ impl RenderOnce for TabBar {
                     .child(
                         h_flex()
                             .id("tabs")
+                            .when(cfg!(target_family = "wasm"), |this| {
+                                this.role(gpui::Role::TabList).aria_label("Editor tabs")
+                            })
                             .flex_grow_1()
                             .overflow_x_scroll()
                             .when_some(self.scroll_handle, |cx, scroll_handle| {

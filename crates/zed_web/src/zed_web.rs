@@ -16,6 +16,7 @@ mod boot;
 mod bridge;
 mod clipboard;
 mod connect;
+mod export;
 mod init;
 mod keymap;
 #[cfg(feature = "test-hooks")]

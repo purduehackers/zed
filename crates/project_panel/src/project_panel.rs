@@ -348,6 +348,9 @@ struct SelectPrevDiagnostic {
     pub severity: GoToDiagnosticSeverityFilter,
 }
 
+#[cfg(target_family = "wasm")]
+actions!(project_panel, [DownloadFolderZip]);
+
 actions!(
     project_panel,
     [
@@ -1141,6 +1144,11 @@ impl ProjectPanel {
 
             let has_pasteable_content = self.has_pasteable_content(cx);
             let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
+                #[cfg(target_family = "wasm")]
+                let menu = menu.when(is_dir, |menu| {
+                    menu.action("Download ZIP…", Box::new(DownloadFolderZip))
+                        .separator()
+                });
                 menu.context(self.focus_handle.clone()).map(|menu| {
                     if is_read_only {
                         menu.when(is_markdown, |menu| {
@@ -5879,6 +5887,33 @@ impl ProjectPanel {
 
         div()
             .id(id.clone())
+            .when(cfg!(target_family = "wasm") && !is_sticky, |this| {
+                this.role(gpui::Role::TreeItem)
+                    .aria_label(file_name.clone())
+                    .aria_level(depth + 1)
+                    .aria_selected(is_active || is_marked)
+                    .on_a11y_action(gpui::AccessibleAction::Focus, {
+                        let panel = cx.entity().downgrade();
+                        move |_, window, cx| {
+                            panel
+                                .update(cx, |this, cx| {
+                                    this.selection = Some(selection);
+                                    window.focus(&this.focus_handle(cx), cx);
+                                    cx.notify();
+                                })
+                                .ok();
+                        }
+                    })
+                    .when(kind.is_dir(), |this| {
+                        this.aria_expanded(
+                            self.state
+                                .expanded_dir_ids
+                                .get(&worktree_id)
+                                .is_some_and(|ids| ids.binary_search(&entry_id).is_ok()),
+                        )
+                    })
+                    .when(is_active, |this| this.aria_active_descendant())
+            })
             .relative()
             .group(GROUP_NAME)
             .cursor_pointer()
@@ -7197,6 +7232,9 @@ impl Render for ProjectPanel {
             }
             h_flex()
                 .id("project-panel")
+                .when(cfg!(target_family = "wasm"), |this| {
+                    this.role(gpui::Role::Tree).aria_label("Project files")
+                })
                 .group("project-panel")
                 .when(panel_settings.drag_and_drop, |this| {
                     this.on_drag_move(cx.listener(handle_drag_move::<ExternalPaths>))
