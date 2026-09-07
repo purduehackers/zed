@@ -135,6 +135,13 @@ impl Replayer {
     }
 
     pub fn next(self, window: &mut Window, cx: &mut App) {
+        #[cfg(target_family = "wasm")]
+        if Vim::globals(cx).web_clipboard_pending > 0 {
+            // A browser permission prompt must not let later macro actions
+            // move the cursor or finish dot-repeat before paste has resumed.
+            window.on_next_frame(move |window, cx| self.next(window, cx));
+            return;
+        }
         let mut lock = self.0.borrow_mut();
         let action = if lock.ix < 10000 {
             lock.actions.get(lock.ix).cloned()

@@ -509,6 +509,8 @@ impl TitleBar {
 
         #[cfg(not(target_family = "wasm"))]
         subscriptions.push(cx.observe(&active_call, |this, _, cx| this.active_call_changed(cx)));
+        #[cfg(target_family = "wasm")]
+        subscriptions.push(cx.observe_global::<collab::WebCall>(|_, cx| cx.notify()));
         subscriptions.push(
             cx.subscribe(&git_store, move |_, _, event, cx| match event {
                 GitStoreEvent::ActiveRepositoryChanged(_)

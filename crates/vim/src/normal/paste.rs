@@ -31,6 +31,15 @@ pub struct Paste {
 
 impl Vim {
     pub fn paste(&mut self, action: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(target_family = "wasm")]
+        if self.defer_web_clipboard(
+            crate::web_clipboard::Operation::Paste(action.clone()),
+            self.selected_register,
+            window,
+            cx,
+        ) {
+            return;
+        }
         self.record_current_action(cx);
         self.store_visual_marks(window, cx);
         let count = Vim::take_count(cx).unwrap_or(1);

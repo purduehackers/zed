@@ -387,7 +387,7 @@ impl Session {
                             session.kernel(Kernel::RunningKernel(kernel), cx);
                             let request =
                                 JupyterMessageContent::KernelInfoRequest(KernelInfoRequest {});
-                            session.send(request.into(), cx).log_err();
+                            session.send(crate::message(request, None), cx).log_err();
                         })
                         .ok();
                     }
@@ -512,7 +512,7 @@ impl Session {
                 status: ReplyStatus::Ok,
                 error: None,
             };
-            let message = reply.as_child_of(parent_message);
+            let message = crate::message(reply, Some(parent_message));
             kernel.stdin_tx().try_send(message).log_err();
         }
     }
@@ -653,7 +653,7 @@ impl Session {
             ..ExecuteRequest::default()
         };
 
-        let message: JupyterMessage = execute_request.into();
+        let message = crate::message(execute_request, None);
 
         let mut blocks_to_remove: HashSet<CustomBlockId> = HashSet::default();
         let mut inlays_to_remove: Vec<InlayId> = Vec::new();
@@ -823,7 +823,8 @@ impl Session {
     pub fn interrupt(&mut self, cx: &mut Context<Self>) {
         match &mut self.kernel {
             Kernel::RunningKernel(_kernel) => {
-                self.send(InterruptRequest {}.into(), cx).ok();
+                self.send(crate::message(InterruptRequest {}, None), cx)
+                    .ok();
             }
             Kernel::StartingKernel(_task) => {
                 // NOTE: If we switch to a literal queue instead of chaining on to the task, clear all queued executions
@@ -860,7 +861,7 @@ impl Session {
                 let forced = kernel.force_shutdown(window, cx);
 
                 cx.spawn(async move |this, cx| {
-                    let message: JupyterMessage = ShutdownRequest { restart: false }.into();
+                    let message = crate::message(ShutdownRequest { restart: false }, None);
                     request_tx.try_send(message).ok();
 
                     forced.await.log_err();
@@ -899,7 +900,7 @@ impl Session {
                 cx.spawn_in(window, async move |this, cx| {
                     // Send shutdown request with restart flag
                     log::debug!("restarting kernel");
-                    let message: JupyterMessage = ShutdownRequest { restart: true }.into();
+                    let message = crate::message(ShutdownRequest { restart: true }, None);
                     request_tx.try_send(message).ok();
 
                     // Wait for kernel to shutdown

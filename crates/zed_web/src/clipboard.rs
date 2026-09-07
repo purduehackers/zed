@@ -55,11 +55,7 @@ pub fn init(cx: &mut App) {
                 .capture_action(paste::<editor::actions::DiffClipboardWithSelection>)
                 .capture_action(paste::<terminal::Paste>)
                 .capture_action(paste::<terminal::PasteText>)
-                .capture_action(|action: &vim::WebPaste, window, cx| {
-                    if vim::web_uses_system_clipboard(cx) {
-                        paste(action, window, cx);
-                    }
-                })
+                .capture_action(paste::<vim::WebClipboardAction>)
         });
     })
     .detach();
@@ -116,10 +112,16 @@ fn paste<A: Action>(action: &A, window: &mut Window, cx: &mut App) {
         return;
     }
     cx.stop_propagation();
-    if clipboard::request_native_paste() {
+    let deferred_vim = (action as &dyn std::any::Any)
+        .downcast_ref::<vim::WebClipboardAction>()
+        .cloned();
+    if deferred_vim.is_none() && clipboard::request_native_paste() {
         return;
     }
     let Some(focus) = window.focused(cx) else {
+        if let Some(action) = deferred_vim {
+            action.finish(cx);
+        }
         return;
     };
     let action = action.boxed_clone();
@@ -144,6 +146,9 @@ fn paste<A: Action>(action: &A, window: &mut Window, cx: &mut App) {
                 };
                 clipboard::report_error(message);
             }
+        }
+        if let Some(action) = deferred_vim {
+            cx.update(|_, cx| action.finish(cx)).ok();
         }
     }).detach();
 }

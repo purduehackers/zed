@@ -718,6 +718,17 @@ impl Vim {
     }
 
     pub(crate) fn motion(&mut self, motion: Motion, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(target_family = "wasm")]
+        if self.operator_stack.contains(&Operator::ReplaceWithRegister)
+            && self.defer_web_clipboard(
+                crate::web_clipboard::Operation::Motion(motion.clone()),
+                self.selected_register,
+                window,
+                cx,
+            )
+        {
+            return;
+        }
         if let Some(Operator::FindForward { .. })
         | Some(Operator::Sneak { .. })
         | Some(Operator::SneakBackward { .. })

@@ -41,6 +41,40 @@ pub fn init(fs: Arc<dyn Fs>, cx: &mut App) {
     ReplStore::init(fs, cx);
 }
 
+fn message(
+    content: impl Into<jupyter_protocol::JupyterMessageContent>,
+    parent: Option<&jupyter_protocol::JupyterMessage>,
+) -> jupyter_protocol::JupyterMessage {
+    #[cfg(not(target_family = "wasm"))]
+    return jupyter_protocol::JupyterMessage::new(content, parent);
+    #[cfg(target_family = "wasm")]
+    {
+        // jupyter-protocol's constructor unconditionally calls std::SystemTime,
+        // which panics on wasm32-unknown-unknown. Use the browser-aware clock.
+        let content = content.into();
+        jupyter_protocol::JupyterMessage {
+            header: jupyter_protocol::Header {
+                msg_id: uuid::Uuid::new_v4().to_string(),
+                session: parent
+                    .map(|message| message.header.session.clone())
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                username: "runtimelib".to_string(),
+                date: chrono::Utc::now(),
+                msg_type: content.message_type().to_owned(),
+                version: "5.3".to_string(),
+            },
+            parent_header: parent.map(|message| message.header.clone()),
+            zmq_identities: parent
+                .map(|message| message.zmq_identities.clone())
+                .unwrap_or_default(),
+            metadata: serde_json::json!({}),
+            content,
+            buffers: Vec::new(),
+            channel: None,
+        }
+    }
+}
+
 #[cfg(not(target_family = "wasm"))]
 fn zed_dispatcher(cx: &mut App) -> impl Dispatcher {
     struct ZedDispatcher {

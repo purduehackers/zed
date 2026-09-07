@@ -15195,6 +15195,7 @@ dependencies = [
  "async-trait",
  "async-tungstenite",
  "base64 0.22.1",
+ "chrono",
  "client",
  "collections",
  "command_palette_hooks",

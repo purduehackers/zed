@@ -35,6 +35,7 @@ pub struct JsHost {
     download_project: Function,
     connect_debug_adapter: Function,
     connect_kernel: Function,
+    call_action: Function,
     on_closed: Option<Function>,
 }
 
@@ -89,6 +90,7 @@ impl JsHost {
             download_project: required("downloadProject")?,
             connect_debug_adapter: required("connectDebugAdapter")?,
             connect_kernel: required("connectKernel")?,
+            call_action: required("callAction")?,
             on_closed: optional("onClosed"),
             this: value,
         })
@@ -111,6 +113,21 @@ pub fn update_action(action: &str) {
             "updateAction",
             host.update_action
                 .call1(&host.this, &JsValue::from_str(action)),
+        )
+    });
+}
+
+/// Media permission requests must begin synchronously inside the user's click.
+pub fn call_action(action: &str, replica: u16, name: &str) {
+    with_host(|host| {
+        log_call_error(
+            "callAction",
+            host.call_action.call3(
+                &host.this,
+                &JsValue::from_str(action),
+                &JsValue::from(replica),
+                &JsValue::from_str(name),
+            ),
         )
     });
 }

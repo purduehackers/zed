@@ -305,6 +305,7 @@ pub fn init_after_db(
     // 31. On desktop `collab_ui::init` calls this; `collab_ui` is excluded here.
     title_bar::init(cx);
     title_bar::init_web_updates(crate::bridge::update_action, cx);
+    title_bar::collab::init_web_calls(crate::bridge::call_action, cx);
     cx.observe_new(|editor: &mut editor::Editor, window, cx| {
         use gpui::Focusable;
         let Some(window) = window else {

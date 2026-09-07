@@ -550,13 +550,24 @@ impl Vim {
         self.object_impl(object, false, window, cx);
     }
 
-    fn object_impl(
+    pub(super) fn object_impl(
         &mut self,
         object: Object,
         opening: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(target_family = "wasm")]
+        if self.operator_stack.contains(&Operator::ReplaceWithRegister)
+            && self.defer_web_clipboard(
+                crate::web_clipboard::Operation::Object(object, opening),
+                self.selected_register,
+                window,
+                cx,
+            )
+        {
+            return;
+        }
         let count = Self::take_count(cx);
 
         match self.mode {

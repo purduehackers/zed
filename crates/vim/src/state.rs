@@ -248,6 +248,8 @@ impl From<String> for Register {
 
 #[derive(Default)]
 pub struct VimGlobals {
+    #[cfg(target_family = "wasm")]
+    pub(crate) web_clipboard_pending: usize,
     pub last_find: Option<Motion>,
 
     pub dot_recording: bool,

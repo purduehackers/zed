@@ -2,6 +2,8 @@ mod boundary;
 mod duplicate;
 mod object;
 mod paste;
+#[cfg(target_family = "wasm")]
+pub(super) use paste::HelixPaste;
 mod select;
 mod surround;
 

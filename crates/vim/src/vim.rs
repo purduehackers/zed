@@ -18,10 +18,10 @@ mod rewrap;
 mod state;
 mod surrounds;
 mod visual;
+#[cfg(target_family = "wasm")]
+mod web_clipboard;
 
 use crate::normal::paste::Paste as VimPaste;
-#[cfg(target_family = "wasm")]
-pub use crate::normal::paste::Paste as WebPaste;
 use collections::HashMap;
 use editor::{
     Anchor, Bias, Editor, EditorEvent, EditorSettings, MultiBufferOffset, NavigationOverlayKey,
@@ -57,27 +57,14 @@ use theme_settings::ThemeSettings;
 use ui::{IntoElement, SharedString, px};
 use vim_mode_setting::HelixModeSetting;
 use vim_mode_setting::VimModeSetting;
+#[cfg(target_family = "wasm")]
+pub use web_clipboard::WebClipboardAction;
 use workspace::{self, Pane, Workspace};
 
 use crate::{
     normal::{GoToPreviousTab, GoToTab},
     state::ReplayableAction,
 };
-
-/// The browser resolves asynchronous system reads before dispatching Vim paste.
-#[cfg(target_family = "wasm")]
-pub fn web_uses_system_clipboard(cx: &mut App) -> bool {
-    let Some(vim) = Vim::globals(cx).focused_vim() else {
-        return false;
-    };
-    match vim.read(cx).selected_register {
-        Some('+' | '*') => true,
-        None | Some('"') => {
-            VimSettings::get_global(cx).use_system_clipboard != UseSystemClipboard::Never
-        }
-        _ => false,
-    }
-}
 
 enum HelixJumpNavigationOverlay {}
 
@@ -1009,6 +996,8 @@ impl Vim {
             );
 
             normal::register(editor, cx);
+            #[cfg(target_family = "wasm")]
+            Vim::action(editor, cx, Vim::complete_web_clipboard);
             insert::register(editor, cx);
             helix::register(editor, cx);
             motion::register(editor, cx);
@@ -2068,6 +2057,19 @@ impl Vim {
 
     fn input_ignored(&mut self, text: Arc<str>, window: &mut Window, cx: &mut Context<Self>) {
         if text.is_empty() {
+            return;
+        }
+
+        #[cfg(target_family = "wasm")]
+        if self.mode == Mode::Insert
+            && self.active_operator() == Some(Operator::Register)
+            && self.defer_web_clipboard(
+                web_clipboard::Operation::InsertRegister(text.clone()),
+                text.chars().next(),
+                window,
+                cx,
+            )
+        {
             return;
         }
 
