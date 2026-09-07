@@ -719,11 +719,26 @@ impl WebWindowInner {
                 key_char: key_char.clone(),
             };
 
+            crate::clipboard::begin_key(
+                event.key().eq_ignore_ascii_case("v")
+                    && !event.alt_key()
+                    && if this.is_mac {
+                        event.meta_key() && !event.ctrl_key() && !event.shift_key()
+                    } else {
+                        event.ctrl_key() && !event.meta_key()
+                    },
+            );
             let result = this.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
                 keystroke,
                 is_held,
                 prefer_character_input: false,
             }));
+            if crate::clipboard::end_key() {
+                // Let this trusted key produce the browser's paste event.
+                // Only a handled paste action requests this, so terminal Ctrl-V
+                // and Vim visual-block bindings keep their own semantics.
+                return;
+            }
 
             if let Some(result) = result {
                 if !result.propagate {
@@ -1064,11 +1079,15 @@ impl WebWindowInner {
             }
             event.prevent_default();
 
+            let target = crate::clipboard::paste_target();
             if image_files.is_empty() {
                 if let Some(text) = text {
-                    this.with_input_handler(|handler| {
-                        handler.paste(ClipboardItem::new_string(text));
-                    });
+                    let item = crate::clipboard::restore_metadata(ClipboardItem::new_string(text));
+                    if let Some(target) = target {
+                        target(item);
+                    } else {
+                        this.with_input_handler(|handler| handler.paste(item));
+                    }
                 }
                 return;
             }
@@ -1095,9 +1114,12 @@ impl WebWindowInner {
                 if entries.is_empty() {
                     return;
                 }
-                this.with_input_handler(|handler| {
-                    handler.paste(ClipboardItem { entries });
-                });
+                let item = ClipboardItem { entries };
+                if let Some(target) = target {
+                    target(item);
+                } else {
+                    this.with_input_handler(|handler| handler.paste(item));
+                }
             });
         })
     }

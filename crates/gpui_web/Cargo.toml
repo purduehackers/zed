@@ -23,6 +23,7 @@ parking_lot = { workspace = true, features = ["nightly"] }
 parking_lot_core.workspace = true
 gpui_wgpu.workspace = true
 http_client.workspace = true
+image.workspace = true
 anyhow.workspace = true
 futures.workspace = true
 log.workspace = true
@@ -41,6 +42,7 @@ wasm_thread = { git = "https://github.com/zed-industries/wasm_thread", rev = "0c
 web-sys = { version = "0.3", features = [
     "console",
     "Blob",
+    "BlobPropertyBag",
     "Clipboard",
     "ClipboardEvent",
     "ClipboardItem",

@@ -580,7 +580,7 @@ impl Platform for WebPlatform {
     }
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
-        None
+        crate::clipboard::read()
     }
 
     fn read_from_clipboard_async(&self) -> Task<Result<Option<ClipboardItem>, ClipboardReadError>> {
@@ -635,7 +635,9 @@ impl Platform for WebPlatform {
                 }
             }
             if !entries.is_empty() {
-                Ok(Some(ClipboardItem { entries }))
+                Ok(Some(crate::clipboard::restore_metadata(ClipboardItem {
+                    entries,
+                })))
             } else if saw_unsupported_type {
                 Err(ClipboardReadError::UnsupportedContent)
             } else {
@@ -645,13 +647,7 @@ impl Platform for WebPlatform {
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
-        if let Some(text) = item.text()
-            && let Some(window) = web_sys::window()
-        {
-            // Fire-and-forget; called synchronously inside the user's input
-            // event, which satisfies the browser's user-activation requirement.
-            drop(window.navigator().clipboard().write_text(&text));
-        }
+        crate::clipboard::write(item);
     }
 
     fn write_credentials(&self, _url: &str, _username: &str, _password: &[u8]) -> Task<Result<()>> {

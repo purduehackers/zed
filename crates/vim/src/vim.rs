@@ -20,6 +20,8 @@ mod surrounds;
 mod visual;
 
 use crate::normal::paste::Paste as VimPaste;
+#[cfg(target_family = "wasm")]
+pub use crate::normal::paste::Paste as WebPaste;
 use collections::HashMap;
 use editor::{
     Anchor, Bias, Editor, EditorEvent, EditorSettings, MultiBufferOffset, NavigationOverlayKey,
@@ -61,6 +63,21 @@ use crate::{
     normal::{GoToPreviousTab, GoToTab},
     state::ReplayableAction,
 };
+
+/// The browser resolves asynchronous system reads before dispatching Vim paste.
+#[cfg(target_family = "wasm")]
+pub fn web_uses_system_clipboard(cx: &mut App) -> bool {
+    let Some(vim) = Vim::globals(cx).focused_vim() else {
+        return false;
+    };
+    match vim.read(cx).selected_register {
+        Some('+' | '*') => true,
+        None | Some('"') => {
+            VimSettings::get_global(cx).use_system_clipboard != UseSystemClipboard::Never
+        }
+        _ => false,
+    }
+}
 
 enum HelixJumpNavigationOverlay {}
 

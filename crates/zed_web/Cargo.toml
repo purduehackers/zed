@@ -50,7 +50,7 @@ smol.workspace = true
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 js-sys.workspace = true
-web-sys = { version = "0.3", features = ["Window", "Navigator", "Location", "Document", "console"] }
+web-sys = { version = "0.3", features = ["Window", "Navigator", "Location", "Document", "ClipboardEvent", "DataTransfer", "console"] }
 web-time.workspace = true
 time = { workspace = true, features = ["wasm-bindgen"] }
 # R3-5: both getrandom lines are declared here so the bundle never depends on a transitive

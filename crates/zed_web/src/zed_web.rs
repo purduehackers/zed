@@ -14,6 +14,7 @@
 mod assets;
 mod boot;
 mod bridge;
+mod clipboard;
 mod connect;
 mod init;
 mod keymap;

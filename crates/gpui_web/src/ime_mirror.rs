@@ -106,6 +106,7 @@ impl ImeMirror {
             .dyn_into()
             .map_err(|e| anyhow::anyhow!("Created element is not a textarea: {e:?}"))?;
         let style = element.style();
+        element.set_attribute("data-gpui-input", "").ok();
         style.set_property("position", "fixed").ok();
         style.set_property("top", "0").ok();
         style.set_property("left", "0").ok();

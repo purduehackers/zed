@@ -339,6 +339,7 @@ pub fn init_after_db(
 
     // 34. Status bar, toolbars, panels and actions on every workspace.
     workspace_chrome::init(app_state.clone(), cx);
+    crate::clipboard::init(cx);
 
     // 35.
     cx.activate(true);
