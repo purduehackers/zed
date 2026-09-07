@@ -2,7 +2,7 @@ use crate::dispatcher::WebDispatcher;
 use crate::display::WebDisplay;
 use crate::events::EventListenerHandle;
 use crate::http_client::FetchHttpClient;
-use crate::keyboard::WebKeyboardLayout;
+use crate::keyboard::WebKeyboard;
 use crate::window::WebWindow;
 use anyhow::Result;
 use futures::channel::oneshot;
@@ -43,6 +43,7 @@ pub struct WebPlatform {
     cursor_visible: Rc<Cell<bool>>,
     last_cursor_css: Rc<Cell<&'static str>>,
     gestures: Rc<WebGestures>,
+    keyboard: Rc<WebKeyboard>,
     _cursor_restore_listeners: Vec<EventListenerHandle>,
 }
 
@@ -137,7 +138,6 @@ struct WebPlatformCallbacks {
     app_menu_action: Option<Box<dyn FnMut(&dyn Action)>>,
     will_open_app_menu: Option<Box<dyn FnMut()>>,
     validate_app_menu_command: Option<Box<dyn FnMut(&dyn Action) -> bool>>,
-    keyboard_layout_change: Option<Box<dyn FnMut()>>,
     thermal_state_change: Option<Box<dyn FnMut()>>,
 }
 
@@ -176,6 +176,7 @@ impl WebPlatform {
             &browser_window.navigator().user_agent().unwrap_or_default(),
         ));
 
+        let keyboard = WebKeyboard::new(&browser_window);
         Self {
             browser_window,
             dispatcher,
@@ -192,6 +193,7 @@ impl WebPlatform {
             cursor_visible,
             last_cursor_css,
             gestures,
+            keyboard,
             _cursor_restore_listeners: cursor_restore_listeners,
         }
     }
@@ -407,6 +409,7 @@ impl Platform for WebPlatform {
             self.browser_window.clone(),
             self.window_lifecycle.clone(),
             self.active_window.clone(),
+            self.keyboard.clone(),
         );
         match window {
             Ok(window) => {
@@ -667,7 +670,7 @@ impl Platform for WebPlatform {
     }
 
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {
-        Box::new(WebKeyboardLayout)
+        Box::new(self.keyboard.layout())
     }
 
     fn keyboard_mapper(&self) -> Rc<dyn PlatformKeyboardMapper> {
@@ -675,7 +678,7 @@ impl Platform for WebPlatform {
     }
 
     fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>) {
-        self.callbacks.borrow_mut().keyboard_layout_change = Some(callback);
+        self.keyboard.on_change(callback);
     }
 }
 

@@ -800,11 +800,13 @@ impl WebWindowInner {
                 return;
             }
 
-            let key = dom_key_to_gpui_key(&event, this.is_mac);
+            this.keyboard.observe(&event);
+            let key = dom_key_to_gpui_key(&event, this.is_mac, &this.keyboard);
 
-            if is_modifier_only_key(&key) {
+            if is_modifier_only_key(&key) || matches!(key.as_str(), "dead" | "unidentified" | "") {
                 return;
             }
+            this.pressed_keys.borrow_mut().insert(key_identity(&event));
 
             let is_held = event.repeat();
             let key_char = compute_key_char(&event, &key, &modifiers);
@@ -879,7 +881,12 @@ impl WebWindowInner {
                 }));
             }
 
-            let key = dom_key_to_gpui_key(&event, this.is_mac);
+            // Never dispatch a release for an IME/AltGraph/semantic-navigation
+            // key whose press was deliberately left to the browser.
+            if !this.pressed_keys.borrow_mut().remove(&key_identity(&event)) {
+                return;
+            }
+            let key = dom_key_to_gpui_key(&event, this.is_mac, &this.keyboard);
 
             if is_modifier_only_key(&key) {
                 return;
@@ -1295,6 +1302,7 @@ impl WebWindowInner {
                 if this.suppress_focus_status_events.get() {
                     return;
                 }
+                this.pressed_keys.borrow_mut().clear();
                 {
                     let mut state = this.state.borrow_mut();
                     state.is_active = false;
@@ -1322,14 +1330,33 @@ impl WebWindowInner {
     }
 }
 
-fn dom_key_to_gpui_key(event: &web_sys::KeyboardEvent, is_mac: bool) -> String {
+fn key_identity(event: &web_sys::KeyboardEvent) -> String {
+    let code = event.code();
+    if code.is_empty() { event.key() } else { code }
+}
+
+fn dom_key_to_gpui_key(
+    event: &web_sys::KeyboardEvent,
+    is_mac: bool,
+    keyboard: &crate::keyboard::WebKeyboard,
+) -> String {
     let key = event.key();
     // macOS reports Option+P as π, Option+W as ∑, and Option+N as Dead.
-    // Match shortcut keys using the platform's current US layout (WebKeyboardLayout),
-    // while compute_key_char retains the original composed text for unbound chords.
-    if is_mac && event.alt_key() && !event.is_composing() && (!key.is_ascii() || key == "Dead") {
+    // Resolve shortcuts against browser/observed legends, while compute_key_char
+    // retains the original composed text for unbound chords.
+    if is_mac && event.alt_key() && !event.is_composing() {
+        if let Some(base) = keyboard.option_key(event) {
+            return if base == " " {
+                "space".into()
+            } else {
+                base.to_lowercase()
+            };
+        }
+        // Without a layout API or observed legend, preserve the browser-safe
+        // letter shortcuts. Do not guess punctuation or change inserted text.
         let code = event.code();
-        if let Some(letter) = code.strip_prefix("Key")
+        if (!key.is_ascii() || key == "Dead")
+            && let Some(letter) = code.strip_prefix("Key")
             && letter.len() == 1
             && letter.as_bytes()[0].is_ascii_uppercase()
         {
@@ -1457,13 +1484,13 @@ fn is_modifier_only_key(key: &str) -> bool {
 ///
 /// On macOS, Option participates in text entry (e.g. option-n composes "~"
 /// or accented characters), so only Command and Control disqualify. Elsewhere,
-/// plain Alt is a shortcut modifier, but AltGr is reported by browsers as
-/// control+alt and `event.key()` then carries the composed character.
+/// Alt is a shortcut modifier. AltGraph is handled by the browser input path;
+/// an ordinary Control+Alt chord must not insert text.
 fn keystroke_inserts_text(modifiers: &Modifiers, is_mac: bool) -> bool {
     if is_mac {
         !modifiers.platform && !modifiers.control
     } else {
-        modifiers.is_subset_of(&Modifiers::shift()) || (modifiers.control && modifiers.alt)
+        modifiers.is_subset_of(&Modifiers::shift())
     }
 }
 
@@ -1472,9 +1499,8 @@ fn compute_key_char(
     gpui_key: &str,
     modifiers: &Modifiers,
 ) -> Option<String> {
-    // AltGr arrives as control+alt with the composed character in
-    // `event.key()`; bare Command/Control combinations are not text.
-    if (modifiers.platform || modifiers.control) && !(modifiers.control && modifiers.alt) {
+    // AltGraph already took the browser input path, before shortcut dispatch.
+    if modifiers.platform || modifiers.control {
         return None;
     }
 

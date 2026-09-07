@@ -93,7 +93,7 @@ impl WebAccessibility {
                     let node =
                         target.and_then(|target| target.closest("[data-gpui-node]").ok().flatten());
                     if let Some(node) = &node {
-                        if node.get_attribute("aria-disabled").as_deref() == Some("true") {
+                        if !is_available(node) {
                             return;
                         }
                         if action == Action::Focus {
@@ -159,6 +159,7 @@ impl WebAccessibility {
                             .filter_map(|ix| descendants.item(ix))
                             .filter(|element| {
                                 element.get_attribute("role").as_deref() == Some("tab")
+                                    && is_available(element)
                             })
                             .collect::<Vec<_>>();
                         if let Some(current) = tabs.iter().position(|tab| *tab == target) {
@@ -207,9 +208,16 @@ impl WebAccessibility {
                             .filter_map(|ix| descendants.item(ix))
                             .filter_map(|element| element.dyn_into::<web_sys::HtmlElement>().ok())
                             .filter(|element| {
-                                element.tab_index() == 0 && element.has_attribute("data-gpui-click")
+                                element.tab_index() == 0
+                                    && element.has_attribute("data-gpui-click")
+                                    && is_available(element)
                             })
                             .collect::<Vec<_>>();
+                        if buttons.is_empty() {
+                            event.prevent_default();
+                            event.stop_propagation();
+                            return;
+                        }
                         let active = dialog
                             .owner_document()
                             .and_then(|document| document.active_element());
@@ -242,11 +250,11 @@ impl WebAccessibility {
                 let target = event
                     .target()
                     .and_then(|target| target.dyn_into::<web_sys::Element>().ok());
-                if let Some(target) =
-                    target.filter(|target| target.has_attribute("data-gpui-click"))
-                    && let Some(id) = target
-                        .get_attribute("data-gpui-node")
-                        .and_then(|id| id.parse().ok())
+                if let Some(target) = target.filter(|target| {
+                    target.has_attribute("data-gpui-click") && is_available(target)
+                }) && let Some(id) = target
+                    .get_attribute("data-gpui-node")
+                    .and_then(|id| id.parse().ok())
                 {
                     event.prevent_default();
                     event.stop_propagation();
@@ -325,6 +333,17 @@ impl WebAccessibility {
                 node.is_disabled().then_some("true"),
             );
             attr(&element, "aria-hidden", node.is_hidden().then_some("true"));
+            element.set_hidden(node.is_hidden());
+            attr(
+                &element,
+                "aria-live",
+                node.live().map(|live| match live {
+                    accesskit::Live::Off => "off",
+                    accesskit::Live::Polite => "polite",
+                    accesskit::Live::Assertive => "assertive",
+                }),
+            );
+            attr(&element, "aria-busy", node.is_busy().then_some("true"));
             attr(
                 &element,
                 "aria-readonly",
@@ -459,6 +478,10 @@ impl WebAccessibility {
         // One tab stop per composite widget. Its query/arrows navigate the rows;
         // opening a large project must not add thousands of Tab presses.
         for (id, (node, element)) in &self.nodes {
+            if node.is_hidden() || node.is_disabled() {
+                element.set_tab_index(-1);
+                continue;
+            }
             match node.role() {
                 Role::ListBox | Role::ListBoxOption => element.set_tab_index(-1),
                 Role::TreeItem => element.set_tab_index(if *id == update.focus { 0 } else { -1 }),
@@ -545,6 +568,14 @@ impl Drop for WebAccessibility {
         self.focus_ring.remove();
         (self.callbacks.deactivation)();
     }
+}
+
+fn is_available(element: &web_sys::Element) -> bool {
+    element
+        .closest("[hidden], [aria-disabled=true]")
+        .ok()
+        .flatten()
+        .is_none()
 }
 
 fn attr(element: &web_sys::HtmlElement, name: &str, value: Option<&str>) {

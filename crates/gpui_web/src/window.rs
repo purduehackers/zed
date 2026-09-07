@@ -4,6 +4,7 @@ use crate::events::{
     ClickState, EventListenerHandle, TouchIds, WebEventListeners, is_mac_platform,
 };
 use crate::ime_mirror::ImeMirror;
+use crate::keyboard::WebKeyboard;
 use crate::platform::WebWindowLifecycle;
 use std::sync::Arc;
 use std::{cell::Cell, cell::RefCell, rc::Rc};
@@ -54,6 +55,8 @@ pub(crate) struct WebWindowInner {
     accessibility: RefCell<Option<WebAccessibility>>,
     pub(crate) has_device_pixel_support: bool,
     pub(crate) is_mac: bool,
+    pub(crate) keyboard: Rc<WebKeyboard>,
+    pub(crate) pressed_keys: RefCell<std::collections::BTreeSet<String>>,
     pub(crate) state: RefCell<WebWindowMutableState>,
     pub(crate) callbacks: RefCell<WebWindowCallbacks>,
     pub(crate) click_state: RefCell<ClickState>,
@@ -146,6 +149,7 @@ impl WebWindow {
         browser_window: web_sys::Window,
         lifecycle: Rc<Cell<WebWindowLifecycle>>,
         active_window: Rc<RefCell<Option<AnyWindowHandle>>>,
+        keyboard: Rc<WebKeyboard>,
     ) -> anyhow::Result<Self> {
         let document = browser_window
             .document()
@@ -199,6 +203,8 @@ impl WebWindow {
             accessibility: RefCell::new(None),
             has_device_pixel_support,
             is_mac,
+            keyboard,
+            pressed_keys: RefCell::default(),
             state: RefCell::new(mutable_state),
             callbacks: RefCell::new(WebWindowCallbacks::default()),
             click_state: RefCell::new(ClickState::default()),
