@@ -61,6 +61,8 @@ use ui::{
     PopoverMenuHandle, TintColor, Tooltip, prelude::*, utils::platform_title_bar_height,
 };
 use update_version::UpdateVersion;
+#[cfg(target_family = "wasm")]
+pub use update_version::{WebUpdateStatus, init_web_updates, set_web_update_status};
 use util::ResultExt;
 use workspace::{
     AccessibleMode, MultiWorkspace, ToggleWorktreeSecurity, Workspace,
@@ -391,9 +393,14 @@ impl Render for TitleBar {
                 .pr_1()
                 .gap_1()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .when(cfg!(target_family = "wasm"), |this| {
+                    this.child(self.update_version.clone())
+                })
                 .child(self.render_call_controls(window, cx))
                 .children(self.render_connection_status(status, cx))
-                .child(self.update_version.clone())
+                .when(!cfg!(target_family = "wasm"), |this| {
+                    this.child(self.update_version.clone())
+                })
                 .when(
                     user.is_none()
                         && is_signed_out_or_auth_error

@@ -302,6 +302,7 @@ pub fn init_after_db(
 
     // 31. On desktop `collab_ui::init` calls this; `collab_ui` is excluded here.
     title_bar::init(cx);
+    title_bar::init_web_updates(crate::bridge::update_action, cx);
 
     // 32. Window background and text rendering follow the settings; the server-URL
     //     reconnect branch is desktop-only.

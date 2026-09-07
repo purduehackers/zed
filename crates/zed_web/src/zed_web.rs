@@ -81,3 +81,15 @@ pub fn has_unsaved_changes() -> bool {
 pub fn build_id() -> String {
     boot::build_id().to_string()
 }
+
+/// Drives the existing Zed update button from the shell's background download.
+#[wasm_bindgen]
+pub fn set_update_status(status_json: String) -> Result<(), JsValue> {
+    let status = serde_json::from_str(&status_json)
+        .map_err(anyhow::Error::from)
+        .map_err(bridge::boot_error("bad_config"))?;
+    boot::async_app()
+        .map_err(bridge::boot_error("runtime_missing"))?
+        .update(|cx| title_bar::set_web_update_status(status, cx));
+    Ok(())
+}

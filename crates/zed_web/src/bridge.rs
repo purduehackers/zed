@@ -31,6 +31,7 @@ pub struct JsHost {
     save_document: Function,
     report_error: Function,
     on_lifecycle: Function,
+    update_action: Function,
     on_closed: Option<Function>,
 }
 
@@ -81,6 +82,7 @@ impl JsHost {
             save_document: required("saveDocument")?,
             report_error: required("reportError")?,
             on_lifecycle: required("onLifecycle")?,
+            update_action: required("updateAction")?,
             on_closed: optional("onClosed"),
             this: value,
         })
@@ -94,6 +96,17 @@ impl JsHost {
 
 fn with_host<R>(f: impl FnOnce(&JsHost) -> R) -> Option<R> {
     HOST.with(|host| host.borrow().as_ref().map(f))
+}
+
+/// Update UI actions stay in the host; it queues them after the current GPUI callback.
+pub fn update_action(action: &str) {
+    with_host(|host| {
+        log_call_error(
+            "updateAction",
+            host.update_action
+                .call1(&host.this, &JsValue::from_str(action)),
+        )
+    });
 }
 
 fn log_call_error(name: &str, result: Result<JsValue, JsValue>) {

@@ -109,6 +109,9 @@ const host = {
   onLifecycle(kind, seconds) {
     console.info("[zed-web] lifecycle", kind, seconds);
   },
+  updateAction() {
+    console.info("Workspace updates are managed by the Zedspaces host, not this standalone harness.");
+  },
   onClosed(info) {
     console.info("[zed-web] closed", info.code, info.reason);
   },

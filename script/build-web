@@ -219,6 +219,8 @@ tar -C assets -cf "$bundle/zed-assets.tar" --exclude='._*' --exclude='.DS_Store'
 
 # 7. build.json (never emit .br files: Vercel recompresses precompressed files).
 wasm_bytes="$(wc -c <"$bundle/zed_web_bg.wasm" | tr -d ' ')"
+assets_bytes="$(wc -c <"$bundle/zed-assets.tar" | tr -d ' ')"
+js_bytes="$(wc -c <"$bundle/zed_web.js" | tr -d ' ')"
 wasm_brotli_bytes=null
 if command -v brotli >/dev/null 2>&1; then
     wasm_brotli_bytes="$(brotli -c -q 5 "$bundle/zed_web_bg.wasm" | wc -c | tr -d ' ')"
@@ -234,7 +236,7 @@ commit="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 test_hooks_json=false
 [[ $test_hooks -eq 1 ]] && test_hooks_json=true
 cat >"$bundle/build.json" <<JSON
-{ "build_id": "$build_id", "commit": "$commit", "wasm_bytes": $wasm_bytes, "wasm_brotli_bytes": $wasm_brotli_bytes, "test_hooks": $test_hooks_json }
+{ "build_id": "$build_id", "commit": "$commit", "wasm_bytes": $wasm_bytes, "wasm_brotli_bytes": $wasm_brotli_bytes, "assets_bytes": $assets_bytes, "js_bytes": $js_bytes, "test_hooks": $test_hooks_json, "web_updates": true }
 JSON
 
 # 8. The dev harness (apps/web never serves these two files; see the header).

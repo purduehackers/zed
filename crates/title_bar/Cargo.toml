@@ -61,7 +61,7 @@ zed_actions.workspace = true
 arrayvec = "0.7.6"
 
 # Collaboration (calls, channels, LiveKit) and the updater are desktop-only: the browser
-# build (BUILD-SPEC 3.2) compiles `collab_web.rs`/`update_version_web.rs` stubs instead.
+# build uses its shared-workspace presence and host-driven update UI instead.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 auto_update.workspace = true
 call.workspace = true
