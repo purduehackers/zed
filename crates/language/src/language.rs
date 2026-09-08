@@ -96,9 +96,11 @@ pub use toolchain::{
     LanguageToolchainStore, LocalLanguageToolchainStore, Toolchain, ToolchainList, ToolchainLister,
     ToolchainMetadata, ToolchainScope,
 };
-use tree_sitter::{self, QueryCursor};
 #[cfg(not(target_family = "wasm"))]
-use tree_sitter::{WasmStore, wasmtime};
+use tree_sitter::wasmtime;
+use tree_sitter::{self, QueryCursor, WasmStore};
+#[cfg(target_family = "wasm")]
+mod web_grammar;
 use util::rel_path::RelPath;
 
 pub use available_languages::AvailableLanguage;
@@ -150,7 +152,6 @@ where
     let new_parser = || {
         #[allow(unused_mut)]
         let mut parser = Parser::new();
-        #[cfg(not(target_family = "wasm"))]
         parser
             .set_wasm_store(WasmStore::new(&WASM_ENGINE).unwrap())
             .unwrap();
@@ -188,6 +189,13 @@ where
 #[cfg(not(target_family = "wasm"))]
 static WASM_ENGINE: LazyLock<wasmtime::Engine> = LazyLock::new(|| {
     wasmtime::Engine::new(&wasmtime::Config::new()).expect("Failed to create Wasmtime engine")
+});
+
+#[cfg(target_family = "wasm")]
+static WASM_ENGINE: LazyLock<tree_sitter::wasmi::Engine> = LazyLock::new(|| {
+    let mut config = tree_sitter::wasmi::Config::default();
+    config.consume_fuel(true);
+    tree_sitter::wasmi::Engine::new(&config)
 });
 
 /// A shared grammar for plain text, exposed for reuse by downstream crates.

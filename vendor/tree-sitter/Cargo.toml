@@ -1,0 +1,36 @@
+[package]
+name = "tree-sitter"
+version = "0.27.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+description = "Rust bindings to the Tree-sitter parsing library"
+repository = "https://github.com/tree-sitter/tree-sitter"
+build = "binding_rust/build.rs"
+links = "tree-sitter"
+
+[lib]
+path = "binding_rust/lib.rs"
+
+[features]
+default = ["std"]
+std = ["regex/std", "regex/perf"]
+wasm = ["std", "dep:wasmtime-c-api", "dep:wasmi-c-api"]
+
+[dependencies]
+regex = { version = "1.12.3", default-features = false, features = ["unicode"] }
+streaming-iterator = "0.1.9"
+tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "43623ec9bf0eaaf7113285c46e8a09018f181b18" }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+wasmtime-c-api = { package = "wasmtime-c-api-impl", version = "48.0.0", default-features = false, features = ["cranelift", "gc", "gc-null"], optional = true }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+wasmi-c-api = { package = "wasmi_c_api_impl", path = "../wasmi-c-api", default-features = false, features = ["std", "portable-dispatch"], optional = true }
+
+[build-dependencies]
+bindgen = { optional = true, version = "0.72.1" }
+cc = "1"
+serde_json = "1"
+
+[workspace]

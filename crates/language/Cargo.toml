@@ -82,11 +82,11 @@ ztracing.workspace = true
 diffy = "0.4.2"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-# `wasm` = wasmtime-backed `WasmStore` for extension grammars; the browser links grammars itself.
+# Downloaded grammar runtime: native Wasmtime, browser isolated Wasmi.
 tree-sitter = { workspace = true, features = ["wasm"] }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
-tree-sitter.workspace = true
+tree-sitter = { workspace = true, features = ["wasm"] }
 # `LanguageFn` names a statically linked grammar without holding its thread-bound `Language`.
 tree-sitter-language.workspace = true
 

@@ -129,6 +129,7 @@ pub fn init_after_db(
 
     // 12. Languages.
     let mut languages = LanguageRegistry::new(cx.background_executor().clone());
+    languages.set_grammar_fs(fs.clone());
     languages.set_language_server_download_dir(paths::languages_dir().clone());
     let languages = Arc::new(languages);
 
