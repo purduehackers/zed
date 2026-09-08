@@ -7845,6 +7845,7 @@ dependencies = [
  "rust-embed",
  "toml 0.8.23",
  "tree-sitter",
+ "tree-sitter-astro-next",
  "tree-sitter-bash",
  "tree-sitter-c",
  "tree-sitter-cpp",
@@ -19210,6 +19211,14 @@ dependencies = [
  "streaming-iterator",
  "tree-sitter-language",
  "wasmtime-c-api-impl",
+]
+
+[[package]]
+name = "tree-sitter-astro-next"
+version = "0.1.1"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
 ]
 
 [[package]]

@@ -19,6 +19,8 @@ util::fs_embed! {
 #[cfg(feature = "load-grammars")]
 pub fn native_grammars() -> Vec<(&'static str, tree_sitter::Language)> {
     vec![
+        #[cfg(feature = "web-languages")]
+        ("astro", tree_sitter_astro_next::LANGUAGE.into()),
         ("bash", tree_sitter_bash::LANGUAGE.into()),
         ("c", tree_sitter_c::LANGUAGE.into()),
         ("cpp", tree_sitter_cpp::LANGUAGE.into()),

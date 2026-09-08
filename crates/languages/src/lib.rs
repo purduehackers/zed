@@ -99,6 +99,12 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
     let built_in_languages = [
         #[cfg(feature = "web-languages")]
         LanguageInfo {
+            name: "astro",
+            adapters: vec![Arc::new(web_languages::InstalledLsp::ASTRO)],
+            ..Default::default()
+        },
+        #[cfg(feature = "web-languages")]
+        LanguageInfo {
             name: "dockerfile",
             adapters: vec![Arc::new(web_languages::InstalledLsp::DOCKERFILE)],
             ..Default::default()
@@ -112,6 +118,7 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
         #[cfg(feature = "web-languages")]
         LanguageInfo {
             name: "toml",
+            adapters: vec![Arc::new(web_languages::InstalledLsp::TOML)],
             ..Default::default()
         },
         LanguageInfo {

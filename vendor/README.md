@@ -285,7 +285,14 @@ Third-party crates that this fork modifies live here until a GitHub fork exists 
 - Regression checks: standalone `cargo test --manifest-path vendor/futures-util/Cargo.toml --lib` covers registered-clone removal, notification, completion caching and native poisoning. The browser contention probe forces a worker to hold this exact notifier lock while the main thread polls another clone, with the test-only D42 counter as its release barrier; actual run results are recorded in round-4 status, not inferred from the test's presence.
 - Rebase: re-copy the newly locked futures-util version, retain this target-only mutex patch and its tests, then validate native and no-std checks plus the browser contention regression. Upstreaming or switching the path patch to a fork requires separate publishing approval.
 
-## tree-sitter-dockerfile and tree-sitter-html
+## tree-sitter-dockerfile, tree-sitter-html and tree-sitter-astro-next
+
+Astro follows the same build adaptation: `tree-sitter-astro-next` 0.1.1 from crates.io
+(archive SHA-256 `794a4a59fc2d88e49b4bc41fef9522d77184a36f4e68bbaf545cd1eb2364c46e`).
+Only `build.rs` adds the WASM headers; grammar/scanner/bindings are unchanged. Its
+license and the original `virchau13/tree-sitter-astro` MIT notice are retained.
+Astro configs/queries come from `zed-extensions/astro` revision
+`03b07a4451df6f9dee6897afc06d841131dc8c05`, with its Apache-2.0 license beside them.
 
 - Dockerfile: MIT-licensed grammar/scanner sources from `camdencheek/tree-sitter-dockerfile` revision `868e44ce378deb68aac902a9db68ff82d2299dd0`. The small Rust binding uses `tree-sitter-language::LanguageFn` instead of the upstream binding's older tree-sitter ABI; the parser itself is unchanged. The Dockerfile highlight queries carry the separate MIT license from `zed-extensions/dockerfile` revision `812fbe0e227d06e2c9e17864cd96985b064125ef` beside them in `crates/grammars/src/dockerfile`.
 - HTML: the crates.io `tree-sitter-html` 0.23.2 package, with its MIT license from upstream revision `5a5ca8551a179998360b4a4ca2c0f366a35acc03`. Only `bindings/rust/build.rs` is patched.

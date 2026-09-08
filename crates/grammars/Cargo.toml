@@ -18,6 +18,7 @@ toml.workspace = true
 util.workspace = true
 
 tree-sitter = { workspace = true, optional = true }
+tree-sitter-astro-next = { workspace = true, optional = true }
 tree-sitter-bash = { workspace = true, optional = true }
 tree-sitter-c = { workspace = true, optional = true }
 tree-sitter-cpp = { workspace = true, optional = true }
@@ -40,7 +41,7 @@ tree-sitter-typescript = { workspace = true, optional = true }
 tree-sitter-yaml = { workspace = true, optional = true }
 
 [features]
-web-languages = ["load-grammars", "tree-sitter-dockerfile", "tree-sitter-html", "tree-sitter-toml-ng"]
+web-languages = ["load-grammars", "tree-sitter-astro-next", "tree-sitter-dockerfile", "tree-sitter-html", "tree-sitter-toml-ng"]
 load-grammars = [
     "tree-sitter",
     "tree-sitter-bash",
