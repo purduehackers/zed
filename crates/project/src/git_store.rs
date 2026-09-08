@@ -2317,6 +2317,27 @@ impl GitStore {
         {
             return Task::ready(Err(anyhow!("no permalink available")));
         }
+        // Registry source opened by rust-analyzer lives in the sandbox, not
+        // the browser. Reuse the native metadata resolver through its RPC.
+        #[cfg(target_family = "wasm")]
+        if let GitStoreState::Remote {
+            upstream_client,
+            upstream_project_id,
+            ..
+        } = &self.state
+        {
+            let request = upstream_client.request(proto::GetPermalinkToLine {
+                project_id: *upstream_project_id,
+                buffer_id: buffer.read(cx).remote_id().into(),
+                selection: Some(proto::Range {
+                    start: selection.start as u64,
+                    end: selection.end as u64,
+                }),
+            });
+            return cx.background_spawn(async move {
+                url::Url::parse(&request.await?.permalink).context("invalid registry permalink")
+            });
+        }
         let file_path = file.worktree.read(cx).absolutize(&file.path);
         cx.spawn(async move |cx| {
             let provider_registry = cx.update(GitHostingProviderRegistry::default_global);
