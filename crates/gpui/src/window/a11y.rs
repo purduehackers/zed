@@ -456,6 +456,26 @@ impl A11yNodeBuilder {
         self.nodes_stack.last_mut()
     }
 
+    /// Unnamed text elements still need DOM text nodes in the browser. Scope
+    /// their identity to the accessible parent and child position, not the text
+    /// contents, so editing a label updates it instead of replacing its identity.
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn push_web_text(&mut self, node: accesskit::Node) -> Option<NodeId> {
+        let parent = self.nodes_stack.last()?;
+        if parent.role() == accesskit::Role::Label {
+            return None; // Text/InteractiveText already supplied this label.
+        }
+        let mut hasher = std::hash::DefaultHasher::default();
+        (
+            "gpui-web-text",
+            self.ids_stack.last()?,
+            parent.children().len(),
+        )
+            .hash(&mut hasher);
+        let id = NodeId(hasher.finish());
+        self.push_leaf(id, node).then_some(id)
+    }
+
     /// Pop the current node off the stack and finalize it into the all_nodes
     /// list.
     pub(crate) fn pop(&mut self) {

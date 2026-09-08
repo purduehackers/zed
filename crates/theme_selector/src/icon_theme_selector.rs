@@ -305,6 +305,11 @@ impl PickerDelegate for IconThemeSelectorDelegate {
 
         Some(
             ListItem::new(ix)
+                .when(cfg!(target_family = "wasm"), |this| {
+                    this.aria_role(gpui::Role::ListBoxOption)
+                        .aria_label(theme_match.string.clone())
+                        .when(selected, |this| this.aria_active_descendant())
+                })
                 .inset(true)
                 .spacing(ListItemSpacing::Sparse)
                 .toggle_state(selected)

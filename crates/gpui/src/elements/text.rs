@@ -284,6 +284,8 @@ impl Element for &'static str {
         _window: &mut Window,
         _cx: &mut App,
     ) {
+        #[cfg(target_family = "wasm")]
+        register_web_text(self, bounds, _window);
         text_layout.prepaint(bounds, self)
     }
 
@@ -358,6 +360,8 @@ impl Element for SharedString {
         _window: &mut Window,
         _cx: &mut App,
     ) {
+        #[cfg(target_family = "wasm")]
+        register_web_text(self.as_ref(), bounds, _window);
         text_layout.prepaint(bounds, self.as_ref())
     }
 
@@ -584,6 +588,8 @@ impl Element for StyledText {
         _window: &mut Window,
         _cx: &mut App,
     ) {
+        #[cfg(target_family = "wasm")]
+        register_web_text(&self.text, bounds, _window);
         self.layout.prepaint(bounds, &self.text)
     }
 
@@ -606,6 +612,29 @@ impl IntoElement for StyledText {
 
     fn into_element(self) -> Self::Element {
         self
+    }
+}
+
+#[cfg(target_family = "wasm")]
+fn register_web_text(text: &str, bounds: Bounds<Pixels>, window: &mut Window) {
+    if !window.a11y.is_active() || text.is_empty() {
+        return;
+    }
+    let bounds = bounds.intersect(&window.content_mask().bounds);
+    let scale = window.scale_factor();
+    let mut node = accesskit::Node::new(accesskit::Role::Label);
+    node.set_value(text);
+    node.set_bounds(accesskit::Rect {
+        x0: (bounds.origin.x.0 * scale) as f64,
+        y0: (bounds.origin.y.0 * scale) as f64,
+        x1: ((bounds.origin.x.0 + bounds.size.width.0) * scale) as f64,
+        y1: ((bounds.origin.y.0 + bounds.size.height.0) * scale) as f64,
+    });
+    if bounds.is_empty() {
+        node.set_hidden();
+    }
+    if let Some(id) = window.a11y.nodes.push_web_text(node) {
+        window.a11y.node_bounds.insert(id, bounds);
     }
 }
 
