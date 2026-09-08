@@ -507,7 +507,31 @@ impl WebAccessibility {
                 .nodes
                 .get(&update.focus)
                 .filter(|(node, _)| node.role() == Role::ListBoxOption)
-                .and_then(|(_, option)| Some((option, option.closest("[role=listbox]").ok()??)));
+                .and_then(|(_, option)| Some((option, option.closest("[role=listbox]").ok()??)))
+                .or_else(|| {
+                    // The custom editor has no AccessKit focus node yet; its
+                    // completion popup therefore cannot claim descendant focus.
+                    // Associate only an unambiguous selected option while the
+                    // browser editor owns focus and AccessKit falls back to root.
+                    if update.focus != self.root_id
+                        || !active
+                            .as_ref()
+                            .is_some_and(|element| element.has_attribute("data-gpui-input"))
+                    {
+                        return None;
+                    }
+                    let mut selected = self.nodes.values().filter_map(|(node, option)| {
+                        if node.role() != Role::ListBoxOption
+                            || node.is_selected() != Some(true)
+                            || !is_available(option)
+                        {
+                            return None;
+                        }
+                        Some((option, option.closest("[role=listbox]").ok()??))
+                    });
+                    let option = selected.next()?;
+                    selected.next().is_none().then_some(option)
+                });
             for (name, value) in [
                 (
                     "aria-controls",
