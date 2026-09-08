@@ -576,6 +576,9 @@ impl WebAccessibility {
                     .nodes
                     .get(&update.focus)
                     .filter(|_| update.focus != self.root_id)
+                    // Picker rows use active-descendant focus; typing belongs
+                    // to their query even when opened from a semantic tree item.
+                    .filter(|(node, _)| node.role() != Role::ListBoxOption)
                     .map(|(_, element)| element.clone())
                     .or_else(|| {
                         document
