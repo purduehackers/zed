@@ -144,6 +144,20 @@ impl PickerDelegate for AttachModalDelegate {
         self.matches.len()
     }
 
+    #[cfg(target_family = "wasm")]
+    fn web_accessible_match(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        let candidate = self.candidates.get(self.matches.get(ix)?.candidate_id)?;
+        Some(
+            format!(
+                "{} — PID {} — {}",
+                candidate.name,
+                candidate.pid,
+                candidate.command.join(" ")
+            )
+            .into(),
+        )
+    }
+
     fn selected_index(&self) -> usize {
         self.selected_index
     }

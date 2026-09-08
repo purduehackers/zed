@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use dap::{
     adapters::{DebugAdapterBinary, TcpArguments},
-    transport::Transport,
+    transport::{IoKind, Transport, WebAdapterLogSink},
 };
 use futures::{
     AsyncRead, AsyncWrite, FutureExt as _, Sink, SinkExt as _, StreamExt as _, TryStreamExt as _,
@@ -29,8 +29,10 @@ type Streams = (
 );
 
 pub fn init(cx: &mut App) {
-    dap::transport::set_web_transport_factory(cx, |binary, cx| {
-        cx.spawn(async move |cx| Ok(Box::new(connect(binary, cx).await?) as Box<dyn Transport>))
+    dap::transport::set_web_transport_factory(cx, |binary, logs, cx| {
+        cx.spawn(async move |cx| {
+            Ok(Box::new(connect(binary, logs, cx).await?) as Box<dyn Transport>)
+        })
     });
     repl::kernels::set_web_kernel_factory(cx, |spec, directory, cx| {
         cx.spawn(async move |cx| {
@@ -41,7 +43,7 @@ pub fn init(cx: &mut App) {
                 .as_str()
                 .context("Missing kernel launch")?
                 .to_owned();
-            let mut transport = open_socket(launch, info, None, cx).await?;
+            let mut transport = open_socket(launch, info, None, None, cx).await?;
             let (writer, reader) = transport.connect().await?;
             Ok(repl::kernels::WebKernelConnection {
                 writer,
@@ -56,11 +58,12 @@ struct BrowserTransport {
     streams: Mutex<Option<Streams>>,
     connection: Option<TcpArguments>,
     task: Option<Task<()>>,
+    has_logs: bool,
 }
 
 impl Transport for BrowserTransport {
     fn has_adapter_logs(&self) -> bool {
-        false
+        self.has_logs
     }
     fn tcp_arguments(&self) -> Option<TcpArguments> {
         self.connection.clone()
@@ -80,19 +83,25 @@ impl Transport for BrowserTransport {
     }
 }
 
-async fn connect(binary: DebugAdapterBinary, cx: &mut AsyncApp) -> Result<BrowserTransport> {
+async fn connect(
+    binary: DebugAdapterBinary,
+    logs: WebAdapterLogSink,
+    cx: &mut AsyncApp,
+) -> Result<BrowserTransport> {
+    let logs = binary.command.is_some().then_some(logs);
     let launch = serde_json::to_string(&serde_json::json!({
         "command": binary.command, "arguments": binary.arguments, "envs": binary.envs,
         "cwd": binary.cwd, "connection": binary.connection,
     }))?;
     let info = crate::bridge::connect_debug_adapter(&launch).await?;
-    open_socket(launch, info, binary.connection, cx).await
+    open_socket(launch, info, binary.connection, logs, cx).await
 }
 
 async fn open_socket(
     launch: String,
     info: serde_json::Value,
     connection: Option<TcpArguments>,
+    mut logs: Option<WebAdapterLogSink>,
     cx: &mut AsyncApp,
 ) -> Result<BrowserTransport> {
     let url = info["url"]
@@ -144,6 +153,7 @@ async fn open_socket(
     let (mut sink, mut source) = socket.split();
     let (outgoing, mut writes) = mpsc::channel::<Vec<u8>>(16);
     let (mut incoming, reads) = mpsc::channel::<io::Result<Vec<u8>>>(8);
+    let has_logs = logs.is_some();
     let task = cx.foreground_executor().spawn(async move {
         let send = async move {
             while let Some(bytes) = writes.next().await {
@@ -160,6 +170,23 @@ async fn open_socket(
                     Ok(frame) if frame.opcode() == OpCode::Text => {
                         let response: serde_json::Value =
                             serde_json::from_slice(frame.payload()).unwrap_or_default();
+                        if let (Some(stream), Some(text)) =
+                            (response["log"].as_str(), response["text"].as_str())
+                        {
+                            if let Some(logs) = &mut logs {
+                                logs(
+                                    if stream == "stdout" {
+                                        IoKind::StdOut
+                                    } else {
+                                        IoKind::StdErr
+                                    },
+                                    text.trim_end(),
+                                );
+                            } else {
+                                log::warn!("Sandbox process {stream}: {}", text.trim_end());
+                            }
+                            continue;
+                        }
                         Err(io::Error::other(
                             response["error"]
                                 .as_str()
@@ -186,6 +213,7 @@ async fn open_socket(
         ))),
         connection,
         task: Some(task),
+        has_logs,
     })
 }
 

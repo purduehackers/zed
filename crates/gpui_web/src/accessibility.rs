@@ -517,6 +517,14 @@ impl WebAccessibility {
                     "aria-activedescendant",
                     controlled.as_ref().map(|(option, _)| option.id()),
                 ),
+                (
+                    "aria-autocomplete",
+                    controlled.as_ref().map(|_| "list".to_owned()),
+                ),
+                (
+                    "aria-haspopup",
+                    controlled.as_ref().map(|_| "listbox".to_owned()),
+                ),
             ] {
                 if let Some(value) = value {
                     if input.get_attribute(name).as_deref() != Some(value.as_str()) {

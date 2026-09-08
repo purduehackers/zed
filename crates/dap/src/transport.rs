@@ -84,8 +84,11 @@ pub trait Transport: Send + Sync {
 }
 
 #[cfg(target_family = "wasm")]
+pub type WebAdapterLogSink = Box<dyn FnMut(IoKind, &str) + Send>;
+
+#[cfg(target_family = "wasm")]
 type WebTransportFactory =
-    fn(DebugAdapterBinary, &mut AsyncApp) -> Task<Result<Box<dyn Transport>>>;
+    fn(DebugAdapterBinary, WebAdapterLogSink, &mut AsyncApp) -> Task<Result<Box<dyn Transport>>>;
 
 #[cfg(target_family = "wasm")]
 struct WebTransportProvider(WebTransportFactory);
@@ -124,14 +127,20 @@ async fn start(
     }
     #[cfg(target_family = "wasm")]
     {
-        let _ = log_handlers;
         let factory = cx
             .update(|cx| {
                 cx.try_global::<WebTransportProvider>()
                     .map(|provider| provider.0)
             })
             .context("No browser debug transport is configured")?;
-        factory(binary.clone(), cx).await
+        let logs = Box::new(move |io_kind, line: &str| {
+            for (kind, handler) in log_handlers.lock().iter_mut() {
+                if matches!(kind, LogKind::Adapter) {
+                    handler(io_kind, None, line);
+                }
+            }
+        });
+        factory(binary.clone(), logs, cx).await
     }
 }
 
