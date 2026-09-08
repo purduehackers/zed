@@ -142,7 +142,6 @@ pub enum Output {
 }
 
 impl Output {
-    #[cfg(not(target_family = "wasm"))]
     pub fn to_nbformat(&self, cx: &App) -> Option<nbformat::v4::Output> {
         match self {
             Output::Stream { content } => {

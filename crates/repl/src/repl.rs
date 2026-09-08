@@ -1,7 +1,6 @@
 pub mod components;
 mod jupyter_settings;
 pub mod kernels;
-#[cfg(not(target_family = "wasm"))]
 pub mod notebook;
 mod outputs;
 mod repl_editor;

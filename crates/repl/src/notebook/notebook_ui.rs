@@ -33,13 +33,18 @@ use uuid::Uuid;
 use crate::components::{KernelPickerDelegate, KernelSelector};
 use crate::kernels::{
     Kernel, KernelSession, KernelSpecification, KernelStatus, LocalKernelSpecification,
+};
+#[cfg(not(target_family = "wasm"))]
+use crate::kernels::{
     NativeRunningKernel, RemoteRunningKernel, SshRunningKernel, WslRunningKernel,
 };
+#[cfg(target_family = "wasm")]
+use crate::kernels::{WebKernelSpecification, WebRunningKernel};
 use crate::notebook::MovementDirection;
 use crate::repl_store::ReplStore;
 
+use jupyter_protocol::{ExecuteRequest, JupyterMessage, JupyterMessageContent};
 use picker::Picker;
-use runtimelib::{ExecuteRequest, JupyterMessage, JupyterMessageContent};
 use ui::PopoverMenuHandle;
 use zed_actions::editor::{MoveDown, MoveUp};
 use zed_actions::notebook::{
@@ -400,6 +405,9 @@ impl NotebookEditor {
         });
 
         let spec = spec.unwrap_or_else(|| {
+            #[cfg(target_family = "wasm")]
+            return KernelSpecification::Web(WebKernelSpecification::bundled_python());
+            #[cfg(not(target_family = "wasm"))]
             KernelSpecification::Jupyter(LocalKernelSpecification {
                 name: "python3".to_string(),
                 path: PathBuf::from("python3"),
@@ -446,6 +454,8 @@ impl NotebookEditor {
             let language = spec.language().to_string();
 
             let display_name = match &spec {
+                #[cfg(target_family = "wasm")]
+                KernelSpecification::Web(s) => s.name.to_string(),
                 KernelSpecification::Jupyter(s) => s.kernelspec.display_name.clone(),
                 KernelSpecification::PythonEnv(s) => s.kernelspec.display_name.clone(),
                 KernelSpecification::JupyterServer(s) => s.kernelspec.display_name.clone(),
@@ -466,6 +476,11 @@ impl NotebookEditor {
         });
 
         let kernel_task = match spec {
+            #[cfg(target_family = "wasm")]
+            KernelSpecification::Web(spec) => {
+                WebRunningKernel::new(spec, working_directory, view, window, cx)
+            }
+            #[cfg(not(target_family = "wasm"))]
             KernelSpecification::Jupyter(local_spec) => NativeRunningKernel::new(
                 local_spec,
                 entity_id,
@@ -475,6 +490,7 @@ impl NotebookEditor {
                 window,
                 cx,
             ),
+            #[cfg(not(target_family = "wasm"))]
             KernelSpecification::PythonEnv(env_spec) => NativeRunningKernel::new(
                 env_spec.as_local_spec(),
                 entity_id,
@@ -484,17 +500,24 @@ impl NotebookEditor {
                 window,
                 cx,
             ),
+            #[cfg(not(target_family = "wasm"))]
             KernelSpecification::JupyterServer(remote_spec) => {
                 RemoteRunningKernel::new(remote_spec, working_directory, view, window, cx)
             }
 
+            #[cfg(not(target_family = "wasm"))]
             KernelSpecification::SshRemote(spec) => {
                 let project = self.project.clone();
                 SshRunningKernel::new(spec, working_directory, project, view, window, cx)
             }
+            #[cfg(not(target_family = "wasm"))]
             KernelSpecification::WslRemote(spec) => {
                 WslRunningKernel::new(spec, entity_id, working_directory, fs, view, window, cx)
             }
+            #[cfg(target_family = "wasm")]
+            _ => Task::ready(Err(anyhow::anyhow!(
+                "Select a sandbox kernel in the browser"
+            ))),
         };
 
         let pending_kernel = cx
@@ -565,8 +588,8 @@ impl NotebookEditor {
         cx: &mut Context<Self>,
     ) {
         if let Kernel::RunningKernel(kernel) = &self.kernel {
-            let interrupt_request = runtimelib::InterruptRequest {};
-            let message: JupyterMessage = interrupt_request.into();
+            let interrupt_request = jupyter_protocol::InterruptRequest {};
+            let message = crate::message(interrupt_request, None);
             kernel.request_tx().try_send(message).ok();
             cx.notify();
         }
@@ -588,7 +611,7 @@ impl NotebookEditor {
             code,
             ..Default::default()
         };
-        let message: JupyterMessage = request.into();
+        let message = crate::message(request, None);
         let msg_id = message.header.msg_id.clone();
 
         let send_result = match &mut self.kernel {

@@ -244,6 +244,7 @@ pub fn init_after_db(
 
     // 25. Browser kernels run in the sandbox. Dev containers remain desktop-only.
     repl::init(app_state.fs.clone(), cx);
+    repl::notebook::init(cx);
     recent_projects::init(cx);
 
     // 26. Editor and viewers; `audio::init` is desktop-only.

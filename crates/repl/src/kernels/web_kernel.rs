@@ -25,6 +25,15 @@ pub struct WebKernelSpecification {
     pub python: Option<SharedString>,
 }
 
+impl WebKernelSpecification {
+    pub fn bundled_python() -> Self {
+        Self {
+            name: "Python (sandbox)".into(),
+            python: None,
+        }
+    }
+}
+
 pub struct WebKernelConnection {
     pub reader: Box<dyn AsyncRead + Unpin + Send>,
     pub writer: Box<dyn AsyncWrite + Unpin + Send>,
@@ -54,10 +63,9 @@ pub fn python_env_kernel_specifications(
         cx,
     );
     async move {
-        let mut specifications = vec![KernelSpecification::Web(WebKernelSpecification {
-            name: "Python (sandbox)".into(),
-            python: None,
-        })];
+        let mut specifications = vec![KernelSpecification::Web(
+            WebKernelSpecification::bundled_python(),
+        )];
         if let Some(Toolchains {
             toolchains,
             user_toolchains,

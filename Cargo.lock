@@ -15240,6 +15240,7 @@ dependencies = [
  "ui",
  "util",
  "uuid",
+ "web-time",
  "workspace",
  "zed_actions",
 ]
