@@ -720,6 +720,16 @@ impl WebWindowInner {
                 match read.await {
                     Ok(Some(paths)) if !paths.is_empty() => {
                         if let Some(this) = this.upgrade() {
+                            this.state.borrow_mut().mouse_position = position;
+                            // Browsers suppress pointermove during an OS file drag.
+                            // A FileDrop is translated by GPUI after its input-modality
+                            // check, so explicitly restore mouse modality before the
+                            // drop hitboxes are tested (keyboard mode suppresses hover).
+                            this.dispatch_input(PlatformInput::MouseMove(MouseMoveEvent {
+                                position,
+                                pressed_button: Some(MouseButton::Left),
+                                modifiers: Modifiers::default(),
+                            }));
                             this.dispatch_input(PlatformInput::FileDrop(FileDropEvent::Entered {
                                 position,
                                 paths: ExternalPaths(paths.into_iter().collect()),
