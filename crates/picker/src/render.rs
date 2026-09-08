@@ -222,9 +222,7 @@ impl<D: PickerDelegate> Picker<D> {
                     v_flex()
                         .id("element-container")
                         .when(cfg!(target_family = "wasm"), |this| {
-                            this.role(gpui::Role::ListBox)
-                                .aria_label(D::name())
-                                .track_focus(&self.focus_handle(cx))
+                            this.role(gpui::Role::ListBox).aria_label(D::name())
                         })
                         .relative()
                         .flex_grow_1()
