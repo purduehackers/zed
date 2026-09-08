@@ -3,7 +3,11 @@ use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+use parking_lot::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
 use std::{fmt, mem};
 
 use slab::Slab;
@@ -97,6 +101,15 @@ impl<T> Mutex<T> {
 }
 
 impl<T: ?Sized> Mutex<T> {
+    // Like Shared's notifier, async mutex waiter bookkeeping must not call
+    // std's blocking futex on the browser main thread.
+    fn lock_waiters(&self) -> StdMutexGuard<'_, Slab<Waiter>> {
+        let guard = self.waiters.lock();
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let guard = guard.unwrap();
+        guard
+    }
+
     /// Attempt to acquire the lock immediately.
     ///
     /// If the lock is currently held, this will return `None`.
@@ -161,7 +174,7 @@ impl<T: ?Sized> Mutex<T> {
 
     fn remove_waker(&self, wait_key: usize, wake_another: bool) {
         if wait_key != WAIT_KEY_NONE {
-            let mut waiters = self.waiters.lock().unwrap();
+            let mut waiters = self.lock_waiters();
             match waiters.remove(wait_key) {
                 Waiter::Waiting(_) => {}
                 Waiter::Woken => {
@@ -186,7 +199,7 @@ impl<T: ?Sized> Mutex<T> {
     fn unlock(&self) {
         let old_state = self.state.fetch_and(!IS_LOCKED, Ordering::AcqRel);
         if (old_state & HAS_WAITERS) != 0 {
-            let mut waiters = self.waiters.lock().unwrap();
+            let mut waiters = self.lock_waiters();
             if let Some((_i, waiter)) = waiters.iter_mut().next() {
                 waiter.wake();
             }
@@ -238,7 +251,7 @@ impl<T: ?Sized> Future for OwnedMutexLockFuture<T> {
         }
 
         {
-            let mut waiters = mutex.waiters.lock().unwrap();
+            let mut waiters = mutex.lock_waiters();
             if this.wait_key == WAIT_KEY_NONE {
                 this.wait_key = waiters.insert(Waiter::Waiting(cx.waker().clone()));
                 if waiters.len() == 1 {
@@ -348,7 +361,7 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
         }
 
         {
-            let mut waiters = mutex.waiters.lock().unwrap();
+            let mut waiters = mutex.lock_waiters();
             if self.wait_key == WAIT_KEY_NONE {
                 self.wait_key = waiters.insert(Waiter::Waiting(cx.waker().clone()));
                 if waiters.len() == 1 {

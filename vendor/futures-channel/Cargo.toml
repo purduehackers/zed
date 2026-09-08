@@ -1,0 +1,27 @@
+[package]
+name = "futures-channel"
+version = "0.3.32"
+edition = "2018"
+rust-version = "1.71"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rust-lang/futures-rs"
+description = "Channels for asynchronous communication using futures-rs."
+
+[features]
+default = ["std"]
+std = ["alloc", "futures-core/std", "dep:parking_lot"]
+alloc = ["futures-core/alloc"]
+sink = ["futures-sink"]
+unstable = []
+cfg-target-has-atomic = []
+
+[dependencies]
+futures-core = { version = "0.3.32", default-features = false }
+futures-sink = { version = "0.3.32", default-features = false, optional = true }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+parking_lot = { version = "0.12.1", optional = true }
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ["cfg(futures_sanitizer)"]

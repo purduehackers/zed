@@ -269,7 +269,7 @@ members = [
 ]
 default-members = ["crates/zed"]
 # Vendored third-party crates (D31): path `[patch]` entries, not workspace members.
-exclude = ["vendor/yawc", "vendor/lsp-types", "vendor/agent-client-protocol", "vendor/alacritty_terminal", "vendor/wasm_thread", "vendor/pet-fs", "vendor/tree-sitter-python", "vendor/tree-sitter-rust", "vendor/tree-sitter-bash", "vendor/tree-sitter-cpp", "vendor/tree-sitter-yaml", "vendor/tree-sitter-md", "vendor/async-tar", "vendor/pet-conda", "vendor/pet-hatch", "vendor/pet-uv", "vendor/pet-env-var-path", "vendor/pet-pyenv", "vendor/pet-virtualenvwrapper", "vendor/pet-venv", "vendor/pet", "vendor/futures-util", "vendor/tree-sitter-dockerfile", "vendor/tree-sitter-html", "vendor/tree-sitter-astro-next"]
+exclude = ["vendor/yawc", "vendor/lsp-types", "vendor/agent-client-protocol", "vendor/alacritty_terminal", "vendor/wasm_thread", "vendor/pet-fs", "vendor/tree-sitter-python", "vendor/tree-sitter-rust", "vendor/tree-sitter-bash", "vendor/tree-sitter-cpp", "vendor/tree-sitter-yaml", "vendor/tree-sitter-md", "vendor/async-tar", "vendor/pet-conda", "vendor/pet-hatch", "vendor/pet-uv", "vendor/pet-env-var-path", "vendor/pet-pyenv", "vendor/pet-virtualenvwrapper", "vendor/pet-venv", "vendor/pet", "vendor/futures-util", "vendor/futures-channel", "vendor/tree-sitter-dockerfile", "vendor/tree-sitter-html", "vendor/tree-sitter-astro-next"]
 
 [workspace.package]
 publish = false
@@ -1012,9 +1012,10 @@ lsp-types = { path = "vendor/lsp-types" }
 [patch.crates-io]
 tree-sitter-astro-next = { path = "vendor/tree-sitter-astro-next" }
 tree-sitter-html = { path = "vendor/tree-sitter-html" }
-# Zed Codespaces: Shared's browser waker mutex must use the D42-aware parker too.
+# Zed Codespaces: browser future/channel waker locks need the D42-aware parker.
 # Native std and no-std behavior are unchanged; vendor/README.md records provenance.
 futures-util = { path = "vendor/futures-util" }
+futures-channel = { path = "vendor/futures-channel" }
 # Zed Codespaces (D42): vendored copy of parking_lot_core 0.9.12 whose shared-memory wasm
 # parker spins instead of `memory.atomic.wait32` on a thread the embedder marks (the
 # browser's main thread, where the instruction throws a JS exception through the wasm frames
