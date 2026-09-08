@@ -86,6 +86,13 @@ typedef wasm_trap_t *(*wasmtime_func_unchecked_callback_t)(void *,
 static wasmtime_error_t *ts_wasmi_error(const char *text) {
   return wasmtime_trap_new(text, strlen(text));
 }
+// Tree-sitter handles guest traps but asserts that calls have no API errors.
+// A downloaded grammar with an invalid ABI must therefore fail as a trap.
+static wasmtime_error_t *ts_wasmi_call_error(wasm_trap_t **trap,
+                                             const char *text) {
+  *trap = ts_wasmi_error(text);
+  return NULL;
+}
 static void ts_wasmi_keep(wasmtime_store_t *store, void *value,
                           void (*destroy)(void *)) {
   ts_wasmi_owned *owned = malloc(sizeof(*owned));
@@ -368,10 +375,14 @@ wasmtime_func_call(wasmtime_context_t *store, const wasmtime_func_t *func,
                    wasmtime_val_t *results, size_t results_length,
                    wasm_trap_t **trap) {
   if (!ts_wasmi_store_refuel(store->inner))
-    return ts_wasmi_error("Grammar engine must enable instruction fuel");
+    return ts_wasmi_call_error(trap,
+                               "Grammar engine must enable instruction fuel");
   if (args_length > 16 || results_length > 16)
-    return ts_wasmi_error("Unsupported grammar call arity");
-  wasm_functype_t *type = wasm_func_type(ts_wasmi_func(func));
+    return ts_wasmi_call_error(trap, "Unsupported grammar call arity");
+  wasm_func_t *target = func->store_id ? ts_wasmi_func(func) : NULL;
+  if (!target)
+    return ts_wasmi_call_error(trap, "Grammar export is not a function");
+  wasm_functype_t *type = wasm_func_type(target);
   bool valid = wasm_functype_params(type)->size == args_length &&
                wasm_functype_results(type)->size == results_length;
   if (valid) {
@@ -385,12 +396,12 @@ wasmtime_func_call(wasmtime_context_t *store, const wasmtime_func_t *func,
   }
   wasm_functype_delete(type);
   if (!valid)
-    return ts_wasmi_error("Unsupported grammar call signature");
+    return ts_wasmi_call_error(trap, "Unsupported grammar call signature");
   wasm_val_t in[16] = {0}, out[16] = {0};
   for (size_t i = 0; i < args_length; i++)
     in[i] = ts_wasmi_value(&args[i]);
   wasm_val_vec_t inputs = {args_length, in}, outputs = {results_length, out};
-  *trap = wasm_func_call(ts_wasmi_func(func), &inputs, &outputs);
+  *trap = wasm_func_call(target, &inputs, &outputs);
   if (!*trap)
     for (size_t i = 0; i < results_length; i++)
       ts_wasmi_result(&results[i], &out[i]);
@@ -400,30 +411,34 @@ static wasmtime_error_t *wasmtime_func_call_unchecked(
     wasmtime_context_t *store, const wasmtime_func_t *func,
     wasmtime_val_raw_t *values, size_t capacity, wasm_trap_t **trap) {
   if (!ts_wasmi_store_refuel(store->inner))
-    return ts_wasmi_error("Grammar engine must enable instruction fuel");
-  wasm_functype_t *type = wasm_func_type(ts_wasmi_func(func));
+    return ts_wasmi_call_error(trap,
+                               "Grammar engine must enable instruction fuel");
+  wasm_func_t *target = func->store_id ? ts_wasmi_func(func) : NULL;
+  if (!target)
+    return ts_wasmi_call_error(trap, "Grammar table entry is not a function");
+  wasm_functype_t *type = wasm_func_type(target);
   size_t ins = wasm_functype_params(type)->size,
          outs = wasm_functype_results(type)->size;
   if (ins > capacity || outs > capacity || ins > 16 || outs > 16) {
     wasm_functype_delete(type);
-    return ts_wasmi_error("Invalid grammar call signature");
+    return ts_wasmi_call_error(trap, "Invalid grammar call signature");
   }
   for (size_t i = 0; i < outs; i++)
     if (wasm_valtype_kind(wasm_functype_results(type)->data[i]) != WASM_I32) {
       wasm_functype_delete(type);
-      return ts_wasmi_error("Unsupported grammar result type");
+      return ts_wasmi_call_error(trap, "Unsupported grammar result type");
     }
   wasm_val_t args[16] = {0}, results[16] = {0};
   for (size_t i = 0; i < ins; i++) {
     if (wasm_valtype_kind(wasm_functype_params(type)->data[i]) != WASM_I32) {
       wasm_functype_delete(type);
-      return ts_wasmi_error("Unsupported grammar argument type");
+      return ts_wasmi_call_error(trap, "Unsupported grammar argument type");
     }
     args[i] = (wasm_val_t)WASM_I32_VAL(values[i].i32);
   }
   wasm_functype_delete(type);
   wasm_val_vec_t in = {ins, args}, out = {outs, results};
-  *trap = wasm_func_call(ts_wasmi_func(func), &in, &out);
+  *trap = wasm_func_call(target, &in, &out);
   if (!*trap)
     for (size_t i = 0; i < outs; i++) {
       assert(results[i].kind == WASM_I32);
