@@ -119,9 +119,11 @@ if [[ $skip_wasm_opt -eq 0 ]] && ! command -v wasm-opt >/dev/null 2>&1; then
 fi
 
 # 2. Forbidden crates: per-crate inverse queries of the browser closure (b7 §6).
-forbidden=(wasmtime cranelift-codegen livekit webrtc-sys aws-config aws-sdk-bedrockruntime
+# extension_host has a browser facade; its executable host (Wasmtime/WASI)
+# remains sandbox-only. Downloaded syntax parsers use the isolated Wasmi runtime.
+forbidden=(wasmtime wasmtime-wasi cranelift-codegen livekit webrtc-sys aws-config aws-sdk-bedrockruntime
     aws-lc-sys rustls-platform-verifier tiny_http tokio tokio-rustls tokio-native-tls
-    gpui_tokio extension_host call dev_container auto_update http_client_tls bedrock reqwest
+    gpui_tokio call dev_container auto_update http_client_tls bedrock reqwest
     audio cpal rodio miniprofiler_ui)
 echo "build-web: checking the browser closure for forbidden crates"
 failed=()
