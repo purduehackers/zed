@@ -124,6 +124,15 @@ pub struct WasmFs {
     state: FsMutex<WasmFsState>,
     executor: BackgroundExecutor,
     job_event_subscribers: FsMutex<Vec<JobEventSender>>,
+    write_through: FsMutex<Option<(PathBuf, async_channel::Sender<ExternalFileWrite>)>>,
+}
+
+/// A virtual file write that must finish in a browser-owned destination first.
+/// Bytes and the completion channel can cross workers; browser handles cannot.
+pub struct ExternalFileWrite {
+    pub path: PathBuf,
+    pub bytes: Vec<u8>,
+    pub completion: futures::channel::oneshot::Sender<Result<()>>,
 }
 
 struct WasmFsState {
@@ -534,7 +543,18 @@ impl WasmFs {
             }),
             executor,
             job_event_subscribers: FsMutex::new(Vec::new()),
+            write_through: FsMutex::new(None),
         })
+    }
+
+    /// Connect a browser-owned subtree to the main thread. The caller must keep
+    /// serving requests; dropped receivers make Save fail rather than lose data.
+    pub fn set_write_through(
+        &self,
+        prefix: PathBuf,
+        sender: async_channel::Sender<ExternalFileWrite>,
+    ) {
+        *self.write_through.lock() = Some((prefix, sender));
     }
 
     /// Boot helper: `write` without the async wrapper, for seeding settings and the
@@ -880,6 +900,25 @@ impl Fs for WasmFs {
 
     async fn write(&self, path: &Path, content: &[u8]) -> Result<()> {
         let path = Self::abs(path)?;
+        let sender = self
+            .write_through
+            .lock()
+            .as_ref()
+            .and_then(|(prefix, sender)| path.starts_with(prefix).then(|| sender.clone()));
+        if let Some(sender) = sender {
+            let (completion, result) = futures::channel::oneshot::channel();
+            sender
+                .send(ExternalFileWrite {
+                    path: path.clone(),
+                    bytes: content.to_vec(),
+                    completion,
+                })
+                .await
+                .map_err(|_| anyhow!("Browser file writer is unavailable"))?;
+            result
+                .await
+                .context("Browser file write was interrupted")??;
+        }
         let mut state = self.state.lock();
         state.write_file_with_parents(&path, content.to_vec())
     }

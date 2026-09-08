@@ -10,6 +10,7 @@ pub mod clipboard;
 mod dispatcher;
 mod display;
 mod events;
+pub mod files;
 mod http_client;
 mod ime_mirror;
 mod keyboard;

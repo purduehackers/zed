@@ -222,6 +222,7 @@ async fn boot_in_app(
     bridge::progress(BootStage::Settings, "");
     let fs: Arc<WasmFs> = cx.update(|cx| WasmFs::new(cx.background_executor().clone()));
     web_settings::seed_config_files(&fs, &config.settings_json, &config.keymap_json);
+    cx.update(|cx| crate::files::init(fs.clone(), cx));
     let fs_dyn: Arc<dyn Fs> = fs.clone();
 
     // 3b. Everything that precedes the dial.

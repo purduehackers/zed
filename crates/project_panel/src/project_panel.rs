@@ -4711,7 +4711,7 @@ impl ProjectPanel {
         });
     }
 
-    fn drop_external_files(
+    pub fn drop_external_files(
         &mut self,
         paths: &[PathBuf],
         entry_id: ProjectEntryId,
@@ -4719,8 +4719,6 @@ impl ProjectPanel {
         cx: &mut Context<Self>,
     ) {
         let mut paths: Vec<Arc<Path>> = paths.iter().map(|path| Arc::from(path.clone())).collect();
-
-        let open_file_after_drop = paths.len() == 1 && paths[0].is_file();
 
         let Some((target_directory, worktree, fs)) = maybe!({
             let project = self.project.read(cx);
@@ -4752,6 +4750,7 @@ impl ProjectPanel {
 
         cx.spawn_in(window, async move |this, cx| {
             async move {
+                let open_file_after_drop = paths.len() == 1 && fs.is_file(&paths[0]).await;
                 for (filename, original_path) in &paths_to_replace {
                     let prompt_message = format!(
                         concat!(

@@ -39,6 +39,7 @@ toml.workspace = true
 chrono = { workspace = true, features = ["wasmbind"] }
 # platform
 anyhow.workspace = true
+async-channel.workspace = true
 futures.workspace = true
 dap.workspace = true
 yawc.workspace = true

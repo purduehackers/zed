@@ -187,6 +187,12 @@ mkdir -p "$bundle"
 wasm-bindgen --target web --no-typescript --out-dir "$bundle" --out-name zed_web "$wasm_in"
 ./script/patch-wasm-bindgen-memory.sh "$bundle/zed_web.js"
 
+# Keep platform JS imports in the one delivered/cached glue file. wasm-bindgen
+# otherwise emits a snippets/ tree that the four-file editor bundle does not ship.
+npx --yes esbuild@0.25.9 "$bundle/zed_web.js" --bundle --format=esm --platform=browser \
+    --outfile="$bundle/zed_web.bundle.js"
+mv "$bundle/zed_web.bundle.js" "$bundle/zed_web.js"
+
 # 5. wasm-opt. `--enable-simd`: the linked module carries v128 instructions (a crate in the
 #    closure emits simd128 code), which the validator rejects without the flag; every browser
 #    that can run the shared-memory build (COOP/COEP, Chrome 92+/Firefox 89+/Safari 16.4+)

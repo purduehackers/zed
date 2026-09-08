@@ -1,11 +1,11 @@
 use std::{collections::HashMap, rc::Rc};
 
 use gpui::{
-    Capslock, ClipboardEntry, ClipboardItem, ClipboardString, DispatchEventResult, GestureTuning,
-    Image, ImageFormat, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
-    Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, TouchEvent, TouchId, TouchPhase,
-    point, px,
+    Capslock, ClipboardEntry, ClipboardItem, ClipboardString, DispatchEventResult, ExternalPaths,
+    FileDropEvent, GestureTuning, Image, ImageFormat, KeyDownEvent, KeyUpEvent, Keystroke,
+    Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
+    MouseUpEvent, NavigationDirection, Pixels, PlatformInput, Point, RequestFrameOptions,
+    ScrollDelta, ScrollWheelEvent, TouchEvent, TouchId, TouchPhase, point, px,
 };
 use wasm_bindgen::prelude::*;
 
@@ -698,12 +698,6 @@ impl WebWindowInner {
         })
     }
 
-    /// Browsers only expose dropped files as `File` objects, never as
-    /// filesystem paths, so no `FileDrop` input can be synthesized: GPUI's
-    /// `ExternalPaths` consumers would try to read paths that don't exist.
-    /// The events are still intercepted so the browser doesn't navigate to
-    /// the dropped file. Delivering actual file drops would require plumbing
-    /// `File` contents through a web-specific channel.
     fn register_dragover(self: &Rc<Self>) -> EventListenerHandle {
         self.listen("dragover", move |event: JsValue| {
             let event: web_sys::DragEvent = event.unchecked_into();
@@ -712,9 +706,45 @@ impl WebWindowInner {
     }
 
     fn register_drop(self: &Rc<Self>) -> EventListenerHandle {
+        let this = Rc::downgrade(self);
         self.listen("drop", move |event: JsValue| {
             let event: web_sys::DragEvent = event.unchecked_into();
             event.prevent_default();
+            let Some(data) = event.data_transfer() else {
+                return;
+            };
+            let position = mouse_position_in_element(event.as_ref());
+            let read = crate::files::drop_files(&data);
+            let this = this.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                match read.await {
+                    Ok(Some(paths)) if !paths.is_empty() => {
+                        if let Some(this) = this.upgrade() {
+                            this.dispatch_input(PlatformInput::FileDrop(FileDropEvent::Entered {
+                                position,
+                                paths: ExternalPaths(paths.into_iter().collect()),
+                            }));
+                            // Populate the native drop hitboxes before Submit; reading
+                            // browser files is asynchronous, so there was no Entered frame.
+                            this.with_callback(
+                                |callbacks| &mut callbacks.request_frame,
+                                |callback| {
+                                    callback(RequestFrameOptions {
+                                        require_presentation: false,
+                                        force_render: true,
+                                    });
+                                },
+                            );
+                            this.dispatch_input(PlatformInput::FileDrop(FileDropEvent::Submit {
+                                position,
+                            }));
+                            this.dispatch_input(PlatformInput::FileDrop(FileDropEvent::Ended));
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => crate::files::report_error(error),
+                }
+            });
         })
     }
 

@@ -1155,6 +1155,16 @@ impl CompletionsMenu {
                             .max_w(COMPLETION_MENU_MAX_WIDTH)
                             .child(
                                 ListItem::new(mat.candidate_id)
+                                    .map(|item| {
+                                        #[cfg(target_family = "wasm")]
+                                        let item = item
+                                            .aria_role(gpui::Role::ListBoxOption)
+                                            .aria_label(completion.label.text.clone())
+                                            .when(item_ix == selected_item, |item| {
+                                                item.aria_active_descendant()
+                                            });
+                                        item
+                                    })
                                     .inset(true)
                                     .toggle_state(item_ix == selected_item)
                                     .on_click(cx.listener(move |editor, _event, window, cx| {
@@ -1216,13 +1226,21 @@ impl CompletionsMenu {
 
         Popover::new()
             .child(
-                div().child(list).custom_scrollbars(
-                    Scrollbars::for_settings::<CompletionMenuScrollBarSetting>()
-                        .show_along(ScrollAxes::Vertical)
-                        .tracked_scroll_handle(&self.scroll_handle),
-                    window,
-                    cx,
-                ),
+                div()
+                    .id("completion-options")
+                    .map(|list| {
+                        #[cfg(target_family = "wasm")]
+                        let list = list.role(gpui::Role::ListBox).aria_label("Completions");
+                        list
+                    })
+                    .child(list)
+                    .custom_scrollbars(
+                        Scrollbars::for_settings::<CompletionMenuScrollBarSetting>()
+                            .show_along(ScrollAxes::Vertical)
+                            .tracked_scroll_handle(&self.scroll_handle),
+                        window,
+                        cx,
+                    ),
             )
             .into_any_element()
     }
@@ -2063,6 +2081,14 @@ impl CodeActionsMenu {
                         let colors = cx.theme().colors();
 
                         ListItem::new(item_ix)
+                            .map(|item| {
+                                #[cfg(target_family = "wasm")]
+                                let item = item
+                                    .aria_role(gpui::Role::ListBoxOption)
+                                    .aria_label(action.menu_label())
+                                    .when(selected, |item| item.aria_active_descendant());
+                                item
+                            })
                             .inset(true)
                             .toggle_state(selected)
                             .overflow_x()
@@ -2112,6 +2138,12 @@ impl CodeActionsMenu {
         )
         .with_sizing_behavior(ListSizingBehavior::Infer);
 
+        #[cfg(target_family = "wasm")]
+        let list = div()
+            .id("code-action-options")
+            .role(gpui::Role::ListBox)
+            .aria_label("Code actions")
+            .child(list);
         Popover::new().child(list).into_any_element()
     }
 

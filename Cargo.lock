@@ -23310,6 +23310,7 @@ dependencies = [
  "agent_ui",
  "anyhow",
  "assets",
+ "async-channel 2.5.0",
  "breadcrumbs",
  "call_hierarchy",
  "cargo_toml",

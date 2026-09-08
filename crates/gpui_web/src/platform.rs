@@ -456,28 +456,17 @@ impl Platform for WebPlatform {
 
     fn prompt_for_paths(
         &self,
-        _options: PathPromptOptions,
+        options: PathPromptOptions,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
-        let (tx, rx) = oneshot::channel();
-        tx.send(Err(anyhow::anyhow!(
-            "prompt_for_paths is not supported on the web"
-        )))
-        .ok();
-        rx
+        crate::files::prompt_for_paths(options)
     }
 
     fn prompt_for_new_path(
         &self,
         _directory: &Path,
-        _suggested_name: Option<&str>,
+        suggested_name: Option<&str>,
     ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
-        let (sender, receiver) = oneshot::channel();
-        sender
-            .send(Err(anyhow::anyhow!(
-                "prompt_for_new_path is not supported on the web"
-            )))
-            .ok();
-        receiver
+        crate::files::prompt_for_new_path(suggested_name)
     }
 
     fn can_select_mixed_files_and_dirs(&self) -> bool {
