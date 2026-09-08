@@ -506,10 +506,9 @@ impl WebWindowInner {
     /// `pointerup` is still on the stack (by which point GPUI has usually
     /// painted a frame since the `MouseDown`, so the input handler reflects
     /// the tap's focus change). `readOnly` suppresses the keyboard while
-    /// keeping the hidden input available to the IME. Leaving it blurred after
-    /// a non-editable tap lets the next editable tap establish a new input
-    /// session instead of relying on a same-task blur/focus cycle, which iOS
-    /// may coalesce.
+    /// keeping the hidden input focused for hardware keys. A non-editable
+    /// tap must not leave focus on the page: Vim Normal mode and non-text
+    /// controls still need their keyboard bindings.
     ///
     /// We don't use `navigator.virtualKeyboard` here because it's
     /// Chromium-only.
@@ -525,19 +524,16 @@ impl WebWindowInner {
         // through the visual viewport and force a fresh focus event.
         let editable_needs_focus_event = editable
             && (!was_editable || !self.ime_mirror.is_focused() || self.keyboard_likely_dismissed());
-        if editable_needs_focus_event || (!editable && was_editable) {
+        if editable_needs_focus_event
+            || (!editable && (was_editable || !self.ime_mirror.is_focused()))
+        {
             self.suppress_focus_status_events.set(true);
-            if editable {
-                // A same-task blur/focus cycle may be coalesced by iOS, but
-                // this branch only runs when the keyboard is already gone,
-                // so a coalesced cycle loses nothing.
-                if self.ime_mirror.is_focused() {
-                    self.ime_mirror.blur();
-                }
-                self.ime_mirror.focus();
-            } else {
+            // End the old editable session before focusing a read-only
+            // conduit, or start a new one when summoning a dismissed keyboard.
+            if self.ime_mirror.is_focused() {
                 self.ime_mirror.blur();
             }
+            self.ime_mirror.focus();
             self.suppress_focus_status_events.set(false);
 
             if editable {
@@ -831,6 +827,15 @@ impl WebWindowInner {
                 is_held,
                 prefer_character_input: false,
             }));
+            // Hardware commands can enter text input without a touch
+            // (e.g. Vim's i). Keep the IME usable after that transition,
+            // without cycling focus or summoning it during a pan.
+            if this.ime_mirror.is_focused()
+                && this.ime_mirror.read_only()
+                && this.focused_input_accepts_text()
+            {
+                this.ime_mirror.set_read_only(false);
+            }
             if crate::clipboard::end_key() {
                 // Let this trusted key produce the browser's paste event.
                 // Only a handled paste action requests this, so terminal Ctrl-V
