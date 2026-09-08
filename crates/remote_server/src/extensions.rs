@@ -180,6 +180,53 @@ pub struct SandboxExtensions {
 }
 
 impl SandboxExtensions {
+    pub async fn handle_language_server_labels(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GetExtensionLanguageServerLabels>,
+        cx: AsyncApp,
+    ) -> Result<proto::GetExtensionLanguageServerLabelsResponse> {
+        let request = envelope.payload;
+        anyhow::ensure!(
+            request.request_json.len() <= 8 * 1024 * 1024,
+            "Extension label request is too large"
+        );
+        let server = lsp::LanguageServerName(request.language_server_id.into());
+        let extension = this.read_with(&cx, |this, cx| {
+            anyhow::ensure!(
+                this.revisions.get(request.extension_id.as_str()) == Some(&request.revision),
+                "Extension changed; refresh before requesting labels"
+            );
+            let extension = this
+                .store
+                .read(cx)
+                .executable_extension(&request.extension_id)
+                .context("Extension is not loaded")?;
+            anyhow::ensure!(
+                extension.manifest().language_servers.contains_key(&server),
+                "Language server does not belong to this extension"
+            );
+            Ok::<_, anyhow::Error>(extension)
+        })?;
+        let labels = match serde_json::from_slice(&request.request_json)? {
+            extension::LanguageServerLabelRequest::Completions(completions) => {
+                anyhow::ensure!(completions.len() <= 10_000, "Too many completion labels");
+                extension
+                    .labels_for_completions(server, completions)
+                    .await?
+            }
+            extension::LanguageServerLabelRequest::Symbols(symbols) => {
+                anyhow::ensure!(symbols.len() <= 10_000, "Too many symbol labels");
+                extension.labels_for_symbols(server, symbols).await?
+            }
+        };
+        let labels_json = serde_json::to_vec(&labels)?;
+        anyhow::ensure!(
+            labels_json.len() <= 16 * 1024 * 1024,
+            "Extension labels are too large"
+        );
+        Ok(proto::GetExtensionLanguageServerLabelsResponse { labels_json })
+    }
+
     /// Compile a browser-selected source snapshot with the ordinary native builder.
     /// The previous installed version remains in place until compilation succeeds.
     pub fn install_dev_archive(

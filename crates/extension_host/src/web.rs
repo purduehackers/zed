@@ -8,8 +8,8 @@ use cloud_api_types::{ExtensionMetadata, ExtensionProvides};
 use collections::{BTreeMap, BTreeSet};
 pub use extension::ExtensionManifest;
 use extension::{
-    ExtensionGrammarProxy, ExtensionHostProxy, ExtensionLanguageProxy, ExtensionSnippetProxy,
-    ExtensionThemeProxy,
+    ExtensionGrammarProxy, ExtensionHostProxy, ExtensionLanguageProxy,
+    ExtensionLanguageServerProxy, ExtensionSnippetProxy, ExtensionThemeProxy,
 };
 use fs::{Fs, RemoveOptions};
 use futures::FutureExt;
@@ -531,6 +531,12 @@ impl ExtensionStore {
             return;
         };
         let entry = self.installed.remove(id).unwrap();
+        for (server, config) in &entry.manifest.language_servers {
+            for language in config.languages() {
+                // Asset refresh is local to this tab; it must not stop a peer's server.
+                self.proxy.remove_remote_language_server(&language, server);
+            }
+        }
         self.proxy.remove_languages(
             &assets
                 .languages
@@ -568,6 +574,23 @@ impl ExtensionStore {
     }
 
     fn register_languages(&self, cx: &mut App) {
+        if let Some(remote) = &self.remote {
+            for (id, entry) in &self.installed {
+                let labels = remote
+                    .read(cx)
+                    .language_server_labels(id.clone(), entry.revision);
+                for (server, config) in &entry.manifest.language_servers {
+                    for language in config.languages() {
+                        self.proxy.register_remote_language_server(
+                            entry.manifest.clone(),
+                            labels.clone(),
+                            server.clone(),
+                            language,
+                        );
+                    }
+                }
+            }
+        }
         self.proxy.register_grammars(
             self.installed
                 .iter()

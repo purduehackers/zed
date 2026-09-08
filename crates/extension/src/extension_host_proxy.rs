@@ -285,6 +285,18 @@ impl ExtensionLanguageProxy for ExtensionHostProxy {
 }
 
 pub trait ExtensionLanguageServerProxy: Send + Sync + 'static {
+    #[cfg(target_family = "wasm")]
+    fn remove_remote_language_server(&self, language: &LanguageName, server: &LanguageServerName);
+
+    #[cfg(target_family = "wasm")]
+    fn register_remote_language_server(
+        &self,
+        manifest: Arc<crate::ExtensionManifest>,
+        labels: crate::RemoteLanguageServerLabels,
+        language_server_id: LanguageServerName,
+        language: LanguageName,
+    );
+
     fn register_language_server(
         &self,
         extension: Arc<dyn Extension>,
@@ -307,6 +319,26 @@ pub trait ExtensionLanguageServerProxy: Send + Sync + 'static {
 }
 
 impl ExtensionLanguageServerProxy for ExtensionHostProxy {
+    #[cfg(target_family = "wasm")]
+    fn remove_remote_language_server(&self, language: &LanguageName, server: &LanguageServerName) {
+        if let Some(proxy) = self.language_server_proxy.read().clone() {
+            proxy.remove_remote_language_server(language, server);
+        }
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn register_remote_language_server(
+        &self,
+        manifest: Arc<crate::ExtensionManifest>,
+        labels: crate::RemoteLanguageServerLabels,
+        language_server_id: LanguageServerName,
+        language: LanguageName,
+    ) {
+        if let Some(proxy) = self.language_server_proxy.read().clone() {
+            proxy.register_remote_language_server(manifest, labels, language_server_id, language);
+        }
+    }
+
     fn register_language_server(
         &self,
         extension: Arc<dyn Extension>,

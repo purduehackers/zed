@@ -54,6 +54,37 @@ impl WorktreeDelegate for WorktreeDelegateAdapter {
 }
 
 impl ExtensionLanguageServerProxy for LanguageServerRegistryProxy {
+    #[cfg(target_family = "wasm")]
+    fn remove_remote_language_server(&self, language: &LanguageName, server: &LanguageServerName) {
+        if self
+            .language_registry
+            .lsp_adapters(language)
+            .iter()
+            .any(|adapter| &adapter.name == server && adapter.adapter.is_extension())
+        {
+            self.language_registry.remove_lsp_adapter(language, server);
+        }
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn register_remote_language_server(
+        &self,
+        manifest: Arc<extension::ExtensionManifest>,
+        labels: extension::RemoteLanguageServerLabels,
+        language_server_id: LanguageServerName,
+        language: LanguageName,
+    ) {
+        self.remove_remote_language_server(&language, &language_server_id);
+        self.language_registry.register_lsp_adapter(
+            language,
+            Arc::new(crate::remote_lsp_adapter::RemoteLspAdapter {
+                manifest,
+                labels,
+                language_server_id,
+            }),
+        );
+    }
+
     fn register_language_server(
         &self,
         extension: Arc<dyn Extension>,
@@ -502,7 +533,7 @@ impl LspAdapter for ExtensionLspAdapter {
     }
 }
 
-fn labels_from_extension(
+pub(crate) fn labels_from_extension(
     labels: Vec<Option<extension::CodeLabel>>,
     language: &Arc<Language>,
 ) -> Vec<Option<CodeLabel>> {
@@ -577,7 +608,7 @@ fn build_code_label(
     Some(CodeLabel::new(text, filter_range, runs))
 }
 
-fn lsp_completion_to_extension(value: lsp::CompletionItem) -> extension::Completion {
+pub(crate) fn lsp_completion_to_extension(value: lsp::CompletionItem) -> extension::Completion {
     extension::Completion {
         label: value.label,
         label_details: value
@@ -643,7 +674,7 @@ fn lsp_insert_text_format_to_extension(
     }
 }
 
-fn symbol_kind_to_extension(value: language::SymbolKind) -> extension::SymbolKind {
+pub(crate) fn symbol_kind_to_extension(value: language::SymbolKind) -> extension::SymbolKind {
     match value {
         language::SymbolKind::File => extension::SymbolKind::File,
         language::SymbolKind::Module => extension::SymbolKind::Module,

@@ -549,7 +549,9 @@ message Envelope {
     UninstallExtension uninstall_extension = 513;
     ExtensionsChanged extensions_changed = 514;
     RestoreBufferSnapshot restore_buffer_snapshot = 515;
-    RestoreBufferSnapshotResponse restore_buffer_snapshot_response = 516; // current max
+    RestoreBufferSnapshotResponse restore_buffer_snapshot_response = 516;
+    GetExtensionLanguageServerLabels get_extension_language_server_labels = 517;
+    GetExtensionLanguageServerLabelsResponse get_extension_language_server_labels_response = 518; // current max
   }
 
   reserved 87 to 88;

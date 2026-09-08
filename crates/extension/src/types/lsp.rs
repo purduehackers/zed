@@ -1,7 +1,7 @@
 use std::option::Option;
 
 /// An LSP completion.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Completion {
     pub label: String,
     pub label_details: Option<CompletionLabelDetails>,
@@ -11,7 +11,7 @@ pub struct Completion {
 }
 
 /// The kind of an LSP completion.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub enum CompletionKind {
     Text,
     Method,
@@ -42,14 +42,14 @@ pub enum CompletionKind {
 }
 
 /// Label details for an LSP completion.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompletionLabelDetails {
     pub detail: Option<String>,
     pub description: Option<String>,
 }
 
 /// Defines how to interpret the insert text in a completion item.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub enum InsertTextFormat {
     PlainText,
     Snippet,
@@ -57,7 +57,7 @@ pub enum InsertTextFormat {
 }
 
 /// An LSP symbol.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Symbol {
     pub kind: SymbolKind,
     pub name: String,
@@ -65,7 +65,7 @@ pub struct Symbol {
 }
 
 /// The kind of an LSP symbol.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub enum SymbolKind {
     File,
     Module,
@@ -95,3 +95,20 @@ pub enum SymbolKind {
     TypeParameter,
     Other(i32),
 }
+
+/// Browser presentation callbacks execute in the sandbox's existing extension host.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub enum LanguageServerLabelRequest {
+    Completions(Vec<Completion>),
+    Symbols(Vec<Symbol>),
+}
+
+pub type RemoteLanguageServerLabels = std::sync::Arc<
+    dyn Fn(
+            ::lsp::LanguageServerName,
+            LanguageServerLabelRequest,
+        )
+            -> futures::future::BoxFuture<'static, anyhow::Result<Vec<Option<super::CodeLabel>>>>
+        + Send
+        + Sync,
+>;

@@ -432,6 +432,8 @@ messages!(
     (InstallRegistryExtension, Background),
     (UninstallExtension, Background),
     (ExtensionsChanged, Background),
+    (GetExtensionLanguageServerLabels, Background),
+    (GetExtensionLanguageServerLabelsResponse, Background),
     (RestoreBufferSnapshot, Foreground),
     (RestoreBufferSnapshotResponse, Foreground),
 );
@@ -679,6 +681,10 @@ request_messages!(
     (ForwardPort, ForwardPortResponse),
     (UnforwardPort, Ack),
     (ListExtensions, ListExtensionsResponse),
+    (
+        GetExtensionLanguageServerLabels,
+        GetExtensionLanguageServerLabelsResponse
+    ),
     (InstallRegistryExtension, Ack),
     (UninstallExtension, Ack),
 );

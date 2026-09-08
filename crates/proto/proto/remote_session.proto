@@ -154,3 +154,15 @@ message ExtensionsChanged {
   uint64 project_id = 1;
   repeated InstalledExtension installed = 2;
 }
+
+// Only presentation callbacks cross into the browser; executable extensions stay remote.
+message GetExtensionLanguageServerLabels {
+  uint64 project_id = 1;
+  string extension_id = 2;
+  uint64 revision = 3;
+  string language_server_id = 4;
+  bytes request_json = 5;
+}
+message GetExtensionLanguageServerLabelsResponse {
+  bytes labels_json = 1;
+}

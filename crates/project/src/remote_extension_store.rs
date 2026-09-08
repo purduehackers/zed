@@ -92,6 +92,35 @@ pub enum RemoteExtensionEvent {
 impl EventEmitter<RemoteExtensionEvent> for RemoteExtensionStore {}
 
 impl RemoteExtensionStore {
+    /// A revision-pinned presentation bridge for the browser's LSP adapter.
+    #[cfg(target_family = "wasm")]
+    pub fn language_server_labels(
+        &self,
+        extension_id: Arc<str>,
+        revision: u64,
+    ) -> extension::RemoteLanguageServerLabels {
+        use futures::FutureExt;
+        let client = self.client.clone();
+        let project_id = self.project_id;
+        Arc::new(move |server, request| {
+            let client = client.clone();
+            let extension_id = extension_id.to_string();
+            async move {
+                let response = client
+                    .request(proto::GetExtensionLanguageServerLabels {
+                        project_id,
+                        extension_id,
+                        revision,
+                        language_server_id: server.to_string(),
+                        request_json: serde_json::to_vec(&request)?,
+                    })
+                    .await?;
+                Ok(serde_json::from_slice(&response.labels_json)?)
+            }
+            .boxed()
+        })
+    }
+
     /// A store over the remote server session.
     pub fn remote(client: AnyProtoClient, project_id: u64) -> Self {
         Self {

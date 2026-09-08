@@ -42,7 +42,7 @@ impl std::fmt::Debug for Command {
 }
 
 /// A label containing some code.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CodeLabel {
     /// The source code to parse with Tree-sitter.
     pub code: String,
@@ -53,7 +53,7 @@ pub struct CodeLabel {
 }
 
 /// A span within a code label.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum CodeLabelSpan {
     /// A range into the parsed code.
     CodeRange(Range<usize>),
@@ -62,7 +62,7 @@ pub enum CodeLabelSpan {
 }
 
 /// A span containing a code literal.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CodeLabelSpanLiteral {
     /// The literal text.
     pub text: String,

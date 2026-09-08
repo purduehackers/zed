@@ -60,6 +60,11 @@ pub(crate) struct LoadedExtension {
 }
 
 impl HeadlessExtensionStore {
+    /// Retain the loaded instance while a remote presentation callback is running.
+    pub fn executable_extension(&self, id: &str) -> Option<Arc<dyn Extension>> {
+        self.loaded_extensions.get(id)?.wasm_extension.clone()
+    }
+
     pub fn new(
         fs: Arc<dyn Fs>,
         http_client: Arc<dyn HttpClient>,

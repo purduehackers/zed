@@ -1,4 +1,6 @@
 mod extension_lsp_adapter;
+#[cfg(target_family = "wasm")]
+mod remote_lsp_adapter;
 
 use std::path::PathBuf;
 use std::sync::Arc;

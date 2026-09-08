@@ -498,6 +498,10 @@ impl HeadlessProject {
         );
         session.add_request_handler(
             extensions.downgrade(),
+            SandboxExtensions::handle_language_server_labels,
+        );
+        session.add_request_handler(
+            extensions.downgrade(),
             SandboxExtensions::handle_install_registry_extension,
         );
         session.add_request_handler(
