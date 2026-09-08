@@ -5,6 +5,7 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use anyhow::{Context as _, Result};
+use cloud_api_types::{ExtensionApiManifest, ExtensionMetadata, ExtensionProvides};
 use gpui::{AsyncApp, Context, Entity, EventEmitter, Task};
 use rpc::{AnyProtoClient, TypedEnvelope, proto};
 
@@ -23,6 +24,8 @@ pub struct InstalledExtension {
     pub provides: Vec<String>,
     /// Whether it was uploaded as a dev extension rather than installed from the registry.
     pub dev: bool,
+    /// Installed artifact revision, including same-version development rebuilds.
+    pub revision: u64,
 }
 
 impl InstalledExtension {
@@ -34,44 +37,34 @@ impl InstalledExtension {
             description: extension.description,
             provides: extension.provides,
             dev: extension.dev,
+            revision: extension.revision,
         }
     }
 }
 
-/// An extension the registry offers.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AvailableExtension {
-    /// Registry id.
-    pub id: Arc<str>,
-    /// Latest compatible version.
-    pub version: Arc<str>,
-    /// Display name.
-    pub name: String,
-    /// Description from the registry.
-    pub description: Option<String>,
-    /// Authors.
-    pub authors: Vec<String>,
-    /// Repository URL.
-    pub repository: String,
-    /// `ExtensionProvides` kebab-case names.
-    pub provides: Vec<String>,
-    /// Registry download count.
-    pub download_count: u64,
-}
-
-impl AvailableExtension {
-    fn from_proto(extension: proto::AvailableExtension) -> Self {
-        Self {
-            id: extension.id.into(),
+fn registry_metadata(extension: proto::AvailableExtension) -> Result<ExtensionMetadata> {
+    Ok(ExtensionMetadata {
+        id: extension.id.into(),
+        published_at: extension
+            .published_at
+            .parse()
+            .context("invalid extension publication date")?,
+        download_count: extension.download_count,
+        manifest: ExtensionApiManifest {
             version: extension.version.into(),
             name: extension.name,
             description: extension.description,
             authors: extension.authors,
             repository: extension.repository,
-            provides: extension.provides,
-            download_count: extension.download_count,
-        }
-    }
+            provides: extension
+                .provides
+                .iter()
+                .map(|value| value.parse())
+                .collect::<Result<_, _>>()?,
+            schema_version: extension.schema_version,
+            wasm_api_version: extension.wasm_api_version,
+        },
+    })
 }
 
 /// The client's view of the server's extensions.
@@ -130,6 +123,7 @@ impl RemoteExtensionStore {
             project_id: self.project_id,
             search: None,
             include_available: false,
+            ..Default::default()
         });
         cx.spawn(async move |this, cx| {
             let response = request.await.context("listing extensions")?;
@@ -143,21 +137,25 @@ impl RemoteExtensionStore {
     pub fn search(
         &self,
         search: Option<String>,
+        extension_id: Option<String>,
+        provides: BTreeSet<ExtensionProvides>,
         cx: &mut Context<Self>,
-    ) -> Task<Result<Vec<AvailableExtension>>> {
+    ) -> Task<Result<Vec<ExtensionMetadata>>> {
         let request = self.client.request(proto::ListExtensions {
             project_id: self.project_id,
             search,
             include_available: true,
+            extension_id,
+            provides: provides.iter().map(ToString::to_string).collect(),
         });
         cx.spawn(async move |this, cx| {
             let response = request.await.context("searching extensions")?;
             this.update(cx, |this, cx| this.set_installed(response.installed, cx))?;
-            Ok(response
+            response
                 .available
                 .into_iter()
-                .map(AvailableExtension::from_proto)
-                .collect())
+                .map(registry_metadata)
+                .collect()
         })
     }
 
@@ -169,11 +167,44 @@ impl RemoteExtensionStore {
         version: Option<Arc<str>>,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        let request = self.client.request(proto::InstallRegistryExtension {
-            project_id: self.project_id,
-            id: id.to_string(),
-            version: version.map(|version| version.to_string()),
-        });
+        self.install_request(
+            proto::InstallRegistryExtension {
+                project_id: self.project_id,
+                id: id.to_string(),
+                version: version.map(|version| version.to_string()),
+                ..Default::default()
+            },
+            cx,
+        )
+    }
+
+    /// Startup settings/updates must not overwrite a concurrent peer's install.
+    pub fn install_automatically(
+        &mut self,
+        id: Arc<str>,
+        version: Option<Arc<str>>,
+        expected_revision: Option<u64>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.install_request(
+            proto::InstallRegistryExtension {
+                project_id: self.project_id,
+                id: id.to_string(),
+                version: version.map(|version| version.to_string()),
+                expected_revision,
+                only_if_missing: expected_revision.is_none(),
+            },
+            cx,
+        )
+    }
+
+    fn install_request(
+        &mut self,
+        request: proto::InstallRegistryExtension,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let id: Arc<str> = request.id.as_str().into();
+        let request = self.client.request(request);
         self.pending.insert(id.clone());
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -273,6 +304,7 @@ mod tests {
             description: None,
             provides: vec!["languages".into()],
             dev: false,
+            revision: 1,
         }
     }
 

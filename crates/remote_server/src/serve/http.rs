@@ -158,6 +158,7 @@ pub struct ServeState {
     /// Commands to the gpui side.
     pub gpui_tx: futures::channel::mpsc::UnboundedSender<GpuiCommand>,
     verify_permits: tokio::sync::Semaphore,
+    extension_upload_permit: Arc<tokio::sync::Semaphore>,
     auth_failures: AtomicU64,
     auth_penalties: Mutex<HashMap<IpAddr, PeerPenalty>>,
     sessions: Mutex<HashMap<String, SessionMeta>>,
@@ -256,6 +257,7 @@ impl ServeState {
             broker_tx,
             gpui_tx,
             verify_permits: tokio::sync::Semaphore::new(VERIFY_CONCURRENCY),
+            extension_upload_permit: Arc::new(tokio::sync::Semaphore::new(1)),
             auth_failures: AtomicU64::new(0),
             auth_penalties: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
@@ -682,6 +684,12 @@ pub async fn route(
                 Err(response) => response,
             },
             (_, "/files") => error_response(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"),
+            (&Method::POST, "/extensions/dev") => {
+                match authenticate_request(&state, peer, &req).await {
+                    Ok(_) => install_dev_extension(&state, req).await,
+                    Err(response) => response,
+                }
+            }
             (&Method::GET, asset_path) if asset_path.starts_with("/extensions/") => {
                 match authenticate_request(&state, peer, &req).await {
                     Ok(_) => match parse_extension_asset_path(asset_path) {
@@ -715,11 +723,60 @@ pub async fn route(
     Ok(response)
 }
 
+async fn install_dev_extension(state: &ServeState, req: Request<Incoming>) -> Response<BoxBody> {
+    let Ok(permit) = state.extension_upload_permit.clone().try_acquire_owned() else {
+        return error_response(StatusCode::CONFLICT, "extension_build_in_progress");
+    };
+    if req
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        != Some("application/x-tar")
+    {
+        return error_response(StatusCode::UNSUPPORTED_MEDIA_TYPE, "expected_tar_archive");
+    }
+    let body = match Limited::new(req.into_body(), 64 * 1024 * 1024)
+        .collect()
+        .await
+    {
+        Ok(body) => body.to_bytes().to_vec(),
+        Err(_) => {
+            return error_response(StatusCode::PAYLOAD_TOO_LARGE, "extension_upload_too_large");
+        }
+    };
+    let (reply, result) = futures::channel::oneshot::channel();
+    if state
+        .gpui_tx
+        .unbounded_send(crate::serve::GpuiCommand::InstallDevExtension {
+            archive: body,
+            permit,
+            reply,
+        })
+        .is_err()
+    {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "extension_host_unavailable",
+        );
+    }
+    match result.await {
+        Ok(Ok(())) => json_response(StatusCode::OK, &serde_json::json!({"installed": true})),
+        Ok(Err(error)) => json_response(
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({"error": format!("{error:#}")}),
+        ),
+        Err(_) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "extension_host_unavailable",
+        ),
+    }
+}
+
 /// `/extensions/{id}/assets/{rel}` → `(id, rel)`, both percent-decoded.
 fn parse_extension_asset_path(path: &str) -> Option<(String, String)> {
     let rest = path.strip_prefix("/extensions/")?;
     let (id, rel) = rest.split_once("/assets/")?;
-    if id.is_empty() || rel.is_empty() {
+    if id.is_empty() {
         return None;
     }
     let id = percent_encoding::percent_decode_str(id)
@@ -730,7 +787,7 @@ fn parse_extension_asset_path(path: &str) -> Option<(String, String)> {
         .decode_utf8()
         .ok()?
         .into_owned();
-    Some((id, rel))
+    Some((id, if rel.is_empty() { ".".to_owned() } else { rel }))
 }
 
 /// Verifies the `Authorization: Bearer` or `?zs_token=` token of a `/files` or
@@ -1516,7 +1573,7 @@ mod tests {
         );
         assert_eq!(
             parse_extension_asset_path("/extensions/theme-x/assets/"),
-            None
+            Some(("theme-x".to_owned(), ".".to_owned()))
         );
         assert_eq!(parse_extension_asset_path("/extensions/theme-x"), None);
     }

@@ -1,7 +1,7 @@
+#[cfg(not(target_family = "wasm"))]
+use std::{fs, path::Path};
 use std::{
-    fs,
     hash::{Hash, Hasher},
-    path::Path,
     sync::Arc,
 };
 
@@ -292,11 +292,24 @@ impl Asset for SvgAsset {
 
     fn load(
         source: Self::Source,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> impl Future<Output = Self::Output> + Send + 'static {
+        #[cfg(target_family = "wasm")]
+        let bytes = cx
+            .asset_source()
+            .load(&source)
+            .and_then(|bytes| bytes.ok_or_else(|| anyhow::anyhow!("Missing SVG asset {source}")))
+            .map(|bytes| Arc::from(bytes.as_ref()))
+            .map_err(|error| Arc::new(std::io::Error::other(error)));
+        #[cfg(not(target_family = "wasm"))]
+        let _ = cx;
         async move {
+            #[cfg(not(target_family = "wasm"))]
             let bytes = fs::read(Path::new(source.as_ref())).map_err(|e| Arc::new(e))?;
+            #[cfg(not(target_family = "wasm"))]
             let bytes = Arc::from(bytes);
+            #[cfg(target_family = "wasm")]
+            let bytes = bytes?;
             Ok(bytes)
         }
     }

@@ -1310,6 +1310,7 @@ mod tests {
                 project_id: REMOTE_SERVER_PROJECT_ID,
                 search: Some("toml".into()),
                 include_available: true,
+                ..Default::default()
             },
             true,
         );
@@ -1322,6 +1323,7 @@ mod tests {
                     description: None,
                     provides: vec!["languages".into()],
                     dev: false,
+                    revision: 1,
                 }],
                 available: vec![AvailableExtension {
                     id: "html".into(),
@@ -1332,6 +1334,9 @@ mod tests {
                     repository: "https://example.com".into(),
                     provides: vec!["languages".into()],
                     download_count: 10,
+                    published_at: "2024-01-01T00:00:00Z".into(),
+                    schema_version: Some(1),
+                    wasm_api_version: None,
                 }],
             },
             true,
@@ -1341,6 +1346,8 @@ mod tests {
                 project_id: REMOTE_SERVER_PROJECT_ID,
                 id: "toml".into(),
                 version: None,
+                expected_revision: Some(4),
+                only_if_missing: false,
             },
             true,
         );

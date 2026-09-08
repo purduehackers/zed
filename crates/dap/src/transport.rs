@@ -64,6 +64,8 @@ pub enum RequestHandling<T> {
 }
 
 type LogHandlers = Arc<Mutex<SmallVec<[(LogKind, IoHandler); 2]>>>;
+#[cfg(target_family = "wasm")]
+type WebStartupLogs = Arc<Mutex<std::collections::VecDeque<(IoKind, String)>>>;
 
 pub trait Transport: Send + Sync {
     fn has_adapter_logs(&self) -> bool;
@@ -104,6 +106,7 @@ pub fn set_web_transport_factory(cx: &mut gpui::App, factory: WebTransportFactor
 async fn start(
     binary: &DebugAdapterBinary,
     log_handlers: LogHandlers,
+    #[cfg(target_family = "wasm")] startup_logs: WebStartupLogs,
     cx: &mut AsyncApp,
 ) -> Result<Box<dyn Transport>> {
     #[cfg(any(test, feature = "test-support"))]
@@ -134,7 +137,21 @@ async fn start(
             })
             .context("No browser debug transport is configured")?;
         let logs = Box::new(move |io_kind, line: &str| {
-            for (kind, handler) in log_handlers.lock().iter_mut() {
+            let mut handlers = log_handlers.lock();
+            if !handlers
+                .iter()
+                .any(|(kind, _)| matches!(kind, LogKind::Adapter))
+            {
+                // The sandbox can print before the native LogStore subscribes.
+                // Keep a bounded startup tail, then replay it on subscription.
+                let mut pending = startup_logs.lock();
+                if pending.len() == 32 {
+                    pending.pop_front();
+                }
+                let end = line.floor_char_boundary(8192.min(line.len()));
+                pending.push_back((io_kind, line[..end].to_owned()));
+            }
+            for (kind, handler) in handlers.iter_mut() {
                 if matches!(kind, LogKind::Adapter) {
                     handler(io_kind, None, line);
                 }
@@ -194,6 +211,8 @@ impl PendingRequests {
 
 pub(crate) struct TransportDelegate {
     log_handlers: LogHandlers,
+    #[cfg(target_family = "wasm")]
+    startup_logs: WebStartupLogs,
     pub(crate) pending_requests: Arc<Mutex<PendingRequests>>,
     pub(crate) transport: Mutex<Box<dyn Transport>>,
     pub(crate) server_tx: smol::lock::Mutex<Option<Sender<Message>>>,
@@ -203,10 +222,17 @@ pub(crate) struct TransportDelegate {
 impl TransportDelegate {
     pub(crate) async fn start(binary: &DebugAdapterBinary, cx: &mut AsyncApp) -> Result<Self> {
         let log_handlers: LogHandlers = Default::default();
+        #[cfg(target_family = "wasm")]
+        let startup_logs = WebStartupLogs::default();
+        #[cfg(not(target_family = "wasm"))]
         let transport = start(binary, log_handlers.clone(), cx).await?;
+        #[cfg(target_family = "wasm")]
+        let transport = start(binary, log_handlers.clone(), startup_logs.clone(), cx).await?;
         Ok(Self {
             transport: Mutex::new(transport),
             log_handlers,
+            #[cfg(target_family = "wasm")]
+            startup_logs,
             server_tx: Default::default(),
             pending_requests: Arc::new(Mutex::new(PendingRequests::new())),
             tasks: Default::default(),
@@ -510,7 +536,16 @@ impl TransportDelegate {
         F: 'static + Send + FnMut(IoKind, Option<&Command>, &IoMessage),
     {
         let mut log_handlers = self.log_handlers.lock();
-        log_handlers.push((kind, Box::new(f)));
+        let f: IoHandler = Box::new(f);
+        #[cfg(target_family = "wasm")]
+        let mut f = f;
+        #[cfg(target_family = "wasm")]
+        if matches!(kind, LogKind::Adapter) {
+            for (io_kind, line) in self.startup_logs.lock().drain(..) {
+                f(io_kind, None, &line);
+            }
+        }
+        log_handlers.push((kind, f));
     }
 }
 

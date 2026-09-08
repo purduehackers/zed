@@ -18,6 +18,7 @@ mod clipboard;
 mod connect;
 mod debugger;
 mod export;
+mod extensions;
 mod files;
 mod init;
 mod keymap;

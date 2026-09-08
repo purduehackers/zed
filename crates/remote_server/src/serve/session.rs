@@ -1283,6 +1283,7 @@ mod tests {
                 project_id: 0,
                 search: None,
                 include_available: false,
+                ..Default::default()
             }),
         ];
         for payload in not_input {
@@ -1317,6 +1318,7 @@ mod tests {
                 project_id: 0,
                 id: "toml".into(),
                 version: None,
+                ..Default::default()
             }),
         ];
         for payload in input {

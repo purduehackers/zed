@@ -594,6 +594,17 @@ impl WasmFs {
         paths
     }
 
+    /// Read an in-memory asset without blocking the browser's render thread.
+    pub fn read_bytes(&self, path: &Path) -> Result<Vec<u8>> {
+        let path = Self::abs(path)?;
+        let state = self.state.lock();
+        match state.resolve(&path, true) {
+            Some((WasmEntry::File { content, .. }, _)) => Ok(content.clone()),
+            Some(_) => bail!("is a directory: {path:?}"),
+            None => bail!("path does not exist: {path:?}"),
+        }
+    }
+
     /// Files written, renamed into place or removed since the previous call
     /// (`contents == None` means removed), in path order; clears the dirty set.
     /// Synchronous so the `visibilitychange` → hidden / `STOPPING` flush can drain
@@ -880,13 +891,7 @@ impl Fs for WasmFs {
     }
 
     async fn load_bytes(&self, path: &Path) -> Result<Vec<u8>> {
-        let path = Self::abs(path)?;
-        let state = self.state.lock();
-        match state.resolve(&path, true) {
-            Some((WasmEntry::File { content, .. }, _)) => Ok(content.clone()),
-            Some(_) => bail!("is a directory: {path:?}"),
-            None => bail!("path does not exist: {path:?}"),
-        }
+        self.read_bytes(path)
     }
 
     async fn atomic_write(&self, path: PathBuf, text: String) -> Result<()> {

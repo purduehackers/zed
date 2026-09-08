@@ -221,6 +221,7 @@ async fn boot_in_app(
     // 3a. Settings and keymap seeded into the in-memory filesystem (D11).
     bridge::progress(BootStage::Settings, "");
     let fs: Arc<WasmFs> = cx.update(|cx| WasmFs::new(cx.background_executor().clone()));
+    assets.set_fs(fs.clone());
     web_settings::seed_config_files(&fs, &config.settings_json, &config.keymap_json);
     cx.update(|cx| crate::files::init(fs.clone(), cx));
     let fs_dyn: Arc<dyn Fs> = fs.clone();
@@ -324,6 +325,10 @@ async fn boot_in_app(
     });
     cx.update(|cx| {
         let project = opened.workspace.read(cx).project().clone();
+        if let Some(remote) = project.read(cx).remote_extension_store().cloned() {
+            extension_host::ExtensionStore::global(cx)
+                .update(cx, |store, cx| store.attach(remote, cx));
+        }
         let workspace = opened.workspace.downgrade();
         cx.subscribe(&project, move |_, event, cx| {
             if let project::Event::LifecycleNotice { kind, seconds } = event {

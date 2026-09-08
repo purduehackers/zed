@@ -589,7 +589,8 @@ pub async fn handle_download<B>(
 /// backslash or an absolute component; resolution itself happens on the gpui side
 /// (`GpuiCommand::ResolveExtensionAsset`), which answers `None` for unknown ids, uninstalled
 /// extensions and any traversal. The file streams with a `Content-Type` derived from its
-/// extension and no `Content-Disposition`; directories are 404.
+/// extension and no `Content-Disposition`. Directories stream a bounded tar;
+/// `/assets/` selects the installed extension root, using the same confinement.
 pub async fn handle_extension_asset(
     state: &ServeState,
     id: String,
@@ -603,7 +604,7 @@ pub async fn handle_extension_asset(
     state
         .gpui_tx
         .unbounded_send(GpuiCommand::ResolveExtensionAsset {
-            id,
+            id: id.clone(),
             rel,
             reply: reply_tx,
         })
@@ -612,12 +613,16 @@ pub async fn handle_extension_asset(
         return Err(FilesError::NotFound);
     };
     let metadata = match tokio::fs::metadata(&path).await {
-        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(metadata) if metadata.is_file() || metadata.is_dir() => metadata,
         Ok(_) => return Err(FilesError::NotFound),
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(FilesError::NotFound),
         Err(error) => return Err(FilesError::Io(error)),
     };
-    file_response(&path, metadata.len(), content_type_for(&path), None).await
+    if metadata.is_dir() {
+        Ok(tar_response(path, id))
+    } else {
+        file_response(&path, metadata.len(), content_type_for(&path), None).await
+    }
 }
 
 fn validate_asset_segment(segment: &str) -> Result<(), FilesError> {

@@ -6151,6 +6151,7 @@ name = "extension"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-tar",
  "async-trait",
  "cloud_api_types",
  "collections",
@@ -13925,6 +13926,7 @@ dependencies = [
  "circular-buffer",
  "client",
  "clock",
+ "cloud_api_types",
  "collections",
  "context_server",
  "credentials_provider",
@@ -23389,6 +23391,7 @@ dependencies = [
  "anyhow",
  "assets",
  "async-channel 2.5.0",
+ "async-tar",
  "breadcrumbs",
  "call_hierarchy",
  "cargo_toml",
@@ -23412,6 +23415,8 @@ dependencies = [
  "editor",
  "encoding_selector",
  "extension",
+ "extension_host",
+ "extensions_ui",
  "feature_flags",
  "file_finder",
  "fs",

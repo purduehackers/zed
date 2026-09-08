@@ -34,6 +34,7 @@ test-support = [
 ]
 
 [dependencies]
+cloud_api_types.workspace = true
 aho-corasick.workspace = true
 anyhow.workspace = true
 askpass.workspace = true

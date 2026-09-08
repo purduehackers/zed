@@ -131,6 +131,12 @@ pub enum GpuiCommand {
         /// `None` for unknown ids, uninstalled extensions and any traversal.
         reply: futures::channel::oneshot::Sender<Option<PathBuf>>,
     },
+    /// Authenticated browser upload; compilation is confined to this sandbox.
+    InstallDevExtension {
+        archive: Vec<u8>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        reply: futures::channel::oneshot::Sender<anyhow::Result<()>>,
+    },
     /// SIGTERM/SIGINT after the session was closed: kill terminals and quit the app.
     Quit,
 }
@@ -670,6 +676,32 @@ fn spawn_gpui_command_loop(
                     let path =
                         cx.update(|cx| project_hooks.extension_asset_path(&project, &id, &rel, cx));
                     reply.send(path).ok();
+                }
+                GpuiCommand::InstallDevExtension {
+                    archive,
+                    permit,
+                    reply,
+                } => {
+                    let task = cx.update(|cx| {
+                        let extensions = project
+                            .read(cx)
+                            .sandbox
+                            .as_ref()
+                            .map(|sandbox| sandbox.extensions.clone());
+                        match extensions {
+                            Some(extensions) => extensions.update(cx, |extensions, cx| {
+                                extensions.install_dev_archive(archive, cx)
+                            }),
+                            None => gpui::Task::ready(Err(anyhow::anyhow!(
+                                "Sandbox extensions are not initialized"
+                            ))),
+                        }
+                    });
+                    cx.spawn(async move |_| {
+                        let _permit = permit;
+                        reply.send(task.await).ok();
+                    })
+                    .detach();
                 }
                 GpuiCommand::Quit => {
                     pty.kill_all();

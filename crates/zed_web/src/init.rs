@@ -1,5 +1,5 @@
 //! The registry, store and panel initialization of `crates/zed/src/main.rs`, in the desktop
-//! order minus the crates the browser excludes (the updater, extension host, collaboration,
+//! order minus the crates the browser excludes (the native updater, collaboration,
 //! audio, feedback, onboarding, the profiler). Items skipped on purpose are noted inline so
 //! the sequence can be diffed against `main.rs`.
 
@@ -180,8 +180,8 @@ pub fn init_after_db(
     });
     AppState::set_global(app_state.clone(), cx);
 
-    // 18. Skipped: `auto_update::init`, `auto_update_ui::init`, `reliability::init`,
-    //     `extension_host::init` (desktop-only).
+    // 18. Executable extensions run in the sandbox, assets in the browser host.
+    crate::extensions::init(fs.clone(), cx);
     dap_adapters::init(cx);
 
     // 19. Themes from the asset pack. `eager_load_active_theme_and_icon_theme` needs the
@@ -290,8 +290,9 @@ pub fn init_after_db(
     settings_profile_selector::init(cx);
     language_tools::init(cx);
 
-    // 30. Skipped: `call`, `collab_ui`, `feedback`, `onboarding`, `extensions_ui` (awaits the
-    //     remote extension store), `inspector_ui`, `miniprofiler_ui` (std `Instant`).
+    // 30. Native extension marketplace, backed by the connected sandbox.
+    extensions_ui::init(cx);
+    // Calls, onboarding and desktop profiling remain excluded.
     notifications::init(app_state.client.clone(), app_state.user_store.clone(), cx);
     git_ui::init(cx);
     markdown_preview::init(cx);

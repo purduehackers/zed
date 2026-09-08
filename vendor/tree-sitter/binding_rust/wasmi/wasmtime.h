@@ -371,6 +371,21 @@ wasmtime_func_call(wasmtime_context_t *store, const wasmtime_func_t *func,
     return ts_wasmi_error("Grammar engine must enable instruction fuel");
   if (args_length > 16 || results_length > 16)
     return ts_wasmi_error("Unsupported grammar call arity");
+  wasm_functype_t *type = wasm_func_type(ts_wasmi_func(func));
+  bool valid = wasm_functype_params(type)->size == args_length &&
+               wasm_functype_results(type)->size == results_length;
+  if (valid) {
+    for (size_t i = 0; i < args_length; i++)
+      valid &=
+          wasm_valtype_kind(wasm_functype_params(type)->data[i]) == WASM_I32 &&
+          args[i].kind == WASMTIME_I32;
+    for (size_t i = 0; i < results_length; i++)
+      valid &=
+          wasm_valtype_kind(wasm_functype_results(type)->data[i]) == WASM_I32;
+  }
+  wasm_functype_delete(type);
+  if (!valid)
+    return ts_wasmi_error("Unsupported grammar call signature");
   wasm_val_t in[16] = {0}, out[16] = {0};
   for (size_t i = 0; i < args_length; i++)
     in[i] = ts_wasmi_value(&args[i]);

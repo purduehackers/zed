@@ -58,15 +58,10 @@ pub fn is_supported_wasm_api_version(release_channel: ReleaseChannel, version: V
 /// Returns the Wasm API version range that is supported by the Wasm host.
 #[inline(always)]
 pub fn wasm_api_version_range(release_channel: ReleaseChannel) -> RangeInclusive<Version> {
-    // Note: The release channel can be used to stage a new version of the extension API.
-    let _ = release_channel;
-
-    let max_version = match release_channel {
-        ReleaseChannel::Dev | ReleaseChannel::Nightly => latest::MAX_VERSION,
+    since_v0_0_1::MIN_VERSION..=match release_channel {
+        ReleaseChannel::Dev | ReleaseChannel::Nightly => since_v0_8_0::MAX_VERSION,
         ReleaseChannel::Stable | ReleaseChannel::Preview => since_v0_6_0::MAX_VERSION,
-    };
-
-    since_v0_0_1::MIN_VERSION..=max_version
+    }
 }
 
 /// Authorizes access to use unreleased versions of the Wasm API, based on the provided [`ReleaseChannel`].

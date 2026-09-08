@@ -1,3 +1,4 @@
+pub mod browser_archive;
 mod capabilities;
 // Compiles extensions with `cargo`/`clang` against the local disk (`std::fs`, `std::env`,
 // `std::time::Instant::now()`); none of that exists in the browser, and nothing in the wasm

@@ -13,6 +13,7 @@ path = "src/extension.rs"
 
 [dependencies]
 anyhow.workspace = true
+async-tar.workspace = true
 async-trait.workspace = true
 cloud_api_types.workspace = true
 collections.workspace = true

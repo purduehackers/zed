@@ -111,6 +111,7 @@ message InstalledExtension {
   optional string description = 4;
   repeated string provides = 5;   // ExtensionProvides kebab-case names
   bool dev = 6;
+  uint64 revision = 7; // changes when a development build keeps the same version
 }
 message AvailableExtension {
   string id = 1;
@@ -121,11 +122,16 @@ message AvailableExtension {
   string repository = 6;
   repeated string provides = 7;
   uint64 download_count = 8;
+  string published_at = 9;
+  optional int32 schema_version = 10;
+  optional string wasm_api_version = 11;
 }
 message ListExtensions {
   uint64 project_id = 1;
   optional string search = 2;
   bool include_available = 3;     // when false, `available` is left empty and no registry call is made
+  optional string extension_id = 4; // list all versions of one extension
+  repeated string provides = 5;
 }
 message ListExtensionsResponse {
   repeated InstalledExtension installed = 1;
@@ -137,6 +143,8 @@ message InstallRegistryExtension {
   uint64 project_id = 1;
   string id = 2;                  // validated against ^[a-z0-9][a-z0-9_-]{0,63}$ by the server
   optional string version = 3;    // absent = latest compatible
+  optional uint64 expected_revision = 4; // automatic update: skip if another peer changed it
+  bool only_if_missing = 5;       // automatic installation must not replace a peer's choice
 }
 message UninstallExtension {
   uint64 project_id = 1;

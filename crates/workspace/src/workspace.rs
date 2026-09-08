@@ -3189,7 +3189,10 @@ impl Workspace {
         // TODO: If `on_prompt_for_open_path` is set, we should always use it
         // rather than gating on `use_system_path_prompts`. This would let tests
         // inject a mock without also having to disable the setting.
-        if !lister.is_local(cx) || !WorkspaceSettings::get_global(cx).use_system_path_prompts {
+        if !lister.is_local(cx)
+            || (!cfg!(target_family = "wasm")
+                && !WorkspaceSettings::get_global(cx).use_system_path_prompts)
+        {
             let prompt = self.on_prompt_for_open_path.take().unwrap();
             let rx = prompt(self, lister, window, cx);
             self.on_prompt_for_open_path = Some(prompt);

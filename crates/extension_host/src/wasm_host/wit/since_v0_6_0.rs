@@ -9,7 +9,7 @@ use wasmtime::component::{Linker, Resource};
 use super::latest;
 
 pub const MIN_VERSION: Version = Version::new(0, 6, 0);
-pub const MAX_VERSION: Version = Version::new(0, 7, 0);
+pub const MAX_VERSION: Version = crate::compatibility::STABLE_MAX_API_VERSION;
 
 wasmtime::component::bindgen!({
     imports: {

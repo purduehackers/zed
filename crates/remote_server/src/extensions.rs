@@ -47,6 +47,7 @@ pub const STAGING_DIR: &str = "staging";
 /// `WasmHost`'s work directory inside the extensions directory; skipped by the disk scan.
 const WORK_DIR: &str = "work";
 const MANIFEST_FILE: &str = "extension.toml";
+const INSTALL_STATE_FILE: &str = ".zedspaces-install.json";
 const MAX_EXTENSION_ID_BYTES: usize = 64;
 const MAX_EXTENSION_VERSION_BYTES: usize = 80;
 const MAX_VERSION_SUFFIX_BYTES: usize = 64;
@@ -109,6 +110,12 @@ pub struct RegistryConfig {
     pub release_channel: ReleaseChannel,
 }
 
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct InstallState {
+    dev: bool,
+    revision: u64,
+}
+
 /// An installed extension as reported to the client.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InstalledExtensionRecord {
@@ -124,6 +131,7 @@ pub struct InstalledExtensionRecord {
     pub provides: Vec<String>,
     /// Whether the last install of this id was a dev upload.
     pub dev: bool,
+    pub revision: u64,
 }
 
 impl InstalledExtensionRecord {
@@ -140,6 +148,7 @@ impl InstalledExtensionRecord {
                 .map(|provides| provides.to_string())
                 .collect(),
             dev,
+            revision: 0,
         }
     }
 
@@ -152,6 +161,7 @@ impl InstalledExtensionRecord {
             description: self.description.clone(),
             provides: self.provides.clone(),
             dev: self.dev,
+            revision: self.revision,
         }
     }
 }
@@ -164,9 +174,9 @@ pub struct SandboxExtensions {
     extension_dir: PathBuf,
     /// Every installed extension's manifest, keyed by id; the source of the installed set.
     manifests: BTreeMap<Arc<str>, Arc<ExtensionManifest>>,
-    /// Ids whose last install was a dev upload (in-memory only; the desktop re-syncs dev
-    /// extensions on every connect).
+    /// Uploaded development builds, persisted beside their installed manifest.
     dev_ids: BTreeSet<Arc<str>>,
+    revisions: BTreeMap<Arc<str>, u64>,
     /// Ids the store runs (languages, language servers): the ones an uninstall must unload
     /// through the store. An extension that is on disk but failed to load is installed
     /// without being here.
@@ -176,6 +186,93 @@ pub struct SandboxExtensions {
 }
 
 impl SandboxExtensions {
+    /// Compile a browser-selected source snapshot with the ordinary native builder.
+    /// The previous installed version remains in place until compilation succeeds.
+    pub fn install_dev_archive(
+        &mut self,
+        bytes: Vec<u8>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let fs = self.fs.clone();
+        let http = self.registry.http.clone();
+        cx.spawn(async move |this, cx| {
+            let fs_for_build = fs.clone();
+            let (directory, manifest) = cx
+                .background_spawn(async move {
+                    anyhow::ensure!(
+                        bytes.len() <= 64 * 1024 * 1024,
+                        "Development extension exceeds 64 MiB"
+                    );
+                    let uploads = paths::remote_extensions_uploads_dir();
+                    fs_for_build.create_dir(uploads).await?;
+                    let directory = tempfile::Builder::new()
+                        .prefix("web-dev-")
+                        .tempdir_in(uploads)?;
+                    let entries =
+                        extension::browser_archive::read(&bytes, None, 64 * 1024 * 1024).await?;
+                    for (relative, contents) in entries {
+                        let target = directory.path().join(relative);
+                        fs_for_build
+                            .create_dir(target.parent().context("Invalid source path")?)
+                            .await?;
+                        fs_for_build.write(&target, &contents).await?;
+                    }
+                    let mut manifest =
+                        ExtensionManifest::load(fs_for_build.clone(), directory.path()).await?;
+                    anyhow::ensure!(
+                        is_valid_extension_id(&manifest.id)
+                            && is_valid_extension_version(&manifest.version),
+                        "Invalid extension id/version"
+                    );
+                    anyhow::ensure!(
+                        !extension_host::is_suppressed_extension(&manifest.id),
+                        "This extension has moved into Zed"
+                    );
+                    let builder = extension::extension_builder::ExtensionBuilder::new(
+                        http,
+                        paths::remote_extensions_dir().join("build-cache"),
+                    );
+                    builder
+                        .compile_extension(
+                            directory.path(),
+                            &mut manifest,
+                            extension::extension_builder::CompileExtensionOptions::dev(),
+                            fs_for_build.clone(),
+                        )
+                        .await?;
+                    fs_for_build
+                        .atomic_write(
+                            directory.path().join("extension.toml"),
+                            toml::to_string(&manifest)?,
+                        )
+                        .await?;
+                    // Build output is not a client asset and need not consume snapshots.
+                    fs_for_build
+                        .remove_dir(
+                            &directory.path().join("target"),
+                            RemoveOptions {
+                                recursive: true,
+                                ignore_if_not_exists: true,
+                            },
+                        )
+                        .await?;
+                    Ok::<_, anyhow::Error>((directory, manifest))
+                })
+                .await?;
+            let version = ExtensionVersion {
+                id: manifest.id.to_string(),
+                version: manifest.version.to_string(),
+                dev: true,
+                content_fingerprint: None,
+            };
+            this.update(cx, |this, cx| {
+                this.install_uploaded(version, directory.path().to_owned(), cx)
+            })?
+            .await?;
+            Ok(())
+        })
+    }
+
     /// A manager over `store`, installing into `extension_dir` (the store's directory).
     pub fn new(
         store: Entity<HeadlessExtensionStore>,
@@ -190,6 +287,7 @@ impl SandboxExtensions {
             extension_dir,
             manifests: BTreeMap::new(),
             dev_ids: BTreeSet::new(),
+            revisions: BTreeMap::new(),
             store_loaded: BTreeSet::new(),
             operation_lock: Arc::default(),
         }
@@ -216,10 +314,12 @@ impl SandboxExtensions {
         self.manifests
             .values()
             .map(|manifest| {
-                InstalledExtensionRecord::from_manifest(
+                let mut record = InstalledExtensionRecord::from_manifest(
                     manifest,
                     self.dev_ids.contains(&manifest.id),
-                )
+                );
+                record.revision = self.revisions.get(&manifest.id).copied().unwrap_or(0);
+                record
             })
             .collect()
     }
@@ -230,17 +330,29 @@ impl SandboxExtensions {
         &mut self,
         manifest: Arc<ExtensionManifest>,
         dev: bool,
-    ) -> Option<Arc<ExtensionManifest>> {
+    ) -> (Option<Arc<ExtensionManifest>>, bool) {
+        let previous_dev = self.dev_ids.contains(&manifest.id);
+        let revision = self.revisions.entry(manifest.id.clone()).or_default();
+        *revision = revision.saturating_add(1);
         if dev {
             self.dev_ids.insert(manifest.id.clone());
         } else {
             self.dev_ids.remove(&manifest.id);
         }
-        self.manifests.insert(manifest.id.clone(), manifest)
+        (
+            self.manifests.insert(manifest.id.clone(), manifest),
+            previous_dev,
+        )
     }
 
     /// Undoes `record` after a failed install.
-    fn restore_record(&mut self, id: &Arc<str>, previous: Option<Arc<ExtensionManifest>>) {
+    fn restore_record(&mut self, id: &Arc<str>, previous: (Option<Arc<ExtensionManifest>>, bool)) {
+        let (previous, dev) = previous;
+        if dev {
+            self.dev_ids.insert(id.clone());
+        } else {
+            self.dev_ids.remove(id);
+        }
         match previous {
             Some(previous) => {
                 self.manifests.insert(id.clone(), previous);
@@ -263,15 +375,49 @@ impl SandboxExtensions {
         cx.spawn(async move |this, cx| {
             let _operation_guard = operation_lock.lock().await;
             let manifests = scan_manifests(&fs, &extension_dir).await;
+            let mut states = BTreeMap::new();
+            for manifest in &manifests {
+                let state = if fs
+                    .is_file(
+                        &extension_dir
+                            .join(manifest.id.as_ref())
+                            .join(INSTALL_STATE_FILE),
+                    )
+                    .await
+                {
+                    serde_json::from_str::<InstallState>(
+                        &fs.load(
+                            &extension_dir
+                                .join(manifest.id.as_ref())
+                                .join(INSTALL_STATE_FILE),
+                        )
+                        .await?,
+                    )?
+                } else {
+                    InstallState::default()
+                };
+                states.insert(manifest.id.clone(), state);
+            }
             let loadable: Vec<ExtensionVersion> = manifests
                 .iter()
                 .filter(|manifest| needs_store_load(manifest))
+                // These are already installed artifacts. The native dev-sync mode
+                // instead asks a desktop client to upload a matching fingerprint.
                 .map(|manifest| registry_version(manifest))
                 .collect();
             // Recorded before the store loads anything: the `ExtensionsInstalledChanged`
             // the store emits while loading is the first `ExtensionsChanged` the client and
             // the supervisor see, and it must carry the whole installed set.
             this.update(cx, |this, _| {
+                this.dev_ids = states
+                    .iter()
+                    .filter(|(_, state)| state.dev)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                this.revisions = states
+                    .into_iter()
+                    .map(|(id, state)| (id, state.revision))
+                    .collect();
                 this.manifests = manifests
                     .into_iter()
                     .map(|manifest| (manifest.id.clone(), manifest))
@@ -316,17 +462,34 @@ impl SandboxExtensions {
     pub fn search_registry(
         &self,
         search: Option<String>,
+        extension_id: Option<String>,
+        provides: Vec<String>,
         cx: &Context<Self>,
     ) -> Task<Result<Vec<ExtensionMetadata>>> {
         let http = self.registry.http.clone();
         let release_channel = self.registry.release_channel;
         cx.background_spawn(async move {
+            if let Some(id) = &extension_id {
+                anyhow::ensure!(is_valid_extension_id(id), "invalid extension id");
+            }
+            anyhow::ensure!(provides.len() <= 16, "too many extension filters");
+            for value in &provides {
+                value.parse::<cloud_api_types::ExtensionProvides>()?;
+            }
             let max_schema_version = schema_version_range().end().to_string();
             let mut query = vec![("max_schema_version", max_schema_version.as_str())];
             if let Some(search) = search.as_deref() {
                 query.push(("filter", search));
             }
-            let url = http.build_zed_api_url("/extensions", &query)?;
+            let provides = provides.join(",");
+            if !provides.is_empty() {
+                query.push(("provides", &provides));
+            }
+            let path = extension_id.as_ref().map_or_else(
+                || "/extensions".to_owned(),
+                |id| format!("/extensions/{id}"),
+            );
+            let url = http.build_zed_api_url(&path, &query)?;
             let mut response = http
                 .get(url.as_ref(), AsyncBody::empty(), true)
                 .await
@@ -344,7 +507,7 @@ impl SandboxExtensions {
                 serde_json::from_slice(&body).context("parsing the extension registry response")?;
             parsed.data.retain(|extension| {
                 !extension_host::is_suppressed_extension(&extension.id)
-                    && is_version_compatible(release_channel, extension)
+                    && (extension_id.is_some() || is_version_compatible(release_channel, extension))
             });
             Ok(parsed.data)
         })
@@ -360,7 +523,7 @@ impl SandboxExtensions {
         version: Option<Arc<str>>,
         cx: &mut Context<Self>,
     ) -> Task<Result<InstalledExtensionRecord>> {
-        let install = self.spawn_registry_install(id.clone(), version, false, cx);
+        let install = self.spawn_registry_install(id.clone(), version, false, None, cx);
         cx.spawn(async move |_, _| {
             install
                 .await?
@@ -377,7 +540,7 @@ impl SandboxExtensions {
         id: Arc<str>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<InstalledExtensionRecord>>> {
-        self.spawn_registry_install(id, None, true, cx)
+        self.spawn_registry_install(id, None, true, None, cx)
     }
 
     fn spawn_registry_install(
@@ -385,6 +548,7 @@ impl SandboxExtensions {
         id: Arc<str>,
         version: Option<Arc<str>>,
         skip_if_installed: bool,
+        expected_revision: Option<u64>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<InstalledExtensionRecord>>> {
         if !is_valid_extension_id(&id) {
@@ -419,6 +583,15 @@ impl SandboxExtensions {
             let _operation_guard = operation_lock.lock().await;
             if skip_if_installed && this.read_with(cx, |this, _| this.is_installed(&id))? {
                 log::debug!("extension {id} is already installed; not reinstalling it");
+                return Ok(None);
+            }
+            if let Some(expected) = expected_revision
+                && this.read_with(cx, |this, _| {
+                    !this.is_installed(&id)
+                        || this.dev_ids.contains(&id)
+                        || this.revisions.get(&id).copied().unwrap_or(0) != expected
+                })?
+            {
                 return Ok(None);
             }
             log::info!("installing extension {id} from the registry ({url})");
@@ -588,6 +761,21 @@ impl SandboxExtensions {
     ) -> Result<()> {
         let id = manifest.id.clone();
         let runnable = needs_store_load(&manifest);
+        let revision = this.read_with(cx, |this, _| {
+            this.revisions
+                .get(&id)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(1)
+        })?;
+        fs.atomic_write(
+            source_dir.join(INSTALL_STATE_FILE),
+            serde_json::to_string(&InstallState {
+                dev: version.dev,
+                revision,
+            })?,
+        )
+        .await?;
         // Recorded before the store installs so the `ExtensionsInstalledChanged` it emits
         // already sees the new extension.
         let previous = this.update(cx, |this, _| this.record(manifest, version.dev))?;
@@ -702,7 +890,12 @@ impl SandboxExtensions {
         });
         let available = if envelope.payload.include_available {
             this.update(&mut cx, |this, cx| {
-                this.search_registry(envelope.payload.search, cx)
+                this.search_registry(
+                    envelope.payload.search,
+                    envelope.payload.extension_id,
+                    envelope.payload.provides,
+                    cx,
+                )
             })
             .await?
             .into_iter()
@@ -726,7 +919,13 @@ impl SandboxExtensions {
         let id: Arc<str> = envelope.payload.id.into();
         anyhow::ensure!(is_valid_extension_id(&id), "invalid extension id {id:?}");
         this.update(&mut cx, |this, cx| {
-            this.install_from_registry(id, envelope.payload.version.map(Into::into), cx)
+            this.spawn_registry_install(
+                id,
+                envelope.payload.version.map(Into::into),
+                envelope.payload.only_if_missing,
+                envelope.payload.expected_revision,
+                cx,
+            )
         })
         .await?;
         Ok(proto::Ack {})
@@ -880,6 +1079,9 @@ fn available_to_proto(extension: ExtensionMetadata) -> proto::AvailableExtension
             .map(|provides| provides.to_string())
             .collect(),
         download_count: extension.download_count,
+        published_at: extension.published_at.to_rfc3339(),
+        schema_version: extension.manifest.schema_version,
+        wasm_api_version: extension.manifest.wasm_api_version,
     }
 }
 
@@ -1607,6 +1809,7 @@ mod tests {
                 project_id: proto::REMOTE_SERVER_PROJECT_ID,
                 search: None,
                 include_available: false,
+                ..Default::default()
             }),
             cx.to_async(),
         )
@@ -1625,6 +1828,7 @@ mod tests {
                 project_id: proto::REMOTE_SERVER_PROJECT_ID,
                 search: Some("html".into()),
                 include_available: true,
+                ..Default::default()
             }),
             cx.to_async(),
         )
@@ -1654,6 +1858,7 @@ mod tests {
                 project_id: proto::REMOTE_SERVER_PROJECT_ID,
                 search: Some("x".repeat(MAX_SEARCH_BYTES + 1)),
                 include_available: true,
+                ..Default::default()
             }),
             cx.to_async(),
         )

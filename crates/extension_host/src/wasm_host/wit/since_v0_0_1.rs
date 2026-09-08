@@ -9,7 +9,7 @@ use semver::Version;
 use std::sync::{Arc, OnceLock};
 use wasmtime::component::{Linker, Resource};
 
-pub const MIN_VERSION: Version = Version::new(0, 0, 1);
+pub const MIN_VERSION: Version = crate::compatibility::MIN_API_VERSION;
 
 wasmtime::component::bindgen!({
     imports: {

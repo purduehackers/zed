@@ -1,7 +1,11 @@
 //! The browser's `AssetSource`: the fetched asset pack (fonts, icons, images, themes, sounds;
 //! BUILD-SPEC 3.5) layered over the wasm-embedded `assets::Assets` (prompts, `*.md`).
 
-use std::{borrow::Cow, sync::Arc};
+use std::{
+    borrow::Cow,
+    path::Path,
+    sync::{Arc, OnceLock},
+};
 
 use assets::Assets;
 use gpui::{App, AssetSource, SharedString};
@@ -11,6 +15,7 @@ use zed_web_core::AssetPack;
 #[derive(Clone)]
 pub struct WebAssets {
     pack: Arc<AssetPack>,
+    fs: Arc<OnceLock<Arc<fs::WasmFs>>>,
 }
 
 impl WebAssets {
@@ -18,7 +23,12 @@ impl WebAssets {
     pub fn new(pack: AssetPack) -> Self {
         Self {
             pack: Arc::new(pack),
+            fs: Arc::default(),
         }
+    }
+
+    pub fn set_fs(&self, fs: Arc<fs::WasmFs>) {
+        self.fs.set(fs).ok();
     }
 
     /// Registers every `fonts/**/*.ttf` of the pack with the text system. The browser
@@ -45,6 +55,13 @@ impl WebAssets {
 
 impl AssetSource for WebAssets {
     fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {
+        if path.starts_with("/extensions/browser/") {
+            return self
+                .fs
+                .get()
+                .map(|fs| fs.read_bytes(Path::new(path)).map(Cow::Owned))
+                .transpose();
+        }
         if let Some(bytes) = self.pack.get(path) {
             return Ok(Some(Cow::Owned(bytes.to_vec())));
         }

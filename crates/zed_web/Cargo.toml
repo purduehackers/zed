@@ -40,6 +40,7 @@ chrono = { workspace = true, features = ["wasmbind"] }
 # platform
 anyhow.workspace = true
 async-channel.workspace = true
+async-tar.workspace = true
 futures.workspace = true
 dap.workspace = true
 yawc.workspace = true
@@ -70,6 +71,8 @@ clock.workspace = true
 collections.workspace = true
 db.workspace = true
 extension.workspace = true
+extension_host.workspace = true
+extensions_ui.workspace = true
 feature_flags.workspace = true
 fs.workspace = true
 git.workspace = true
