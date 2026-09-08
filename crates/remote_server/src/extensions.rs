@@ -17,6 +17,7 @@ use anyhow::{Context as _, Result};
 use async_compression::futures::bufread::GzipDecoder;
 use async_tar::Archive;
 use cloud_api_types::{ExtensionMetadata, GetExtensionsResponse};
+use extension::browser_archive::{INSTALL_STATE_FILE, InstallState};
 use extension::{ExtensionEvents, ExtensionManifest};
 use extension_host::{
     headless_host::{ExtensionVersion, HeadlessExtensionStore},
@@ -47,7 +48,6 @@ pub const STAGING_DIR: &str = "staging";
 /// `WasmHost`'s work directory inside the extensions directory; skipped by the disk scan.
 const WORK_DIR: &str = "work";
 const MANIFEST_FILE: &str = "extension.toml";
-const INSTALL_STATE_FILE: &str = ".zedspaces-install.json";
 const MAX_EXTENSION_ID_BYTES: usize = 64;
 const MAX_EXTENSION_VERSION_BYTES: usize = 80;
 const MAX_VERSION_SUFFIX_BYTES: usize = 64;
@@ -108,12 +108,6 @@ pub struct RegistryConfig {
     pub http: Arc<HttpClientWithUrl>,
     /// Selects the wasm API range advertised to the registry.
     pub release_channel: ReleaseChannel,
-}
-
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-struct InstallState {
-    dev: bool,
-    revision: u64,
 }
 
 /// An installed extension as reported to the client.
@@ -330,9 +324,10 @@ impl SandboxExtensions {
         &mut self,
         manifest: Arc<ExtensionManifest>,
         dev: bool,
-    ) -> (Option<Arc<ExtensionManifest>>, bool) {
+    ) -> (Option<Arc<ExtensionManifest>>, bool, u64) {
         let previous_dev = self.dev_ids.contains(&manifest.id);
         let revision = self.revisions.entry(manifest.id.clone()).or_default();
+        let previous_revision = *revision;
         *revision = revision.saturating_add(1);
         if dev {
             self.dev_ids.insert(manifest.id.clone());
@@ -342,12 +337,18 @@ impl SandboxExtensions {
         (
             self.manifests.insert(manifest.id.clone(), manifest),
             previous_dev,
+            previous_revision,
         )
     }
 
     /// Undoes `record` after a failed install.
-    fn restore_record(&mut self, id: &Arc<str>, previous: (Option<Arc<ExtensionManifest>>, bool)) {
-        let (previous, dev) = previous;
+    fn restore_record(
+        &mut self,
+        id: &Arc<str>,
+        previous: (Option<Arc<ExtensionManifest>>, bool, u64),
+    ) {
+        let (previous, dev, revision) = previous;
+        self.revisions.insert(id.clone(), revision);
         if dev {
             self.dev_ids.insert(id.clone());
         } else {
@@ -801,7 +802,10 @@ impl SandboxExtensions {
                 }
             }),
             Err(error) => {
-                this.update(cx, |this, _| this.restore_record(&id, previous))?;
+                this.update(cx, |this, cx| {
+                    this.restore_record(&id, previous);
+                    notify_installed_changed(cx);
+                })?;
                 Err(error)
             }
         }
@@ -882,12 +886,6 @@ impl SandboxExtensions {
                 search.len()
             );
         }
-        let installed = this.read_with(&cx, |this, _| {
-            this.installed_extension_records()
-                .iter()
-                .map(InstalledExtensionRecord::to_proto)
-                .collect()
-        });
         let available = if envelope.payload.include_available {
             this.update(&mut cx, |this, cx| {
                 this.search_registry(
@@ -904,6 +902,14 @@ impl SandboxExtensions {
         } else {
             Vec::new()
         };
+        // A registry request may outlive another peer's install/rebuild. Do
+        // not roll clients back to the installed set from before that request.
+        let installed = this.read_with(&cx, |this, _| {
+            this.installed_extension_records()
+                .iter()
+                .map(InstalledExtensionRecord::to_proto)
+                .collect()
+        });
         Ok(proto::ListExtensionsResponse {
             installed,
             available,

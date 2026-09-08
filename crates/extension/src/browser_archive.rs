@@ -7,6 +7,14 @@ use std::{
 };
 
 pub const MAX_ENTRIES: usize = 10_000;
+pub const INSTALL_STATE_FILE: &str = ".zedspaces-install.json";
+
+/// Written by the sandbox installer, never taken from an uploaded source tree.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub struct InstallState {
+    pub dev: bool,
+    pub revision: u64,
+}
 
 pub fn validate_path(path: &Path) -> Result<()> {
     ensure!(

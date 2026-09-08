@@ -649,6 +649,18 @@ async fn prepare(
         manifest.id == record.id && manifest.version == record.version,
         "Extension changed during download; reload extensions to retry"
     );
+    let state_path = root.join(extension::browser_archive::INSTALL_STATE_FILE);
+    let state = if fs.is_file(&state_path).await {
+        serde_json::from_str::<extension::browser_archive::InstallState>(
+            &fs.load(&state_path).await?,
+        )?
+    } else {
+        extension::browser_archive::InstallState::default()
+    };
+    ensure!(
+        state.revision == record.revision && state.dev == record.dev,
+        "Extension rebuilt during download; reload extensions to retry"
+    );
     let mut assets = Assets {
         root,
         languages: Vec::new(),
