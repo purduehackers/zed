@@ -1,7 +1,7 @@
 //! Expose GPUI's AccessKit tree through browser-native accessibility semantics.
 
 use crate::events::EventListenerHandle;
-use accesskit::{Action, ActionRequest, Node, NodeId, Role, TreeId, TreeUpdate};
+use accesskit::{Action, ActionData, ActionRequest, Node, NodeId, Role, TreeId, TreeUpdate};
 use gpui::A11yCallbacks;
 use std::{
     cell::Cell,
@@ -140,6 +140,24 @@ impl WebAccessibility {
             "keydown",
             move |event| {
                 let event: web_sys::KeyboardEvent = event.unchecked_into();
+                if let Some(target) = event
+                    .target()
+                    .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+                    && let Some((action, data)) = control_key_action(&target, &event)
+                    && let Some(id) = target
+                        .get_attribute("data-gpui-node")
+                        .and_then(|id| id.parse().ok())
+                {
+                    event.prevent_default();
+                    event.stop_propagation();
+                    (action_callbacks.action)(ActionRequest {
+                        action,
+                        target_tree: TreeId::ROOT,
+                        target_node: NodeId(id),
+                        data,
+                    });
+                    return;
+                }
                 if matches!(
                     event.key().as_str(),
                     "ArrowLeft" | "ArrowRight" | "Home" | "End"
@@ -207,11 +225,7 @@ impl WebAccessibility {
                         let buttons = (0..descendants.length())
                             .filter_map(|ix| descendants.item(ix))
                             .filter_map(|element| element.dyn_into::<web_sys::HtmlElement>().ok())
-                            .filter(|element| {
-                                element.tab_index() == 0
-                                    && element.has_attribute("data-gpui-click")
-                                    && is_available(element)
-                            })
+                            .filter(|element| element.tab_index() == 0 && is_available(element))
                             .collect::<Vec<_>>();
                         if buttons.is_empty() {
                             event.prevent_default();
@@ -322,11 +336,13 @@ impl WebAccessibility {
             attr(&element, "aria-label", node.label());
             attr(&element, "aria-description", node.description());
             attr(&element, "aria-keyshortcuts", node.keyboard_shortcut());
-            attr(
-                &element,
-                "data-gpui-click",
-                node.supports_action(Action::Click).then_some(""),
-            );
+            for (action, attribute) in CONTROL_ACTIONS {
+                attr(
+                    &element,
+                    attribute,
+                    node.supports_action(action).then_some(""),
+                );
+            }
             attr(
                 &element,
                 "aria-disabled",
@@ -397,6 +413,12 @@ impl WebAccessibility {
             );
             attr(
                 &element,
+                "aria-valuetext",
+                node.value()
+                    .filter(|_| matches!(node.role(), Role::SpinButton | Role::Slider)),
+            );
+            attr(
+                &element,
                 "aria-multiline",
                 (node.role() == Role::MultilineTextInput).then_some("true"),
             );
@@ -412,8 +434,10 @@ impl WebAccessibility {
                     .join(" ");
                 attr(&element, name, (!ids.is_empty()).then_some(ids.as_str()));
             }
-            let focusable =
-                node.supports_action(Action::Focus) || node.supports_action(Action::Click);
+            let focusable = node.supports_action(Action::Focus)
+                || CONTROL_ACTIONS
+                    .iter()
+                    .any(|(action, _)| node.supports_action(*action));
             element.set_tab_index(if focusable && !node.is_hidden() && !node.is_disabled() {
                 0
             } else {
@@ -611,6 +635,63 @@ fn is_available(element: &web_sys::Element) -> bool {
         .ok()
         .flatten()
         .is_none()
+}
+
+const CONTROL_ACTIONS: [(Action, &str); 6] = [
+    (Action::Click, "data-gpui-click"),
+    (Action::Increment, "data-gpui-increment"),
+    (Action::Decrement, "data-gpui-decrement"),
+    (Action::SetValue, "data-gpui-set-value"),
+    (Action::Expand, "data-gpui-expand"),
+    (Action::Collapse, "data-gpui-collapse"),
+];
+
+/// Translate standard ARIA control keys to actions already implemented by GPUI.
+/// Only the focused semantic control owns these keys; nested text editors keep
+/// their normal editing behavior, and unsupported actions fall through unchanged.
+fn control_key_action(
+    target: &web_sys::Element,
+    event: &web_sys::KeyboardEvent,
+) -> Option<(Action, Option<ActionData>)> {
+    if !target.has_attribute("data-gpui-node")
+        || !is_available(target)
+        || target.get_attribute("aria-readonly").as_deref() == Some("true")
+        || event.is_composing()
+        || event.ctrl_key()
+        || event.meta_key()
+        || event.shift_key()
+    {
+        return None;
+    }
+    let role = target.get_attribute("role")?;
+    let key = event.key();
+    let (action, data) = match (role.as_str(), key.as_str(), event.alt_key()) {
+        ("spinbutton" | "slider", "ArrowUp", false) | ("slider", "ArrowRight", false) => {
+            (Action::Increment, None)
+        }
+        ("spinbutton" | "slider", "ArrowDown", false) | ("slider", "ArrowLeft", false) => {
+            (Action::Decrement, None)
+        }
+        ("spinbutton" | "slider", "Home" | "End", false) => {
+            let bound = if key == "Home" {
+                "aria-valuemin"
+            } else {
+                "aria-valuemax"
+            };
+            let value: f64 = target.get_attribute(bound)?.parse().ok()?;
+            if !value.is_finite() {
+                return None;
+            }
+            (Action::SetValue, Some(ActionData::NumericValue(value)))
+        }
+        ("combobox", "ArrowDown", _) => (Action::Expand, None),
+        ("combobox", "ArrowUp", true) | ("combobox", "Escape", false) => (Action::Collapse, None),
+        _ => return None,
+    };
+    let (_, attribute) = CONTROL_ACTIONS
+        .iter()
+        .find(|(candidate, _)| *candidate == action)?;
+    target.has_attribute(attribute).then_some((action, data))
 }
 
 fn attr(element: &web_sys::HtmlElement, name: &str, value: Option<&str>) {
