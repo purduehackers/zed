@@ -159,6 +159,13 @@ impl WebWindow {
             .ok_or_else(|| anyhow::anyhow!("No `body` found on document"))?;
         let dpr = browser_window.device_pixel_ratio() as f32;
         let max_texture_dimension = context.device.limits().max_texture_dimension_2d;
+        // GPUI can lay out restored panels before ResizeObserver's first delivery.
+        // Report the canvas's real size immediately, as native windows do.
+        let rect = canvas.get_bounding_client_rect();
+        let physical_width =
+            ((rect.width() * dpr as f64).round() as u32).min(max_texture_dimension);
+        let physical_height =
+            ((rect.height() * dpr as f64).round() as u32).min(max_texture_dimension);
         let has_device_pixel_support = check_device_pixel_support();
         let renderer_config = WgpuSurfaceConfig {
             size: Size {
@@ -176,7 +183,10 @@ impl WebWindow {
 
         let initial_bounds = Bounds {
             origin: Point::default(),
-            size: Size::default(),
+            size: Size {
+                width: px(physical_width as f32 / dpr),
+                height: px(physical_height as f32 / dpr),
+            },
         };
 
         let mutable_state = WebWindowMutableState {
@@ -210,7 +220,7 @@ impl WebWindow {
             click_state: RefCell::new(ClickState::default()),
             touch_ids: RefCell::new(TouchIds::default()),
             pressed_button: Cell::new(None),
-            last_physical_size: Cell::new((0, 0)),
+            last_physical_size: Cell::new((physical_width, physical_height)),
             notify_scale: Cell::new(false),
             is_composing: Cell::new(false),
             suppress_focus_status_events: Cell::new(false),
@@ -218,7 +228,10 @@ impl WebWindow {
             gesture_start_visual_viewport_height: Cell::new(0.0),
             touch_tap_candidate: Cell::new(None),
             mql_handle: RefCell::new(None),
-            pending_physical_size: Cell::new(None),
+            pending_physical_size: Cell::new(
+                (physical_width > 0 && physical_height > 0)
+                    .then_some((physical_width, physical_height)),
+            ),
             raf_id: Cell::new(None),
             raf_function: RefCell::new(None),
         });
@@ -293,18 +306,11 @@ impl WebWindow {
                 .last_physical_size
                 .set((physical_width, physical_height));
 
-            // Skip rendering to a zero-size canvas (e.g. display:none).
+            // A hidden canvas is not a window resized to zero. Keep its last
+            // usable layout, or native panels permanently clamp to their minimum
+            // sizes. The next positive observation resumes layout and rendering.
             if physical_width == 0 || physical_height == 0 {
-                {
-                    let mut s = inner.state.borrow_mut();
-                    s.bounds.size = Size::default();
-                    s.scale_factor = dpr_f32;
-                }
-                // Still fire the callback so GPUI knows the window is gone.
-                inner.with_callback(
-                    |callbacks| &mut callbacks.resize,
-                    |callback| callback(Size::default(), dpr_f32),
-                );
+                inner.pending_physical_size.set(None);
                 return;
             }
 
@@ -393,6 +399,10 @@ impl WebWindowInner {
             // (e.g. views invalidated during draw) schedule the next request
             // instead of being swallowed.
             this.raf_id.set(None);
+            let (width, height) = this.last_physical_size.get();
+            if width == 0 || height == 0 {
+                return;
+            }
             this.with_callback(
                 |callbacks| &mut callbacks.request_frame,
                 |callback| {
