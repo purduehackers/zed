@@ -1007,28 +1007,30 @@ fn open_settings_editor_in_modal(
 
     // Deferred to get the workspace off the stack, as the desktop path does.
     cx.defer(move |cx| {
-        window_handle
-            .update(cx, |multi_workspace, window, cx| {
-                let workspace = multi_workspace.workspace().clone();
-                workspace.update(cx, |workspace, cx| {
-                    if let Some(modal) = workspace.active_modal::<SettingsModal>(cx) {
-                        let settings_window = modal.read(cx).settings_window.clone();
-                        settings_window.update(cx, |settings_window, cx| {
-                            callback(settings_window, window, cx);
-                        });
-                        return;
-                    }
-                    workspace.toggle_modal(window, cx, |window, cx| {
-                        let settings_window =
-                            cx.new(|cx| SettingsWindow::new(Some(window_handle), window, cx));
-                        settings_window.update(cx, |settings_window, cx| {
-                            callback(settings_window, window, cx);
-                        });
-                        SettingsModal { settings_window }
-                    });
+        cx.update_window(window_handle.into(), |root, window, cx| {
+            let Ok(multi_workspace) = root.downcast::<MultiWorkspace>() else {
+                return;
+            };
+            let workspace = multi_workspace.read(cx).workspace().clone();
+            if let Some(modal) = workspace.read(cx).active_modal::<SettingsModal>(cx) {
+                let settings_window = modal.read(cx).settings_window.clone();
+                settings_window.update(cx, |settings_window, cx| {
+                    callback(settings_window, window, cx);
                 });
-            })
-            .log_err();
+                return;
+            }
+            // Construction and navigation read the workspace store. Keep both
+            // outside the mutable workspace/modal-layer borrow used to show it.
+            let settings_window =
+                cx.new(|cx| SettingsWindow::new(Some(window_handle), window, cx));
+            settings_window.update(cx, |settings_window, cx| {
+                callback(settings_window, window, cx);
+            });
+            workspace.update(cx, |workspace, cx| {
+                workspace.toggle_modal(window, cx, |_, _| SettingsModal { settings_window });
+            });
+        })
+        .log_err();
     });
 }
 
