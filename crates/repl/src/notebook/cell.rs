@@ -120,14 +120,22 @@ pub(crate) enum MovementDirection {
     End,
 }
 
-fn convert_outputs(
-    outputs: &Vec<nbformat::v4::Output>,
-    window: &mut Window,
-    cx: &mut App,
-) -> Vec<Output> {
-    outputs
-        .iter()
-        .map(|output| match output {
+// The renderer chooses one MIME representation and may normalize terminal text.
+// Keep the notebook data separately so saving never depends on that choice.
+struct NotebookOutput {
+    data: nbformat::v4::Output,
+    display_id: Option<String>,
+    view: Output,
+}
+
+impl NotebookOutput {
+    fn new(
+        data: nbformat::v4::Output,
+        display_id: Option<String>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self {
+        let view = match &data {
             nbformat::v4::Output::Stream { text, .. } => Output::Stream {
                 content: cx.new(|cx| TerminalOutput::from(&text.0, window, cx)),
             },
@@ -143,8 +151,13 @@ fn convert_outputs(
                 traceback: cx
                     .new(|cx| TerminalOutput::from(&error.traceback.join("\n"), window, cx)),
             }),
-        })
-        .collect()
+        };
+        Self {
+            data,
+            display_id,
+            view,
+        }
+    }
 }
 
 impl Cell {
@@ -192,19 +205,21 @@ impl Cell {
                 id,
                 metadata,
                 source,
-                ..
+                attachments,
             } => {
                 let source = source.concat();
 
                 let entity = cx.new(|cx| {
-                    MarkdownCell::new(
+                    let mut cell = MarkdownCell::new(
                         id.clone(),
                         metadata.clone(),
                         source,
                         languages.clone(),
                         window,
                         cx,
-                    )
+                    );
+                    cell.attachments = attachments.clone();
+                    cell
                 });
 
                 Cell::Markdown(entity)
@@ -217,13 +232,12 @@ impl Cell {
                 outputs,
             } => {
                 let text = source.concat();
-                let outputs = convert_outputs(outputs, window, cx);
 
                 Cell::Code(cx.new(|cx| {
                     CodeCell::new(
                         CellSource::Existing {
                             execution_count: *execution_count,
-                            outputs,
+                            outputs: outputs.clone(),
                         },
                         id.clone(),
                         metadata.clone(),
@@ -389,6 +403,7 @@ pub trait RunnableCell: RenderableCell {
 pub struct MarkdownCell {
     id: CellId,
     metadata: CellMetadata,
+    attachments: Option<serde_json::Value>,
     image_cache: Entity<RetainAllImageCache>,
     source: String,
     editor: Entity<Editor>,
@@ -461,6 +476,7 @@ impl MarkdownCell {
         Self {
             id,
             metadata,
+            attachments: None,
             image_cache: RetainAllImageCache::new(cx),
             source,
             editor,
@@ -491,13 +507,13 @@ impl MarkdownCell {
 
     pub fn to_nbformat_cell(&self, cx: &App) -> nbformat::v4::Cell {
         let source = self.current_source(cx);
-        let source_lines: Vec<String> = source.lines().map(|l| format!("{}\n", l)).collect();
+        let source_lines = source.split_inclusive('\n').map(str::to_owned).collect();
 
         nbformat::v4::Cell::Markdown {
             id: self.id.clone(),
             metadata: self.metadata.clone(),
             source: source_lines,
-            attachments: None,
+            attachments: self.attachments.clone(),
         }
     }
 
@@ -655,7 +671,10 @@ pub struct CodeCell {
     execution_count: Option<i32>,
     source: String,
     editor: Entity<editor::Editor>,
-    outputs: Vec<Output>,
+    outputs: Vec<NotebookOutput>,
+    output_revision: u64,
+    saved_output_revision: u64,
+    clear_before_next_output: bool,
     selected: bool,
     cell_position: Option<CellPosition>,
     _language_task: Task<()>,
@@ -672,12 +691,12 @@ pub(super) enum CellSource {
     /// Backed by an existing notebook cell
     Existing {
         execution_count: Option<i32>,
-        outputs: Vec<Output>,
+        outputs: Vec<nbformat::v4::Output>,
     },
 }
 
 impl CellSource {
-    fn into_outputs(self) -> (Option<i32>, Vec<Output>) {
+    fn into_outputs(self) -> (Option<i32>, Vec<nbformat::v4::Output>) {
         match self {
             CellSource::Existing {
                 execution_count,
@@ -716,7 +735,6 @@ impl CodeCell {
 
             editor.disable_mouse_wheel_zoom();
             editor.disable_scrollbars_and_minimap(window, cx);
-            editor.set_text(source.clone(), window, cx);
             editor.set_show_gutter(false, cx);
             editor.set_use_modal_editing(true);
             editor
@@ -730,6 +748,10 @@ impl CodeCell {
         });
 
         let (execution_count, outputs) = cell_source.into_outputs();
+        let outputs = outputs
+            .into_iter()
+            .map(|output| NotebookOutput::new(output, None, window, cx))
+            .collect();
 
         Self {
             id,
@@ -738,6 +760,9 @@ impl CodeCell {
             source,
             editor,
             outputs,
+            output_revision: 0,
+            saved_output_revision: 0,
+            clear_before_next_output: false,
             selected: false,
             cell_position: None,
             execution_start_time: None,
@@ -773,14 +798,26 @@ impl CodeCell {
     }
 
     pub fn is_dirty(&self, cx: &App) -> bool {
-        self.editor.read(cx).buffer().read(cx).is_dirty(cx)
+        self.output_revision != self.saved_output_revision
+            || self.editor.read(cx).buffer().read(cx).is_dirty(cx)
+    }
+
+    pub(super) fn output_revision(&self) -> u64 {
+        self.output_revision
+    }
+
+    pub(super) fn mark_outputs_saved(&mut self, revision: u64) {
+        self.saved_output_revision = revision;
     }
 
     pub fn to_nbformat_cell(&self, cx: &App) -> nbformat::v4::Cell {
         let source = self.current_source(cx);
-        let source_lines: Vec<String> = source.lines().map(|l| format!("{}\n", l)).collect();
-
-        let outputs = self.outputs_to_nbformat(cx);
+        let source_lines = source.split_inclusive('\n').map(str::to_owned).collect();
+        let outputs = self
+            .outputs
+            .iter()
+            .map(|output| output.data.clone())
+            .collect();
 
         nbformat::v4::Cell::Code {
             id: self.id.clone(),
@@ -791,20 +828,32 @@ impl CodeCell {
         }
     }
 
-    fn outputs_to_nbformat(&self, cx: &App) -> Vec<nbformat::v4::Output> {
-        self.outputs
-            .iter()
-            .filter_map(|output| output.to_nbformat(cx))
-            .collect()
-    }
-
     pub fn has_outputs(&self) -> bool {
         !self.outputs.is_empty()
     }
 
     pub fn clear_outputs(&mut self) {
+        if !self.outputs.is_empty() {
+            self.output_revision += 1;
+        }
         self.outputs.clear();
+        self.clear_before_next_output = false;
         self.execution_duration = None;
+    }
+
+    fn push_output(
+        &mut self,
+        data: nbformat::v4::Output,
+        display_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.clear_before_next_output {
+            self.clear_outputs();
+        }
+        self.outputs
+            .push(NotebookOutput::new(data, display_id, window, cx));
+        self.output_revision += 1;
     }
 
     pub fn start_execution(&mut self) {
@@ -833,11 +882,16 @@ impl CodeCell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.outputs.push(Output::ErrorOutput(ErrorView {
-            ename: "Kernel Error".to_string(),
-            evalue: "cell could not be executed".to_string(),
-            traceback: cx.new(|cx| TerminalOutput::from(error_message, window, cx)),
-        }));
+        self.push_output(
+            nbformat::v4::Output::Error(nbformat::v4::ErrorOutput {
+                ename: "Kernel Error".to_string(),
+                evalue: "cell could not be executed".to_string(),
+                traceback: vec![error_message.to_string()],
+            }),
+            None,
+            window,
+            cx,
+        );
         self.execution_start_time = None;
         self.is_executing = false;
         cx.notify();
@@ -868,34 +922,96 @@ impl CodeCell {
     ) {
         match &message.content {
             JupyterMessageContent::StreamContent(stream) => {
-                self.outputs.push(Output::Stream {
-                    content: cx.new(|cx| TerminalOutput::from(&stream.text, window, cx)),
-                });
+                self.push_output(
+                    nbformat::v4::Output::Stream {
+                        name: match stream.name {
+                            jupyter_protocol::Stdio::Stdout => "stdout",
+                            jupyter_protocol::Stdio::Stderr => "stderr",
+                        }
+                        .into(),
+                        text: nbformat::v4::MultilineString(stream.text.clone()),
+                    },
+                    None,
+                    window,
+                    cx,
+                );
             }
             JupyterMessageContent::DisplayData(display_data) => {
-                self.outputs
-                    .push(Output::new(&display_data.data, None, window, cx));
+                self.push_output(
+                    nbformat::v4::Output::DisplayData(nbformat::v4::DisplayData {
+                        data: display_data.data.clone(),
+                        metadata: display_data.metadata.clone(),
+                    }),
+                    display_data
+                        .transient
+                        .as_ref()
+                        .and_then(|t| t.display_id.clone()),
+                    window,
+                    cx,
+                );
             }
             JupyterMessageContent::ExecuteResult(execute_result) => {
-                self.outputs
-                    .push(Output::new(&execute_result.data, None, window, cx));
+                self.push_output(
+                    nbformat::v4::Output::ExecuteResult(nbformat::v4::ExecuteResult {
+                        execution_count: execute_result.execution_count,
+                        data: execute_result.data.clone(),
+                        metadata: execute_result.metadata.clone(),
+                    }),
+                    execute_result
+                        .transient
+                        .as_ref()
+                        .and_then(|t| t.display_id.clone()),
+                    window,
+                    cx,
+                );
             }
             JupyterMessageContent::ExecuteInput(input) => {
-                self.execution_count = serde_json::to_value(&input.execution_count)
-                    .ok()
-                    .and_then(|v| v.as_i64())
-                    .map(|v| v as i32);
+                self.execution_count = i32::try_from(input.execution_count.value()).ok();
+                self.output_revision += 1;
             }
             JupyterMessageContent::ExecuteReply(_) => {
                 self.finish_execution();
             }
             JupyterMessageContent::ErrorOutput(error) => {
-                self.outputs.push(Output::ErrorOutput(ErrorView {
-                    ename: error.ename.clone(),
-                    evalue: error.evalue.clone(),
-                    traceback: cx
-                        .new(|cx| TerminalOutput::from(&error.traceback.join("\n"), window, cx)),
-                }));
+                self.push_output(
+                    nbformat::v4::Output::Error(nbformat::v4::ErrorOutput {
+                        ename: error.ename.clone(),
+                        evalue: error.evalue.clone(),
+                        traceback: error.traceback.clone(),
+                    }),
+                    None,
+                    window,
+                    cx,
+                );
+            }
+            JupyterMessageContent::ClearOutput(clear) => {
+                if clear.wait {
+                    self.clear_before_next_output = true;
+                } else {
+                    self.clear_outputs();
+                }
+            }
+            JupyterMessageContent::UpdateDisplayData(update) => {
+                if let Some(display_id) = &update.transient.display_id {
+                    for output in &mut self.outputs {
+                        if output.display_id.as_ref() != Some(display_id) {
+                            continue;
+                        }
+                        let (data, metadata) = match &mut output.data {
+                            nbformat::v4::Output::DisplayData(output) => {
+                                (&mut output.data, &mut output.metadata)
+                            }
+                            nbformat::v4::Output::ExecuteResult(output) => {
+                                (&mut output.data, &mut output.metadata)
+                            }
+                            _ => continue,
+                        };
+                        *data = update.data.clone();
+                        *metadata = update.metadata.clone();
+                        output.view = Output::new(data, None, window, cx);
+                        self.output_revision += 1;
+                    }
+                }
             }
             _ => {}
         }
@@ -1224,7 +1340,7 @@ impl Render for CodeCell {
                                                     div.max_h(max_height).overflow_y_scroll()
                                                 })
                                                 .children(self.outputs.iter().map(|output| {
-                                                    div().children(output.content(window, cx))
+                                                    div().children(output.view.content(window, cx))
                                                 })),
                                         ),
                                 ),
@@ -1247,7 +1363,11 @@ pub struct RawCell {
 
 impl RawCell {
     pub fn to_nbformat_cell(&self) -> nbformat::v4::Cell {
-        let source_lines: Vec<String> = self.source.lines().map(|l| format!("{}\n", l)).collect();
+        let source_lines = self
+            .source
+            .split_inclusive('\n')
+            .map(str::to_owned)
+            .collect();
 
         nbformat::v4::Cell::Raw {
             id: self.id.clone(),
@@ -1323,5 +1443,123 @@ impl Render for RawCell {
             )
             // TODO: Move base cell render into trait impl so we don't have to repeat this
             .children(self.cell_position_spacer(false, window, cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::FutureExt;
+    use gpui::{TestAppContext, VisualTestContext};
+    use serde_json::json;
+    use settings::SettingsStore;
+
+    fn init(cx: &mut TestAppContext) -> &mut VisualTestContext {
+        cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+        cx.add_empty_window()
+    }
+
+    fn load(value: serde_json::Value, cx: &mut VisualTestContext) -> Cell {
+        let cell = serde_json::from_value(value).unwrap();
+        cx.update(|window, cx| {
+            Cell::load(
+                &cell,
+                &Arc::new(LanguageRegistry::new(cx.background_executor().clone())),
+                Task::ready(None).shared(),
+                window,
+                cx,
+            )
+        })
+    }
+
+    fn rich_data() -> serde_json::Value {
+        json!({
+            "text/plain": "fallback\nwithout trailing newline",
+            "text/markdown": "**rich**",
+            "text/html": "<b>rich</b>",
+            "application/json": {"nested": [1, "λ", null]},
+            "image/png": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aR2QAAAAASUVORK5CYII=",
+            "image/svg+xml": "<svg xmlns=\"http://www.w3.org/2000/svg\"/>",
+            "application/x-notebook-test+json": {"unrendered": true}
+        })
+    }
+
+    #[gpui::test]
+    fn saved_cells_preserve_source_attachments_and_all_output_data(cx: &mut TestAppContext) {
+        let cx = init(cx);
+        let outputs = json!([
+            {"output_type":"stream", "name":"stderr", "text":["\u{1b}[31merror\r", "λ\u{1b}[0m"]},
+            {"output_type":"display_data", "data":rich_data(), "metadata":{"image/png":{"width":23}, "custom":{"a":1}}},
+            {"output_type":"execute_result", "execution_count":42, "data":rich_data(), "metadata":{"isolated":true}},
+            {"output_type":"error", "ename":"ValueError", "evalue":"λ", "traceback":["\u{1b}[31mtrace\nline", "last"]}
+        ]);
+        for value in [
+            json!({"cell_type":"code", "id":"code", "metadata":{"tags":["keep"]}, "source":["x = 1\n", "x"], "execution_count":42, "outputs":outputs}),
+            json!({"cell_type":"markdown", "id":"markdown", "metadata":{}, "source":["![plot](attachment:plot.png)"], "attachments":{"plot.png":rich_data()}}),
+            json!({"cell_type":"raw", "id":"raw", "metadata":{}, "source":["raw\n", "tail"]}),
+            json!({"cell_type":"raw", "id":"empty", "metadata":{}, "source":[]}),
+        ] {
+            let expected: nbformat::v4::Cell = serde_json::from_value(value.clone()).unwrap();
+            let cell = load(value, cx);
+            cx.update(|_, cx| {
+                assert_eq!(
+                    serde_json::to_value(cell.to_nbformat_cell(cx)).unwrap(),
+                    serde_json::to_value(expected).unwrap()
+                );
+                assert!(!cell.is_dirty(cx));
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn kernel_outputs_preserve_data_and_apply_display_updates_and_clears(cx: &mut TestAppContext) {
+        let cx = init(cx);
+        let Cell::Code(cell) = load(
+            json!({"cell_type":"code", "id":"code", "metadata":{}, "source":[], "execution_count":null, "outputs":[]}),
+            cx,
+        ) else {
+            panic!()
+        };
+        cell.update_in(cx, |cell, window, cx| {
+            let display: jupyter_protocol::DisplayData = serde_json::from_value(json!({"data":rich_data(), "metadata":{"keep":1}, "transient":{"display_id":"shared"}})).unwrap();
+            cell.handle_message(&display.into(), window, cx);
+            let result: jupyter_protocol::ExecuteResult = serde_json::from_value(json!({"data":rich_data(), "metadata":{"keep":2}, "execution_count":17, "transient":{"display_id":"shared"}})).unwrap();
+            cell.handle_message(&result.into(), window, cx);
+            let expected = json!([
+                {"output_type":"display_data", "data":rich_data(), "metadata":{"keep":1}},
+                {"output_type":"execute_result", "data":rich_data(), "metadata":{"keep":2}, "execution_count":17}
+            ]);
+            let expected: Vec<nbformat::v4::Output> = serde_json::from_value(expected).unwrap();
+            assert_eq!(serde_json::to_value(cell.to_nbformat_cell(cx)).unwrap()["outputs"], serde_json::to_value(expected).unwrap());
+            let saved_revision = cell.output_revision();
+            cell.mark_outputs_saved(saved_revision);
+            assert!(!cell.is_dirty(cx));
+
+            let update: jupyter_protocol::UpdateDisplayData = serde_json::from_value(json!({"data":{"text/plain":"updated", "application/x-notebook-test+json":{"new":true}}, "metadata":{"changed":true}, "transient":{"display_id":"shared"}})).unwrap();
+            cell.handle_message(&update.into(), window, cx);
+            let saved = serde_json::to_value(cell.to_nbformat_cell(cx)).unwrap();
+            assert_eq!(saved["outputs"][0]["metadata"], json!({"changed":true}));
+            assert_eq!(saved["outputs"][0]["data"], saved["outputs"][1]["data"]);
+            assert_eq!(saved["outputs"][1]["execution_count"], 17);
+            assert_eq!(saved["outputs"][0]["data"]["application/x-notebook-test+json"], json!({"new":true}));
+            // Completing an older save must not mark this new output clean.
+            cell.mark_outputs_saved(saved_revision);
+            assert!(cell.is_dirty(cx));
+
+            cell.handle_message(&jupyter_protocol::ClearOutput { wait: true }.into(), window, cx);
+            assert_eq!(cell.outputs.len(), 2);
+            cell.handle_message(&jupyter_protocol::StreamContent::stderr("final\rλ").into(), window, cx);
+            let saved = serde_json::to_value(cell.to_nbformat_cell(cx)).unwrap();
+            assert_eq!(saved["outputs"], json!([{"output_type":"stream", "name":"stderr", "text":["final\rλ"]}]));
+            cell.handle_message(&jupyter_protocol::ClearOutput { wait: false }.into(), window, cx);
+            assert!(!cell.has_outputs());
+            cell.handle_message(&jupyter_protocol::ExecuteInput { code:String::new(), execution_count:23.into() }.into(), window, cx);
+            assert_eq!(cell.execution_count, Some(23));
+        });
     }
 }

@@ -108,6 +108,9 @@ pub fn init_before_connect(
     Project::init(&client, cx);
     client::init(&client, cx);
     feature_flags::FeatureFlagStore::init(cx);
+    gpui::BorrowAppContext::update_global::<feature_flags::FeatureFlagStore, _>(cx, |store, _| {
+        store.update_server_flags(false, vec!["notebooks".into()]);
+    });
 
     Ok((client, extension_host_proxy))
 }

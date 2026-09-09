@@ -167,6 +167,9 @@ impl NotebookEditor {
                     cx.subscribe(&editor, move |this, _editor, event, cx| {
                         if let editor::EditorEvent::Focused = event {
                             this.select_cell_by_id(&cell_id_for_editor, cx);
+                        } else if let editor::EditorEvent::BufferEdited = event {
+                            cx.emit(ItemEvent::Edit);
+                            cx.notify();
                         }
                     })
                     .detach();
@@ -198,6 +201,9 @@ impl NotebookEditor {
                     cx.subscribe(&editor, move |this, _editor, event, cx| {
                         if let editor::EditorEvent::Focused = event {
                             this.select_cell_by_id(&cell_id_for_editor, cx);
+                        } else if let editor::EditorEvent::BufferEdited = event {
+                            cx.emit(ItemEvent::Edit);
+                            cx.notify();
                         }
                     })
                     .detach();
@@ -296,55 +302,14 @@ impl NotebookEditor {
             })
             .collect();
 
-        let metadata = self.notebook_item.read(cx).notebook.metadata.clone();
+        let notebook = &self.notebook_item.read(cx).notebook;
 
         nbformat::v4::Notebook {
-            metadata,
-            nbformat: 4,
-            nbformat_minor: 5,
+            metadata: notebook.metadata.clone(),
+            nbformat: notebook.nbformat,
+            nbformat_minor: notebook.nbformat_minor,
             cells,
         }
-    }
-
-    pub fn mark_as_saved(&mut self, cx: &mut Context<Self>) {
-        self.original_cell_order = self.cell_order.clone();
-
-        for cell in self.cell_map.values() {
-            match cell {
-                Cell::Code(code_cell) => {
-                    code_cell.update(cx, |code_cell, cx| {
-                        let editor = code_cell.editor();
-                        editor.update(cx, |editor, cx| {
-                            editor.buffer().update(cx, |buffer, cx| {
-                                if let Some(buf) = buffer.as_singleton() {
-                                    buf.update(cx, |b, cx| {
-                                        let version = b.version();
-                                        b.did_save(version, None, cx);
-                                    });
-                                }
-                            });
-                        });
-                    });
-                }
-                Cell::Markdown(markdown_cell) => {
-                    markdown_cell.update(cx, |markdown_cell, cx| {
-                        let editor = markdown_cell.editor();
-                        editor.update(cx, |editor, cx| {
-                            editor.buffer().update(cx, |buffer, cx| {
-                                if let Some(buf) = buffer.as_singleton() {
-                                    buf.update(cx, |b, cx| {
-                                        let version = b.version();
-                                        b.did_save(version, None, cx);
-                                    });
-                                }
-                            });
-                        });
-                    });
-                }
-                Cell::Raw(_) => {}
-            }
-        }
-        cx.notify();
     }
 
     fn save_impl(
@@ -356,7 +321,22 @@ impl NotebookEditor {
         let notebook = self.to_notebook(cx);
         let project_path = self.notebook_item.read(cx).project_path.clone();
 
-        self.mark_as_saved(cx);
+        // Capture the exact buffer/output versions being written. A failed save
+        // must stay dirty, as must edits or kernel output arriving during I/O.
+        let saved_cells = self
+            .cell_map
+            .values()
+            .filter_map(|cell| {
+                let (editor, output_revision) = match cell {
+                    Cell::Code(cell) => (cell.read(cx).editor(), cell.read(cx).output_revision()),
+                    Cell::Markdown(cell) => (cell.read(cx).editor(), 0),
+                    Cell::Raw(_) => return None,
+                };
+                let buffer = editor.read(cx).buffer().read(cx).as_singleton()?;
+                let version = buffer.read(cx).version();
+                Some((cell.clone(), buffer, version, output_revision))
+            })
+            .collect::<Vec<_>>();
 
         cx.spawn(async move |this, cx| {
             let json =
@@ -370,7 +350,7 @@ impl NotebookEditor {
                 SaveDestination::CurrentPath => {
                     project
                         .update(cx, |project, cx| project.save_buffer(buffer, cx))
-                        .await
+                        .await?;
                 }
                 SaveDestination::NewPath(new_path) => {
                     project
@@ -391,9 +371,26 @@ impl NotebookEditor {
                                 notebook_item.id = entry_id;
                             }
                         })
-                    })
+                    })?;
                 }
             }
+            this.update(cx, |this, cx| {
+                this.original_cell_order = notebook
+                    .cells
+                    .iter()
+                    .map(|cell| cell.id().clone())
+                    .collect();
+                for (cell, buffer, version, output_revision) in saved_cells {
+                    buffer.update(cx, |buffer, cx| buffer.did_save(version, None, cx));
+                    if let Cell::Code(cell) = cell {
+                        cell.update(cx, |cell, _| cell.mark_outputs_saved(output_revision));
+                    }
+                }
+                this.notebook_item
+                    .update(cx, |item, _| item.notebook.cells = notebook.cells);
+                cx.emit(ItemEvent::UpdateTab);
+                cx.notify();
+            })
         })
     }
 
@@ -644,6 +641,8 @@ impl NotebookEditor {
         } else {
             self.execution_requests.insert(msg_id, cell_id.clone());
         }
+        cx.emit(ItemEvent::Edit);
+        cx.notify();
     }
 
     fn get_selected_cell(&self) -> Option<&Cell> {
@@ -671,6 +670,7 @@ impl NotebookEditor {
                 });
             }
         }
+        cx.emit(ItemEvent::Edit);
         cx.notify();
     }
 
@@ -826,6 +826,7 @@ impl NotebookEditor {
             self.cell_order
                 .swap(self.selected_cell_index, self.selected_cell_index - 1);
             self.selected_cell_index -= 1;
+            cx.emit(ItemEvent::Edit);
             cx.notify();
         }
     }
@@ -836,6 +837,7 @@ impl NotebookEditor {
             self.cell_order
                 .swap(self.selected_cell_index, self.selected_cell_index + 1);
             self.selected_cell_index += 1;
+            cx.emit(ItemEvent::Edit);
             cx.notify();
         }
     }
@@ -858,6 +860,7 @@ impl NotebookEditor {
         }
         self.notebook_mode = NotebookMode::Command;
         window.focus(&self.focus_handle, cx);
+        cx.emit(ItemEvent::Edit);
         cx.notify();
     }
 
@@ -908,6 +911,9 @@ impl NotebookEditor {
         cx.subscribe(&editor, move |this, _editor, event, cx| {
             if let editor::EditorEvent::Focused = event {
                 this.select_cell_by_id(&cell_id_for_editor, cx);
+            } else if let editor::EditorEvent::BufferEdited = event {
+                cx.emit(ItemEvent::Edit);
+                cx.notify();
             }
         })
         .detach();
@@ -920,6 +926,7 @@ impl NotebookEditor {
         let editor = markdown_cell.read(cx).editor().clone();
         window.focus(&editor.focus_handle(cx), cx);
         self.notebook_mode = NotebookMode::Edit;
+        cx.emit(ItemEvent::Edit);
         cx.notify();
     }
 
@@ -957,6 +964,9 @@ impl NotebookEditor {
         cx.subscribe(&editor, move |this, _editor, event, cx| {
             if let editor::EditorEvent::Focused = event {
                 this.select_cell_by_id(&cell_id_for_editor, cx);
+            } else if let editor::EditorEvent::BufferEdited = event {
+                cx.emit(ItemEvent::Edit);
+                cx.notify();
             }
         })
         .detach();
@@ -965,6 +975,7 @@ impl NotebookEditor {
         let editor = code_cell.read(cx).editor().clone();
         window.focus(&editor.focus_handle(cx), cx);
         self.notebook_mode = NotebookMode::Edit;
+        cx.emit(ItemEvent::Edit);
         cx.notify();
     }
 
@@ -1797,7 +1808,7 @@ impl NotebookItem {
 
 impl EventEmitter<()> for NotebookItem {}
 
-impl EventEmitter<()> for NotebookEditor {}
+impl EventEmitter<ItemEvent> for NotebookEditor {}
 
 // pub struct NotebookControls {
 //     pane_focused: bool,
@@ -1845,7 +1856,11 @@ impl EventEmitter<()> for NotebookEditor {}
 // }
 
 impl Item for NotebookEditor {
-    type Event = ();
+    type Event = ItemEvent;
+
+    fn to_item_events(event: &ItemEvent, f: &mut dyn FnMut(ItemEvent)) {
+        f(*event);
+    }
 
     fn can_split(&self) -> bool {
         true
@@ -2057,12 +2072,26 @@ impl KernelSession for NotebookEditor {
         }
 
         // Handle cell-specific messages
+        // Display IDs belong to the kernel, not to one execution request: a
+        // later cell may update outputs displayed by several earlier cells.
+        if matches!(message.content, JupyterMessageContent::UpdateDisplayData(_)) {
+            for cell in self.cell_map.values() {
+                if let Cell::Code(cell) = cell {
+                    cell.update(cx, |cell, cx| cell.handle_message(message, window, cx));
+                }
+            }
+            cx.emit(ItemEvent::Edit);
+            cx.notify();
+            return;
+        }
         if let Some(parent_header) = &message.parent_header {
             if let Some(cell_id) = self.execution_requests.get(&parent_header.msg_id) {
                 if let Some(Cell::Code(cell)) = self.cell_map.get(cell_id) {
                     cell.update(cx, |cell, cx| {
                         cell.handle_message(message, window, cx);
                     });
+                    cx.emit(ItemEvent::Edit);
+                    cx.notify();
                 }
             }
         }
@@ -2386,5 +2415,80 @@ mod tests {
             );
             assert!(!buffer.is_dirty(), "saving should leave the buffer clean");
         });
+
+        // Snapshot a save, then edit before its asynchronous write completes.
+        let save = notebook_editor.update_in(cx, |notebook, window, cx| {
+            notebook.save(SaveOptions::default(), project.clone(), window, cx)
+        });
+        cell_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("print('during save')", window, cx);
+        });
+        notebook_editor.update_in(cx, |notebook, window, cx| {
+            let Cell::Code(cell) = &notebook.cell_map[&notebook.cell_order[0]] else {
+                panic!()
+            };
+            cell.update(cx, |cell, cx| {
+                cell.handle_message(
+                    &jupyter_protocol::StreamContent::stderr("during save").into(),
+                    window,
+                    cx,
+                );
+            });
+        });
+        save.await.unwrap();
+        notebook_editor.read_with(cx, |notebook, cx| assert!(notebook.is_dirty(cx)));
+        buffer.read_with(cx, |buffer, _| {
+            assert!(!buffer.text().contains("during save"))
+        });
+
+        // An invalid destination must leave the newer text and output dirty.
+        let invalid_path = ProjectPath {
+            worktree_id: project_path.worktree_id,
+            path: rel_path("test.ipynb/blocked.ipynb").into(),
+        };
+        let result = notebook_editor
+            .update_in(cx, |notebook, window, cx| {
+                notebook.save_as(project.clone(), invalid_path, window, cx)
+            })
+            .await;
+        assert!(result.is_err());
+        notebook_editor.read_with(cx, |notebook, cx| assert!(notebook.is_dirty(cx)));
+
+        // Save As follows the new project buffer, including on subsequent saves.
+        let new_path = ProjectPath {
+            worktree_id: project_path.worktree_id,
+            path: rel_path("saved.ipynb").into(),
+        };
+        notebook_editor
+            .update_in(cx, |notebook, window, cx| {
+                notebook.save_as(project.clone(), new_path.clone(), window, cx)
+            })
+            .await
+            .unwrap();
+        notebook_editor.read_with(cx, |notebook, cx| assert!(!notebook.is_dirty(cx)));
+        cell_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("print('new path')", window, cx);
+        });
+        notebook_editor
+            .update_in(cx, |notebook, window, cx| {
+                notebook.save(SaveOptions::default(), project.clone(), window, cx)
+            })
+            .await
+            .unwrap();
+        let new_saved: serde_json::Value =
+            serde_json::from_slice(&fs.read_file_sync(path!("/notebooks/saved.ipynb")).unwrap())
+                .unwrap();
+        assert_eq!(
+            new_saved["cells"][0]["source"],
+            json!(["print('new path')"])
+        );
+        assert_eq!(
+            new_saved["cells"][0]["outputs"],
+            json!([{"output_type":"stream", "name":"stderr", "text":["during save"]}])
+        );
+        assert_eq!(
+            String::from_utf8(fs.read_file_sync(path!("/notebooks/test.ipynb")).unwrap()).unwrap(),
+            saved
+        );
     }
 }
