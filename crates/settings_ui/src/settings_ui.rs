@@ -4888,7 +4888,20 @@ fn update_settings_file(
     match file {
         SettingsUiFile::Project((worktree_id, rel_path)) => {
             let rel_path = rel_path.join(paths::local_settings_file_relative_path());
-            let Some(settings_window) = window.root::<SettingsWindow>().flatten() else {
+            #[cfg(not(target_family = "wasm"))]
+            let settings_window = window.root::<SettingsWindow>().flatten();
+            #[cfg(target_family = "wasm")]
+            let settings_window = window
+                .root::<MultiWorkspace>()
+                .flatten()
+                .and_then(|root| {
+                    root.read(cx)
+                        .workspace()
+                        .read(cx)
+                        .active_modal::<SettingsModal>(cx)
+                })
+                .map(|modal| modal.read(cx).settings_window.clone());
+            let Some(settings_window) = settings_window else {
                 anyhow::bail!("No settings window found");
             };
 
