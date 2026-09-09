@@ -56,7 +56,7 @@ pub(crate) struct WebAccessibility {
     focus_ring: web_sys::HtmlElement,
     nodes: BTreeMap<NodeId, (Node, web_sys::HtmlElement)>,
     root_id: NodeId,
-    focus: NodeId,
+    focus: Rc<Cell<NodeId>>,
     callbacks: Rc<A11yCallbacks>,
     _listeners: Vec<EventListenerHandle>,
 }
@@ -78,9 +78,11 @@ impl WebAccessibility {
         focus_ring.style().set_css_text("position:fixed;display:none;pointer-events:none;outline:2px solid Highlight;outline-offset:-2px;z-index:2147483647");
         document.body().unwrap().append_child(&focus_ring)?;
         let callbacks = Rc::new(callbacks);
+        let focus = Rc::new(Cell::new(NodeId(0)));
         let mut listeners = Vec::new();
         for (event_name, action) in [("click", Action::Click), ("focusin", Action::Focus)] {
             let callbacks = callbacks.clone();
+            let focus = focus.clone();
             let focus_ring = focus_ring.clone();
             listeners.push(EventListenerHandle::add(
                 root.as_ref(),
@@ -113,6 +115,7 @@ impl WebAccessibility {
                         }
                     }
                     if let Some(id) = node
+                        .as_ref()
                         .and_then(|node| node.get_attribute("data-gpui-node"))
                         .and_then(|id| id.parse().ok())
                     {
@@ -122,6 +125,15 @@ impl WebAccessibility {
                             target_node: NodeId(id),
                             data: None,
                         });
+                        // Refocusing an already-focused native text field does
+                        // not produce a new AccessKit focus update. Its editable
+                        // browser input still needs focus for typing and IMEs.
+                        if action == Action::Focus
+                            && focus.get() == NodeId(id)
+                            && let Some(node) = node.filter(is_text_control)
+                        {
+                            focus_text_input(&node);
+                        }
                     }
                 },
             ));
@@ -286,7 +298,7 @@ impl WebAccessibility {
             focus_ring,
             nodes: BTreeMap::new(),
             root_id: NodeId(0),
-            focus: NodeId(0),
+            focus,
             callbacks,
             _listeners: listeners,
         };
@@ -585,8 +597,14 @@ impl WebAccessibility {
         }
         let focused_node_removed =
             had_semantic_focus && active.as_ref().is_some_and(|active| !active.is_connected());
-        if self.focus != update.focus || focused_node_removed {
-            self.focus = update.focus;
+        if let Ok(Some(input)) = document.query_selector("[data-gpui-input]")
+            && input.get_attribute("data-gpui-text-proxy").as_deref()
+                != Some(format!("gpui-a11y-{}", update.focus.0).as_str())
+        {
+            input.remove_attribute("data-gpui-text-proxy").ok();
+        }
+        if self.focus.get() != update.focus || focused_node_removed {
+            self.focus.set(update.focus);
             // Follow GPUI focus only while the user is navigating this semantic
             // tree. Never steal focus from the browser chrome or host forms.
             if active.is_some_and(|active| {
@@ -613,7 +631,11 @@ impl WebAccessibility {
                     });
                 if let Some(target) = target {
                     wasm_bindgen_futures::spawn_local(async move {
-                        target.focus().ok();
+                        if is_text_control(&target) {
+                            focus_text_input(&target);
+                        } else {
+                            target.focus().ok();
+                        }
                     });
                 }
             }
@@ -631,10 +653,93 @@ impl Drop for WebAccessibility {
 
 fn is_available(element: &web_sys::Element) -> bool {
     element
-        .closest("[hidden], [aria-disabled=true]")
+        .closest("[hidden], [inert], [aria-disabled=true]")
         .ok()
         .flatten()
         .is_none()
+}
+
+fn is_text_control(element: &web_sys::Element) -> bool {
+    matches!(
+        element.get_attribute("role").as_deref(),
+        Some("textbox" | "searchbox")
+    )
+}
+
+fn focus_text_input(control: &web_sys::Element) {
+    if !is_available(control) || control.has_attribute("data-gpui-tab-exit") {
+        return;
+    }
+    if let Some(document) = control.owner_document()
+        && let Ok(Some(input)) = document.query_selector("[data-gpui-input]")
+        && let Some(input) = input.dyn_ref::<web_sys::HtmlElement>()
+    {
+        input
+            .set_attribute("data-gpui-text-proxy", &control.id())
+            .ok();
+        input.focus().ok();
+    }
+}
+
+/// The single IME input is outside the semantic tree. Tab must continue from
+/// the native text field it represents, not from that input's DOM position.
+pub(crate) fn tab_from_text_input(event: &web_sys::KeyboardEvent) -> bool {
+    if event.key() != "Tab" || event.alt_key() || event.ctrl_key() || event.meta_key() {
+        return false;
+    }
+    let Some(input) = event
+        .target()
+        .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+    else {
+        return false;
+    };
+    let Some(id) = input.get_attribute("data-gpui-text-proxy") else {
+        return false;
+    };
+    let Some(document) = input.owner_document() else {
+        return false;
+    };
+    let Some(control) = document.get_element_by_id(&id) else {
+        return false;
+    };
+    let Some(scope) = control
+        .closest("[role=dialog], [role=alertdialog], [data-gpui-a11y]")
+        .ok()
+        .flatten()
+    else {
+        return false;
+    };
+    let Ok(nodes) = scope.query_selector_all("[tabindex='0']") else {
+        return false;
+    };
+    let nodes = (0..nodes.length())
+        .filter_map(|i| nodes.item(i)?.dyn_into::<web_sys::HtmlElement>().ok())
+        .filter(|node| is_available(node))
+        .collect::<Vec<_>>();
+    let Some(index) = nodes.iter().position(|node| node.id() == id) else {
+        return false;
+    };
+    if scope.has_attribute("data-gpui-a11y")
+        && ((event.shift_key() && index == 0) || (!event.shift_key() && index + 1 == nodes.len()))
+    {
+        // Outside a modal, let the browser move beyond the application. Set its
+        // sequential-focus starting point to the real field, without redirecting
+        // this one focus event back to the shared input.
+        if let Some(control) = control.dyn_ref::<web_sys::HtmlElement>() {
+            control.set_attribute("data-gpui-tab-exit", "").ok();
+            control.focus().ok();
+            control.remove_attribute("data-gpui-tab-exit").ok();
+        }
+        return false;
+    }
+    let next = if event.shift_key() {
+        (index + nodes.len() - 1) % nodes.len()
+    } else {
+        (index + 1) % nodes.len()
+    };
+    nodes[next].focus().ok();
+    event.prevent_default();
+    true
 }
 
 const CONTROL_ACTIONS: [(Action, &str); 6] = [

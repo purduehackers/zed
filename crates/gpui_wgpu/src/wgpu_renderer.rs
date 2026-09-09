@@ -2055,6 +2055,32 @@ impl WgpuRenderer {
         std::mem::take(&mut self.needs_redraw)
     }
 
+    /// Replaces only browser graphics resources. The atlas identity is retained because
+    /// GPUI's text system holds it; a forced frame must discard cached scene tile IDs.
+    #[cfg(target_family = "wasm")]
+    pub fn recover_web(
+        &mut self,
+        context: &WgpuContext,
+        surface: wgpu::Surface<'static>,
+        size: gpui::Size<gpui::DevicePixels>,
+    ) -> anyhow::Result<()> {
+        self.resources = None;
+        self.atlas.handle_device_lost(context);
+        *self = Self::new_internal(
+            None,
+            context,
+            surface,
+            WgpuSurfaceConfig {
+                size,
+                transparent: false,
+                preferred_present_mode: None,
+            },
+            None,
+            self.atlas.clone(),
+        )?;
+        Ok(())
+    }
+
     /// Recovers from a lost GPU device by recreating the renderer with a new context.
     ///
     /// Call this after detecting `device_lost()` returns true.

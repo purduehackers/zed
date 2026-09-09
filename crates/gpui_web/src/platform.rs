@@ -410,6 +410,8 @@ impl Platform for WebPlatform {
             self.window_lifecycle.clone(),
             self.active_window.clone(),
             self.keyboard.clone(),
+            self.wgpu_context.clone(),
+            self.background_executor.clone(),
         );
         match window {
             Ok(window) => {

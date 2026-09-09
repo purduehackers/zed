@@ -3,6 +3,7 @@ use crate::display::WebDisplay;
 use crate::events::{
     ClickState, EventListenerHandle, TouchIds, WebEventListeners, is_mac_platform,
 };
+use crate::graphics::GraphicsRecovery;
 use crate::ime_mirror::ImeMirror;
 use crate::keyboard::WebKeyboard;
 use crate::platform::WebWindowLifecycle;
@@ -58,6 +59,7 @@ pub(crate) struct WebWindowInner {
     pub(crate) keyboard: Rc<WebKeyboard>,
     pub(crate) pressed_keys: RefCell<std::collections::BTreeSet<String>>,
     pub(crate) state: RefCell<WebWindowMutableState>,
+    pub(crate) graphics_ready: Cell<bool>,
     pub(crate) callbacks: RefCell<WebWindowCallbacks>,
     pub(crate) click_state: RefCell<ClickState>,
     pub(crate) touch_ids: RefCell<TouchIds>,
@@ -102,6 +104,7 @@ pub struct WebWindow {
     _resize_observer: Option<web_sys::ResizeObserver>,
     _resize_observer_closure: Closure<dyn FnMut(js_sys::Array)>,
     _event_listeners: WebEventListeners,
+    _graphics_recovery: GraphicsRecovery,
 }
 
 impl WebWindow {
@@ -150,6 +153,8 @@ impl WebWindow {
         lifecycle: Rc<Cell<WebWindowLifecycle>>,
         active_window: Rc<RefCell<Option<AnyWindowHandle>>>,
         keyboard: Rc<WebKeyboard>,
+        shared_context: Rc<RefCell<Option<WgpuContext>>>,
+        executor: gpui::BackgroundExecutor,
     ) -> anyhow::Result<Self> {
         let document = browser_window
             .document()
@@ -216,6 +221,7 @@ impl WebWindow {
             keyboard,
             pressed_keys: RefCell::default(),
             state: RefCell::new(mutable_state),
+            graphics_ready: Cell::new(true),
             callbacks: RefCell::new(WebWindowCallbacks::default()),
             click_state: RefCell::new(ClickState::default()),
             touch_ids: RefCell::new(TouchIds::default()),
@@ -249,6 +255,7 @@ impl WebWindow {
         }
 
         let event_listeners = inner.register_event_listeners();
+        let graphics_recovery = GraphicsRecovery::new(&inner, context, shared_context, executor);
 
         Ok(Self {
             inner,
@@ -259,6 +266,7 @@ impl WebWindow {
             _resize_observer: resize_observer,
             _resize_observer_closure: resize_observer_closure,
             _event_listeners: event_listeners,
+            _graphics_recovery: graphics_recovery,
         })
     }
 
@@ -837,6 +845,9 @@ impl PlatformWindow for WebWindow {
     }
 
     fn draw(&self, scene: &Scene) {
+        if !self.inner.graphics_ready.get() {
+            return;
+        }
         if let Some((width, height)) = self.inner.pending_physical_size.take() {
             if self.inner.canvas.width() != width || self.inner.canvas.height() != height {
                 self.inner.canvas.set_width(width);

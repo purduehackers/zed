@@ -95,6 +95,10 @@ impl WgpuAtlas {
     /// The atlas will lazily recreate textures as needed on subsequent frames.
     pub fn handle_device_lost(&self, context: &WgpuContext) {
         let mut lock = self.0.lock();
+        #[cfg(target_family = "wasm")]
+        {
+            lock.max_texture_size = context.device.limits().max_texture_dimension_2d;
+        }
         lock.device = context.device.clone();
         lock.queue = context.queue.clone();
         lock.color_texture_format = context.color_texture_format();

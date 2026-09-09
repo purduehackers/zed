@@ -763,6 +763,9 @@ impl WebWindowInner {
         self.listen_keyboard("keydown", move |event: JsValue| {
             let event: web_sys::KeyboardEvent = event.unchecked_into();
 
+            if crate::accessibility::tab_from_text_input(&event) {
+                return;
+            }
             let semantic_target = event
                 .target()
                 .and_then(|target| target.dyn_into::<web_sys::Element>().ok())

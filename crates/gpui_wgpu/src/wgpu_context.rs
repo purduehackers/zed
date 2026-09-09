@@ -63,6 +63,18 @@ pub struct CompositorGpuHint {
 }
 
 impl WgpuContext {
+    /// Installs the browser window's loss notification without losing the renderer's flag.
+    #[cfg(target_family = "wasm")]
+    pub fn on_web_device_lost(&self, notify: impl Fn() + Send + 'static) {
+        let lost = self.device_lost.clone();
+        self.device
+            .set_device_lost_callback(move |reason, message| {
+                log::error!("Browser GPU device lost: {reason:?}: {message}");
+                lost.store(true, Ordering::Release);
+                notify();
+            });
+    }
+
     #[cfg(not(target_family = "wasm"))]
     pub fn new(
         instance: wgpu::Instance,

@@ -177,7 +177,7 @@ impl Disableable for DropdownMenu {
 }
 
 impl RenderOnce for DropdownMenu {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let button_style = match self.style {
             DropdownStyle::Solid => ButtonStyle::Filled,
             DropdownStyle::Subtle => ButtonStyle::Subtle,
@@ -190,7 +190,16 @@ impl RenderOnce for DropdownMenu {
         // Ensure a handle exists so assistive technology can open/close the menu
         // via the Expand/Collapse accessibility actions (used by UIA on Windows
         // and AX on macOS; on Linux/AT-SPI the click action is used instead).
-        let handle = self.handle.unwrap_or_default();
+        // PopoverMenu attaches the handle to its persistent state during layout.
+        // Recreating an implicit handle here would report collapsed on every render.
+        let handle = self.handle.unwrap_or_else(|| {
+            window
+                .use_keyed_state((self.id.clone(), "popover-handle"), cx, |_, _| {
+                    PopoverMenuHandle::default()
+                })
+                .read(cx)
+                .clone()
+        });
         let expanded = handle.is_deployed();
 
         // A combobox should announce its current value (the selected option).
