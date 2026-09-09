@@ -295,7 +295,15 @@ impl ReplStore {
             })
         };
         #[cfg(target_family = "wasm")]
-        let all_specs = crate::kernels::web_kernel_specifications(cx);
+        let all_specs = {
+            // The first Run action must not depend on an asynchronous discovery round trip.
+            if self.kernel_specifications.is_empty() {
+                self.kernel_specifications.push(KernelSpecification::Web(
+                    crate::kernels::WebKernelSpecification::bundled_python(),
+                ));
+            }
+            crate::kernels::web_kernel_specifications(cx)
+        };
 
         cx.spawn(async move |this, cx| {
             let all_specs = all_specs.await;

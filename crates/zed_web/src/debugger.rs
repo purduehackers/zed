@@ -54,6 +54,7 @@ pub fn init(cx: &mut App) {
             })
         })
     });
+    repl::ReplStore::global(cx).update(cx, |store, cx| store.ensure_kernelspecs(cx));
 }
 
 struct BrowserTransport {
