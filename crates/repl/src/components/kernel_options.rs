@@ -49,8 +49,14 @@ fn build_grouped_entries(store: &ReplStore, worktree_id: WorktreeId) -> Vec<Kern
 
         match spec {
             #[cfg(target_family = "wasm")]
-            KernelSpecification::Web(_) => {
-                python_envs.push(KernelPickerEntry::Kernel {
+            KernelSpecification::Web(web) => {
+                let entries =
+                    if matches!(web.kernel, crate::kernels::WebKernelRequest::Python { .. }) {
+                        &mut python_envs
+                    } else {
+                        &mut jupyter_kernels
+                    };
+                entries.push(KernelPickerEntry::Kernel {
                     spec: spec.clone(),
                     is_recommended,
                 });
@@ -355,12 +361,11 @@ impl PickerDelegate for KernelPickerDelegate {
 
                 let subtitle = match spec {
                     #[cfg(target_family = "wasm")]
-                    KernelSpecification::Web(spec) => Some(
-                        spec.python
-                            .as_deref()
-                            .unwrap_or("Bundled Python environment")
-                            .to_owned(),
-                    ),
+                    KernelSpecification::Web(spec) => Some(if spec.is_bundled_python() {
+                        "Bundled Python environment".to_owned()
+                    } else {
+                        spec.path().to_string()
+                    }),
                     KernelSpecification::Jupyter(_) => None,
                     KernelSpecification::WslRemote(_) => Some(spec.path().to_string()),
                     KernelSpecification::PythonEnv(_)

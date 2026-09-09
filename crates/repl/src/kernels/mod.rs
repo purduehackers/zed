@@ -363,7 +363,7 @@ impl KernelSpecification {
     pub fn path(&self) -> SharedString {
         SharedString::from(match self {
             #[cfg(target_family = "wasm")]
-            Self::Web(spec) => spec.python.clone().unwrap_or_default().to_string(),
+            Self::Web(spec) => spec.path().to_string(),
             Self::Jupyter(spec) => spec.path.to_string_lossy().into_owned(),
             Self::PythonEnv(spec) => spec.path.to_string_lossy().into_owned(),
             Self::JupyterServer(spec) => spec.url.to_string(),
@@ -375,7 +375,7 @@ impl KernelSpecification {
     pub fn language(&self) -> SharedString {
         SharedString::from(match self {
             #[cfg(target_family = "wasm")]
-            Self::Web(_) => "python".to_owned(),
+            Self::Web(spec) => spec.language.to_string(),
             Self::Jupyter(spec) => spec.kernelspec.language.clone(),
             Self::PythonEnv(spec) => spec.kernelspec.language.clone(),
             Self::JupyterServer(spec) => spec.kernelspec.language.clone(),
@@ -413,7 +413,7 @@ impl KernelSpecification {
     pub fn icon(&self, cx: &App) -> Icon {
         let lang_name = match self {
             #[cfg(target_family = "wasm")]
-            Self::Web(_) => "python".to_owned(),
+            Self::Web(spec) => spec.language.to_string(),
             Self::Jupyter(spec) => spec.kernelspec.language.clone(),
             Self::PythonEnv(spec) => spec.kernelspec.language.clone(),
             Self::JupyterServer(spec) => spec.kernelspec.language.clone(),

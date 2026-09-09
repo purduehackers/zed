@@ -34,11 +34,13 @@ pub fn init(cx: &mut App) {
             Ok(Box::new(connect(binary, logs, cx).await?) as Box<dyn Transport>)
         })
     });
-    repl::kernels::set_web_kernel_factory(cx, |spec, directory, cx| {
+    repl::kernels::set_web_kernel_factory(cx, |kernel, directory, cx| {
         cx.spawn(async move |cx| {
-            let info =
-                crate::bridge::connect_kernel(spec.python.as_deref(), &directory.to_string_lossy())
-                    .await?;
+            let info = crate::bridge::connect_kernel(
+                &serde_json::to_string(&kernel)?,
+                &directory.to_string_lossy(),
+            )
+            .await?;
             let launch = info["launch"]
                 .as_str()
                 .context("Missing kernel launch")?

@@ -161,11 +161,13 @@ pub async fn connect_debug_adapter(launch: &str) -> Result<serde_json::Value> {
     .context("Invalid debug connection")
 }
 
-pub async fn connect_kernel(python: Option<&str>, cwd: &str) -> Result<serde_json::Value> {
-    let python = python.map(JsValue::from_str).unwrap_or(JsValue::NULL);
+pub async fn connect_kernel(kernel: &str, cwd: &str) -> Result<serde_json::Value> {
     let promise = with_host(|host| {
-        host.connect_kernel
-            .call2(&host.this, &python, &JsValue::from_str(cwd))
+        host.connect_kernel.call2(
+            &host.this,
+            &JsValue::from_str(kernel),
+            &JsValue::from_str(cwd),
+        )
     })
     .context("No browser host")?
     .map_err(|error| anyhow!(describe_js_value(&error)))?

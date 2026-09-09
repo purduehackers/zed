@@ -1,4 +1,4 @@
-//! Browser transport for the existing inline REPL. Python runs in the host's sandbox.
+//! Browser transport for Jupyter kernels running in the host's sandbox.
 
 use super::{KernelSession, KernelSpecification, RunningKernel};
 use anyhow::{Context as _, Result, ensure};
@@ -13,24 +13,51 @@ use jupyter_protocol::{
 };
 use language::LanguageName;
 use project::{Project, ProjectPath, Toolchains, WorktreeId};
+use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fmt, path::PathBuf, time::Duration};
 use util::rel_path::RelPath;
 
 const MAX_MESSAGE: usize = 8 * 1024 * 1024;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct WebKernelSpecification {
     pub name: SharedString,
+    pub language: SharedString,
+    pub kernel: WebKernelRequest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WebKernelRequest {
+    List,
     /// None selects the Python environment bundled by the browser host.
-    pub python: Option<SharedString>,
+    Python {
+        executable: Option<SharedString>,
+    },
+    Kernelspec {
+        name: SharedString,
+    },
 }
 
 impl WebKernelSpecification {
     pub fn bundled_python() -> Self {
         Self {
             name: "Python (sandbox)".into(),
-            python: None,
+            language: "python".into(),
+            kernel: WebKernelRequest::Python { executable: None },
         }
+    }
+
+    pub fn path(&self) -> SharedString {
+        match &self.kernel {
+            WebKernelRequest::Python { executable } => executable.clone().unwrap_or_default(),
+            WebKernelRequest::Kernelspec { name } => name.clone(),
+            WebKernelRequest::List => SharedString::default(),
+        }
+    }
+
+    pub fn is_bundled_python(&self) -> bool {
+        matches!(self.kernel, WebKernelRequest::Python { executable: None })
     }
 }
 
@@ -40,13 +67,32 @@ pub struct WebKernelConnection {
     pub keep_alive: Task<()>,
 }
 
-type Factory =
-    fn(WebKernelSpecification, PathBuf, &mut AsyncApp) -> Task<Result<WebKernelConnection>>;
+type Factory = fn(WebKernelRequest, PathBuf, &mut AsyncApp) -> Task<Result<WebKernelConnection>>;
 struct WebKernelProvider(Factory);
 impl Global for WebKernelProvider {}
 
 pub fn set_web_kernel_factory(cx: &mut App, factory: Factory) {
     cx.set_global(WebKernelProvider(factory));
+}
+
+pub fn web_kernel_specifications(cx: &mut App) -> Task<Result<Vec<KernelSpecification>>> {
+    let factory = cx.global::<WebKernelProvider>().0;
+    cx.spawn(async move |cx| {
+        let connection = factory(WebKernelRequest::List, PathBuf::from("/workspaces"), cx).await?;
+        let mut reader = BufReader::new(connection.reader);
+        let response = read_message(&mut reader).fuse();
+        let timeout = cx
+            .background_executor()
+            .timer(Duration::from_secs(15))
+            .fuse();
+        pin_mut!(response, timeout);
+        let response = select! {
+            response = response => response?.context("Kernel discovery closed without a response")?,
+            _ = timeout => anyhow::bail!("Timed out discovering sandbox kernels"),
+        };
+        let specs: Vec<WebKernelSpecification> = serde_json::from_value(response)?;
+        Ok(specs.into_iter().map(KernelSpecification::Web).collect())
+    })
 }
 
 pub fn python_env_kernel_specifications(
@@ -63,9 +109,7 @@ pub fn python_env_kernel_specifications(
         cx,
     );
     async move {
-        let mut specifications = vec![KernelSpecification::Web(
-            WebKernelSpecification::bundled_python(),
-        )];
+        let mut specifications = Vec::new();
         if let Some(Toolchains {
             toolchains,
             user_toolchains,
@@ -81,7 +125,10 @@ pub fn python_env_kernel_specifications(
                 if seen.insert(toolchain.path.clone()) {
                     specifications.push(KernelSpecification::Web(WebKernelSpecification {
                         name: toolchain.name.clone(),
-                        python: Some(toolchain.path),
+                        language: "python".into(),
+                        kernel: WebKernelRequest::Python {
+                            executable: Some(toolchain.path),
+                        },
                     }));
                 }
             }
@@ -140,7 +187,7 @@ impl WebRunningKernel {
         let factory = cx.global::<WebKernelProvider>().0;
         let session = session.downgrade();
         window.spawn(cx, async move |cx| {
-            let connection = factory(specification, directory.clone(), cx).await?;
+            let connection = factory(specification.kernel, directory.clone(), cx).await?;
             let mut reader = BufReader::new(connection.reader);
             let mut writer = connection.writer;
             let ready = read_message(&mut reader).fuse();
@@ -151,8 +198,8 @@ impl WebRunningKernel {
             {
                 pin_mut!(ready, timeout);
                 let ready = select! {
-                    ready = ready => ready?.context("Python kernel closed before startup")?,
-                    _ = timeout => anyhow::bail!("Timed out starting the Python kernel"),
+                    ready = ready => ready?.context("Kernel closed before startup")?,
+                    _ = timeout => anyhow::bail!("Timed out starting the sandbox kernel"),
                 };
                 ensure!(ready["ready"] == true, "Invalid kernel startup response");
             }
@@ -185,7 +232,7 @@ impl WebRunningKernel {
                             session.route(&message, window, cx)
                         })?;
                     }
-                    anyhow::bail!("Python kernel disconnected")
+                    anyhow::bail!("Sandbox kernel disconnected")
                 }
                 .fuse();
                 let result = {

@@ -94,17 +94,29 @@ impl ReplStore {
         &self,
         worktree_id: WorktreeId,
     ) -> impl Iterator<Item = &KernelSpecification> {
-        let global_specs = if self.remote_worktrees.contains(&worktree_id) {
-            None
-        } else {
-            Some(self.kernel_specifications.iter())
-        };
+        // In a browser these specs come from the sandbox, not the client machine.
+        #[cfg(target_family = "wasm")]
+        return self.kernel_specifications.iter().chain(
+            self.kernel_specifications_for_worktree
+                .get(&worktree_id)
+                .into_iter()
+                .flatten(),
+        );
 
-        self.kernel_specifications_for_worktree
-            .get(&worktree_id)
-            .into_iter()
-            .flat_map(|specs| specs.iter())
-            .chain(global_specs.into_iter().flatten())
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let global_specs = if self.remote_worktrees.contains(&worktree_id) {
+                None
+            } else {
+                Some(self.kernel_specifications.iter())
+            };
+
+            self.kernel_specifications_for_worktree
+                .get(&worktree_id)
+                .into_iter()
+                .flat_map(|specs| specs.iter())
+                .chain(global_specs.into_iter().flatten())
+        }
     }
 
     pub fn pure_jupyter_kernel_specifications(&self) -> impl Iterator<Item = &KernelSpecification> {
@@ -283,7 +295,7 @@ impl ReplStore {
             })
         };
         #[cfg(target_family = "wasm")]
-        let all_specs = Task::ready(anyhow::Ok(Vec::new()));
+        let all_specs = crate::kernels::web_kernel_specifications(cx);
 
         cx.spawn(async move |this, cx| {
             let all_specs = all_specs.await;
@@ -325,7 +337,7 @@ impl ReplStore {
     ) -> bool {
         #[cfg(target_family = "wasm")]
         if let KernelSpecification::Web(spec) = spec {
-            return spec.python.is_none();
+            return spec.is_bundled_python();
         }
         if let Some(active_path) = self.active_python_toolchain_path(worktree_id) {
             spec.path().as_ref() == active_path.as_ref()
