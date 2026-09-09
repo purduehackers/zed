@@ -175,6 +175,15 @@ impl WebWindowInner {
         let this = Rc::clone(self);
         handles.push(EventListenerHandle::add(
             self.browser_window.as_ref(),
+            "gpui-text-input-focus",
+            move |_| {
+                this.ime_mirror.text_input_focus_changed();
+                this.schedule_ime_mirror_sync();
+            },
+        ));
+        let this = Rc::clone(self);
+        handles.push(EventListenerHandle::add(
+            self.browser_window.as_ref(),
             "gpui-screen-reader-mode",
             move |_| {
                 this.ime_mirror.screen_reader_mode_changed();

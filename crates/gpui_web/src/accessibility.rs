@@ -31,6 +31,13 @@ pub fn set_text_input_label(label: &str, read_only: bool) {
         element
             .set_attribute("aria-readonly", bool_str(read_only))
             .ok();
+        // The shared browser input must not carry the previous field's selection
+        // or IME context into this one, even when both fields have the same label.
+        if let Some(window) = web_sys::window()
+            && let Ok(event) = web_sys::Event::new("gpui-text-input-focus")
+        {
+            window.dispatch_event(&event).ok();
+        }
     }
 }
 

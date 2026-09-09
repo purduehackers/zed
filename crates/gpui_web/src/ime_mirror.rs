@@ -81,7 +81,7 @@ pub(crate) struct ImeMirror {
     /// selection has moved; a rejected import means no import is coming,
     /// so the next sync must reassert the app's state instead of waiting.
     selection_import_rejected: Cell<bool>,
-    mode_changed: Cell<bool>,
+    context_changed: Cell<bool>,
 }
 
 /// Whether the device's primary pointer is coarse (a touch screen). The
@@ -144,7 +144,7 @@ impl ImeMirror {
             window_hint: Cell::new(0),
             sync_scheduled: Cell::new(false),
             selection_import_rejected: Cell::new(false),
-            mode_changed: Cell::new(false),
+            context_changed: Cell::new(false),
         };
         // Until an input handler asks otherwise, the element is an IME
         // conduit, not a form field: browser-side text assistance would
@@ -206,13 +206,19 @@ impl ImeMirror {
     }
 
     pub(crate) fn screen_reader_mode_changed(&self) {
-        self.mode_changed.set(true);
+        self.context_changed.set(true);
         self.element.set_read_only(primary_pointer_is_coarse());
         self.element.set_attribute("aria-description", if crate::accessibility::screen_reader_mode() {
             "Screen reader mode. Full document text is available. Tab moves focus out of the editor. F1 opens the command palette."
         } else {
             "F1 opens the command palette. Enable screen reader mode for full-document reading and Tab navigation."
         }).ok();
+    }
+
+    pub(crate) fn text_input_focus_changed(&self) {
+        // A pending selectionchange belongs to the previous native field, not
+        // the new input handler. Rebuild its context on the next coalesced sync.
+        self.context_changed.set(true);
     }
 
     /// The candidate popup is anchored to the browser's focused textarea.
@@ -374,7 +380,7 @@ impl ImeMirror {
             }
             let mirror = &window.ime_mirror;
             let screen_reader = crate::accessibility::screen_reader_mode();
-            let mode_changed = mirror.mode_changed.replace(false);
+            let context_changed = mirror.context_changed.replace(false);
             // A live element selection that differs from the stored baseline
             // while the value still matches is an IME-driven selection move
             // whose `selectionchange` import hasn't dispatched yet (the event
@@ -383,7 +389,7 @@ impl ImeMirror {
             // an in-progress gesture, e.g. Android's slide-on-backspace
             // growing its selection. The import reconciles the two sides and
             // schedules a fresh sync when it cannot adopt the move.
-            if !mode_changed
+            if !context_changed
                 && !mirror.selection_import_rejected.replace(false)
                 && *mirror.text.borrow() == mirror.element.value()
             {
@@ -424,7 +430,7 @@ impl ImeMirror {
                 .flatten();
 
             if !screen_reader
-                && !mode_changed
+                && !context_changed
                 && is_consistent(
                     window,
                     &selection.range,
@@ -441,7 +447,7 @@ impl ImeMirror {
             // connection, which desynchronizes the keyboard's word model
             // right when it is about to act on the tapped word.
             if !screen_reader
-                && !mode_changed
+                && !context_changed
                 && move_selection_within_window(
                     window,
                     &selection.range,
