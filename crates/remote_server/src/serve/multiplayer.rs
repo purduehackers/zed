@@ -4,9 +4,53 @@
 use super::*;
 use rpc::proto::PeerId;
 use session::{BrokerCommand, ServeHooks, SessionBroker, SessionMeta};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
-const MAX_PARTICIPANTS: usize = 32;
+// Bound expensive replay channels, not the number of people who can ever visit a VM.
+const MAX_REPLAY_BROKERS: usize = 32;
+
+struct Participant {
+    identity: String,
+    peer: PeerId,
+    tx: tokio::sync::mpsc::UnboundedSender<BrokerCommand>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Oldest last-attach first. Only the broker can arbitrate retirement against socket
+/// exit/reconnect, so a queued attach or half-open live connection is never evicted.
+async fn reclaim_detached(
+    participants: &mut VecDeque<Participant>,
+    gpui: &mpsc::UnboundedSender<GpuiCommand>,
+) -> bool {
+    for index in 0..participants.len() {
+        let (done, reply) = tokio::sync::oneshot::channel();
+        let sent = participants[index]
+            .tx
+            .send(BrokerCommand::RetireIfDetached { done })
+            .is_ok();
+        if sent && !reply.await.unwrap_or(true) {
+            continue;
+        }
+        let Some(participant) = participants.remove(index) else {
+            continue;
+        };
+        if let Err(error) = participant.task.await {
+            log::warn!("participant broker exited unexpectedly: {error}");
+        }
+        let (done, reply) = futures::channel::oneshot::channel();
+        if gpui
+            .unbounded_send(GpuiCommand::ReleaseParticipant {
+                peer: participant.peer,
+                done,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        return reply.await.is_ok();
+    }
+    false
+}
 
 struct ParticipantHooks {
     tx: mpsc::UnboundedSender<GpuiCommand>,
@@ -58,9 +102,11 @@ pub async fn run(
     state: Arc<ServeState>,
     gpui: mpsc::UnboundedSender<GpuiCommand>,
 ) {
-    let mut participants =
-        HashMap::<String, tokio::sync::mpsc::UnboundedSender<BrokerCommand>>::new();
-    let mut tasks = Vec::new();
+    let mut participants = VecDeque::<Participant>::new();
+    // Keep only lightweight identities after eviction. Replica IDs cannot be reused
+    // for another person while VM buffers retain their operations. Stable IDs also
+    // preserve terminal ownership. The wire's u16 replica space bounds this registry.
+    let mut identities = HashMap::<String, PeerId>::new();
     while let Some(command) = commands.recv().await {
         match command {
             BrokerCommand::Attach { ws, hello, claims } => {
@@ -75,15 +121,37 @@ pub async fn run(
                     session::refuse_socket(ws, 1008, "invalid participant identity");
                     continue;
                 }
-                if !participants.contains_key(participant) {
-                    if participants.len() >= MAX_PARTICIPANTS {
-                        session::refuse_socket(ws, 1008, "workspace participant limit reached");
+                let existing = participants
+                    .iter()
+                    .position(|entry| entry.identity == *participant);
+                if let Some(index) = existing {
+                    if let Some(entry) = participants.remove(index) {
+                        participants.push_back(entry);
+                    }
+                } else {
+                    if participants.len() >= MAX_REPLAY_BROKERS
+                        && !reclaim_detached(&mut participants, &gpui).await
+                    {
+                        session::refuse_socket(
+                            ws,
+                            1008,
+                            "workspace has 32 connected participants; try again when someone leaves",
+                        );
                         continue;
                     }
-                    let peer = PeerId {
+                    let next_peer = PeerId {
                         owner_id: 0,
-                        id: 8 + participants.len() as u32,
+                        id: 8 + identities.len() as u32,
                     };
+                    let peer = identities.get(participant).copied().unwrap_or(next_peer);
+                    if peer.id > u16::MAX as u32 {
+                        session::refuse_socket(
+                            ws,
+                            1008,
+                            "workspace replica identities exhausted; restart the workspace",
+                        );
+                        continue;
+                    }
                     let (done, reply) = futures::channel::oneshot::channel();
                     if gpui
                         .unbounded_send(GpuiCommand::JoinParticipant {
@@ -101,7 +169,7 @@ pub async fn run(
                         continue;
                     };
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                    tasks.push(tokio::spawn(
+                    let task = tokio::spawn(
                         SessionBroker::new(
                             ends.incoming_tx,
                             ends.outgoing_rx,
@@ -114,20 +182,38 @@ pub async fn run(
                             }),
                         )
                         .run(),
-                    ));
-                    participants.insert(participant.clone(), tx);
+                    );
+                    identities.insert(participant.clone(), peer);
+                    participants.push_back(Participant {
+                        identity: participant.clone(),
+                        peer,
+                        tx,
+                        task,
+                    });
                 }
-                participants[participant]
-                    .send(BrokerCommand::Attach { ws, hello, claims })
-                    .ok();
+                if let Some(participant) = participants.back()
+                    && let Err(error) =
+                        participant
+                            .tx
+                            .send(BrokerCommand::Attach { ws, hello, claims })
+                {
+                    log::warn!("participant broker is unavailable: {error}");
+                }
             }
             // A browser closes its WebSocket; it cannot shut down the shared host.
             BrokerCommand::CloseSession { .. } => {}
+            BrokerCommand::RetireIfDetached { done } => {
+                done.send(false).ok();
+            }
             BrokerCommand::Shutdown { done } => {
                 let mut closed = Vec::new();
-                for tx in participants.values() {
+                for participant in &participants {
                     let (done, reply) = tokio::sync::oneshot::channel();
-                    if tx.send(BrokerCommand::Shutdown { done }).is_ok() {
+                    if participant
+                        .tx
+                        .send(BrokerCommand::Shutdown { done })
+                        .is_ok()
+                    {
                         closed.push(reply);
                     }
                 }
@@ -138,7 +224,7 @@ pub async fn run(
             }
         }
     }
-    for task in tasks {
-        task.abort();
+    for participant in participants {
+        participant.task.abort();
     }
 }

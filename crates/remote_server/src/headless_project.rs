@@ -633,6 +633,16 @@ impl HeadlessProject {
             .update(cx, |store, _| store.forget_shared_buffers_for(&peer));
     }
 
+    pub fn release_participant(&mut self, peer: proto::PeerId, cx: &mut Context<Self>) {
+        self.reset_participant(peer, cx);
+        if let Some(sandbox) = &self.sandbox {
+            sandbox
+                .client_state
+                .update(cx, |store, _| store.release_participant(peer));
+        }
+        // VM buffers, PTYs and their stable participant ownership outlive replay channels.
+    }
+
     pub fn participant_attached(&mut self, peer: proto::PeerId, cx: &mut Context<Self>) {
         self.participants.insert(peer);
         if let Some(hub) = &self.hub {

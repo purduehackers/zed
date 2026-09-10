@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context as _, Result};
 use fs::{CopyOptions, Fs, RenameOptions};
 use futures::{FutureExt as _, future::Shared};
-use gpui::{App, AppContext as _, AsyncApp, Context, Entity, Task};
+use gpui::{App, AppContext as _, AsyncApp, Context, Entity, Task, WeakEntity};
 use rpc::{TypedEnvelope, proto};
 use serde::{Deserialize, Serialize};
 use util::ResultExt as _;
@@ -57,7 +57,7 @@ pub struct ClientStateMeta {
 
 /// The blob store behind `SaveClientState` / `LoadClientState`.
 pub struct ClientStateStore {
-    peers: collections::HashMap<proto::PeerId, Entity<Self>>,
+    peers: collections::HashMap<proto::PeerId, ParticipantStore>,
     fs: Arc<dyn Fs>,
     dir: PathBuf,
     /// `None` until `loaded` resolves and when nothing is stored.
@@ -76,6 +76,13 @@ pub struct ClientStateStore {
     /// Versions of accepted saves that carried `stopping` (the D6 flush).
     stopping_saved_tx: watch::Sender<u64>,
     _stopping_saved_rx: watch::Receiver<u64>,
+}
+
+struct ParticipantStore {
+    active: Option<Entity<ClientStateStore>>,
+    // An in-flight save can outlive eviction. Reuse its store/lock if the participant
+    // returns before it finishes; never create two writers for the same disk image.
+    store: WeakEntity<ClientStateStore>,
 }
 
 /// Decrements the pending-save count when a save finishes, however it finishes.
@@ -136,9 +143,24 @@ impl ClientStateStore {
         cx: &mut Context<Self>,
     ) {
         let dir = self.dir.join("participants").join(participant);
-        self.peers
-            .entry(peer)
-            .or_insert_with(|| cx.new(|cx| Self::new(self.fs.clone(), dir, cx)));
+        let store = self
+            .peers
+            .get(&peer)
+            .and_then(|entry| entry.store.upgrade())
+            .unwrap_or_else(|| cx.new(|cx| Self::new(self.fs.clone(), dir, cx)));
+        self.peers.insert(
+            peer,
+            ParticipantStore {
+                store: store.downgrade(),
+                active: Some(store),
+            },
+        );
+    }
+
+    pub fn release_participant(&mut self, peer: proto::PeerId) {
+        if let Some(entry) = self.peers.get_mut(&peer) {
+            entry.active = None;
+        }
     }
 
     pub fn participant_stopping_versions(
@@ -148,12 +170,18 @@ impl ClientStateStore {
     ) -> Option<watch::Receiver<u64>> {
         self.peers
             .get(&peer)
+            .and_then(|entry| entry.store.upgrade())
             .map(|store| store.read(cx).stopping_saved_versions())
     }
 
     fn for_peer(this: Entity<Self>, peer: proto::PeerId, cx: &AsyncApp) -> Result<Entity<Self>> {
-        this.read_with(cx, |store, _| store.peers.get(&peer).cloned())
-            .context("unknown client-state participant")
+        this.read_with(cx, |store, _| {
+            store
+                .peers
+                .get(&peer)
+                .and_then(|entry| entry.store.upgrade())
+        })
+        .context("unknown client-state participant")
     }
 
     /// Metadata of the stored image, once loaded.
@@ -478,6 +506,14 @@ mod tests {
                     .accepted
             );
         }
+        root.update(cx, |store, cx| {
+            store.release_participant(a);
+            store.release_participant(b);
+            assert!(store.peers[&a].store.upgrade().is_none());
+            assert!(store.peers[&b].store.upgrade().is_none());
+            store.register_participant(a, "p_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", cx);
+            store.register_participant(b, "p_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", cx);
+        });
         for (peer, bytes) in [(a, b"layout-a"), (b, b"layout-b")] {
             let mut request = load(false);
             request.original_sender_id = Some(peer);
@@ -493,6 +529,20 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[gpui::test]
+    async fn rejoining_reuses_an_in_flight_store(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        let root = store(&fs, cx);
+        let peer = proto::PeerId { owner_id: 0, id: 8 };
+        root.update(cx, |store, cx| {
+            store.register_participant(peer, "p_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", cx);
+            let in_flight = store.peers[&peer].store.upgrade().unwrap();
+            store.release_participant(peer);
+            store.register_participant(peer, "p_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", cx);
+            assert_eq!(store.peers[&peer].store.upgrade().unwrap(), in_flight);
+        });
     }
 
     #[gpui::test]

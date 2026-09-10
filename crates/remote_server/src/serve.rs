@@ -120,6 +120,10 @@ pub enum GpuiCommand {
     },
     ParticipantAttached(rpc::proto::PeerId),
     ParticipantDetached(rpc::proto::PeerId),
+    ReleaseParticipant {
+        peer: rpc::proto::PeerId,
+        done: futures::channel::oneshot::Sender<()>,
+    },
     /// `/files` upload, after its renames: absolute paths under the workspace root.
     FilesUploaded(Vec<PathBuf>),
     /// `/extensions/{id}/assets/{rel}`: resolve an installed extension's asset path.
@@ -668,6 +672,11 @@ fn spawn_gpui_command_loop(
                 }
                 GpuiCommand::ParticipantDetached(peer) => {
                     project.update(cx, |project, cx| project.participant_detached(peer, cx));
+                }
+                GpuiCommand::ReleaseParticipant { peer, done } => {
+                    project.update(cx, |project, cx| project.release_participant(peer, cx));
+                    hub.remove_peer(peer);
+                    done.send(()).ok();
                 }
                 GpuiCommand::FilesUploaded(paths) => {
                     cx.update(|cx| project_hooks.files_uploaded(&project, paths, cx));

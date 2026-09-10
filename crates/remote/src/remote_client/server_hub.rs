@@ -49,6 +49,7 @@ impl ServerHub {
     }
 
     pub fn remove_peer(&self, peer: PeerId) {
+        self.active.lock().remove(&peer);
         self.peers.lock().remove(&peer);
     }
 

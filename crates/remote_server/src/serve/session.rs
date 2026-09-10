@@ -142,6 +142,10 @@ pub enum BrokerCommand {
         /// Close reason.
         reason: &'static str,
     },
+    /// Reclaim an idle multiplayer replay broker without interrupting a live socket.
+    RetireIfDetached {
+        done: tokio::sync::oneshot::Sender<bool>,
+    },
     /// From SIGTERM/SIGINT: flush, close 1001, then `ServeHooks::request_quit`.
     Shutdown {
         /// Completed once the session is closed and quit was requested.
@@ -388,6 +392,14 @@ impl SessionBroker {
                 }
                 BrokerEvent::Command(Some(BrokerCommand::CloseSession { code, reason })) => {
                     self.close_session(code, reason).await;
+                }
+                BrokerEvent::Command(Some(BrokerCommand::RetireIfDetached { done })) => {
+                    self.reap_finished_session().await;
+                    let retired = self.current.is_none();
+                    done.send(retired).ok();
+                    if retired {
+                        return;
+                    }
                 }
                 BrokerEvent::Command(Some(BrokerCommand::Shutdown { done })) => {
                     self.close_session(CLOSE_STOPPING, "server shutting down")
@@ -1388,6 +1400,27 @@ mod tests {
         client.hello(sid, instance, false, None).await;
         let ack = client.hello_ack().await.expect("hello ack");
         (client, ack)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retirement_never_evicts_a_live_session() {
+        let server = TestServer::start().await;
+        let (client, _) = attach_fresh(&server, "sid_1", "inst_1").await;
+        let (done, reply) = tokio::sync::oneshot::channel();
+        server
+            .broker_tx
+            .send(BrokerCommand::RetireIfDetached { done })
+            .unwrap();
+        assert!(!reply.await.unwrap());
+        drop(client);
+        wait_for_detach(&server).await;
+        let (done, reply) = tokio::sync::oneshot::channel();
+        server
+            .broker_tx
+            .send(BrokerCommand::RetireIfDetached { done })
+            .unwrap();
+        assert!(reply.await.unwrap());
+        server.broker_tx.closed().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
