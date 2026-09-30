@@ -34,9 +34,9 @@ pub const WEB_LAYOUT_DEFAULTS: &str = r#"{
   "buffer_font_size": 14,
   "buffer_font_features": { "aalt": true },
   "buffer_line_height": "comfortable",
-  "vim_mode": true,
-  // A browser tab can be closed at any moment; saving on focus change is the desktop setting
-  // and happens to be the safer one here too.
+  "vim_mode": false,
+  "focus_follows_mouse": { "enabled": true },
+  // Save when focus leaves a buffer, including when the mouse moves to another pane.
   "autosave": "on_focus_change",
   "diff_view_style": "unified",
   "bottom_dock_layout": "contained",
@@ -183,7 +183,7 @@ mod tests {
         );
         // The layout block is applied on top and must survive the merge intact.
         assert_eq!(merged["disable_ai"], serde_json::json!(true));
-        assert_eq!(merged["vim_mode"], serde_json::json!(true));
+        assert_eq!(merged["vim_mode"], serde_json::json!(false));
         assert_eq!(merged["theme"]["mode"], serde_json::json!("dark"));
         assert_eq!(merged["project_panel"]["dock"], serde_json::json!("left"));
         assert_eq!(
